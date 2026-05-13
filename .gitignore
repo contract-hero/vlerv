@@ -26,3 +26,6 @@ orkskullz.webp
 
 # Forge artifacts (lost in the rsync incident; do not gitignore future runs)
 # .forge/
+
+# Multi-agent review scratch (ship-reviewed-pr skill)
+.claude-pr-review/

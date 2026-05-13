@@ -4,6 +4,7 @@ import Sidebar from "./components/Sidebar";
 import Preview from "./components/Preview";
 import { tauriIpc } from "./ipc";
 import type { IpcSurface, FilePayload } from "./ipc";
+import { useDeepLink } from "./hooks/useDeepLink";
 
 interface AppProps {
   ipc?: IpcSurface;
@@ -15,6 +16,20 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   const [payload, setPayload] = React.useState<
     FilePayload | { error: { kind: string; path: string; reason: string } } | null
   >(null);
+
+  const handleDeepLinkIntent = React.useCallback(
+    ({ path }: { path: string }) => {
+      setSelectedFile(path);
+    },
+    [],
+  );
+  const handleDeepLinkError = React.useCallback(
+    ({ reason, url }: { reason: string; url: string }) => {
+      setPayload({ error: { kind: "DeepLink", path: url, reason } });
+    },
+    [],
+  );
+  useDeepLink({ onIntent: handleDeepLinkIntent, onError: handleDeepLinkError });
 
   React.useEffect(() => {
     if (!selectedFile) {

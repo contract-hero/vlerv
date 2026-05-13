@@ -45,6 +45,7 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/"));
     let default_root = std::path::PathBuf::from(format!("{home}/workspace"));
     let roots = src_tauri::security::RootSet::new(vec![default_root]);
+    let roots_for_setup = roots.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
@@ -60,13 +61,25 @@ fn main() {
             list_workspace_roots,
             read_file,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
+            let roots = roots_for_setup;
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
                     let url_str = url.to_string();
                     src_tauri::handle_deep_link(&url_str);
-                    let _ = app_handle.emit("vlerv://deep-link", url_str);
+                    match src_tauri::dispatch_deep_link(&url_str, &roots) {
+                        Ok(open_event) => {
+                            let _ = app_handle.emit("vlerv://open-file", open_event);
+                        }
+                        Err(err_event) => {
+                            eprintln!(
+                                "vlerv: deep-link rejected: {} ({})",
+                                err_event.reason, err_event.url
+                            );
+                            let _ = app_handle.emit("vlerv://deep-link-error", err_event);
+                        }
+                    }
                 }
             });
             Ok(())
