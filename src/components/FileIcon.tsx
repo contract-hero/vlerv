@@ -147,14 +147,14 @@ export function iconForFile(name: string): { Icon: LucideIcon; color: string } {
   return { Icon: File, color: "#9aa0a6" };
 }
 
-export function FileGlyph({ name, size = 14 }: { name: string; size?: number }): React.ReactElement {
+export function FileGlyph({ name, size = 17 }: { name: string; size?: number }): React.ReactElement {
   const { Icon, color } = iconForFile(name);
   return <Icon size={size} color={color} strokeWidth={1.75} />;
 }
 
 export function FolderGlyph({
   open,
-  size = 14,
+  size = 17,
 }: {
   open: boolean;
   size?: number;

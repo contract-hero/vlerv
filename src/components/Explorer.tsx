@@ -63,7 +63,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
     return () => { cancelled = true; };
   }, [expanded, entry.path, entries, ipc]);
 
-  const indentPx = 10 + depth * 14;
+  const indentPx = 12 + depth * 16;
   const isSelected = selectedFile === entry.path;
 
   return (
@@ -76,7 +76,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
         data-kind="dir"
       >
         <span className={`chevron ${expanded ? "open" : ""}`}>
-          <ChevronRight size={12} strokeWidth={2} />
+          <ChevronRight size={14} strokeWidth={2} />
         </span>
         <span className="icon folder-icon" aria-hidden>
           <FolderGlyph open={expanded} />
@@ -120,7 +120,7 @@ interface FileRowProps {
 }
 
 function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.ReactElement {
-  const indentPx = 10 + depth * 14;
+  const indentPx = 12 + depth * 16;
   return (
     <div
       className={`row file ${selected ? "selected" : ""}`}
