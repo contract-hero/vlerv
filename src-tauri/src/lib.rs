@@ -34,6 +34,32 @@ impl RevealEvent {
     }
 }
 
+/// Intent kind surfaced to the webview as a lowercase string in JSON
+/// (`"open"` or `"reveal"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepLinkIntentKind {
+    Open,
+    Reveal,
+}
+
+/// Typed payload emitted on `vlerv://open-file` after a deep-link is parsed
+/// and the path is canonicalized against the active `RootSet`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenFileEvent {
+    pub path: std::path::PathBuf,
+    pub intent: DeepLinkIntentKind,
+}
+
+/// Typed payload emitted on `vlerv://deep-link-error` when the URL is
+/// unparseable, the path is rejected by the root check, or the path does
+/// not exist.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeepLinkErrorEvent {
+    pub url: String,
+    pub reason: String,
+}
+
 /// C3: Tauri IPC command — read a file gated by the active RootSet.
 /// Every call passes through canonicalize_and_check_root via tauri::State<RootSet>.
 /// T-008: no _with_roots escape hatch exists in the exported command surface.
@@ -155,6 +181,39 @@ pub fn snippet_chars_take(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Parse a `vlerv://` URL, canonicalize the path against `roots`, push the
+/// path to Recents on Open intent (best-effort), and return a typed event
+/// the webview can consume. Single entry point used by `main.rs`'s
+/// `on_open_url` callback.
+pub fn dispatch_deep_link(
+    url: &str,
+    roots: &security::RootSet,
+) -> Result<OpenFileEvent, DeepLinkErrorEvent> {
+    let make_err = |reason: String| DeepLinkErrorEvent {
+        url: url.to_string(),
+        reason,
+    };
+
+    let intent = deeplink::parse(url).map_err(|e| make_err(e.to_string()))?;
+
+    let (path, kind) = match intent {
+        deeplink::DeepLinkIntent::Open { path, .. } => (path, DeepLinkIntentKind::Open),
+        deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal),
+    };
+
+    let canonical = security::canonicalize_and_check_root(&path, roots)
+        .map_err(|e| make_err(e.to_string()))?;
+
+    if matches!(kind, DeepLinkIntentKind::Open) {
+        let _ = recents::push(&canonical);
+    }
+
+    Ok(OpenFileEvent {
+        path: canonical,
+        intent: kind,
+    })
+}
+
 /// Handle a deep-link URL: parse it and (when the `e2e-hooks` feature is
 /// enabled AND `VLERV_E2E_ECHO_LOG` is set) write a content snippet to
 /// that log file. The feature gate ensures production builds cannot use
@@ -202,4 +261,79 @@ fn e2e_echo(path: &std::path::Path) {
 /// Entry point invoked by `main.rs`. C2: boots a real Tauri app.
 pub fn run() {
     eprintln!("vlerv: run() called — Tauri Builder wired in main.rs");
+}
+
+#[cfg(test)]
+mod dispatch_deep_link_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::OnceLock;
+    use tempfile::TempDir;
+
+    // Redirect state_store writes to a tempdir for the whole test binary.
+    // Without this, `recents::push` → `state_store::set_state_field` spawns a
+    // debounced thread (DEBOUNCE_MS=250) that outlives the test and writes to
+    // the developer's real ~/Library/Application Support/Vlerv/state.json.
+    // Set once per process — `std::env::set_var` is process-global, and cargo
+    // runs tests in parallel threads, so racing per-test set_vars would point
+    // the debounced writer at TempDirs that have already been dropped.
+    fn ensure_isolated_state_dir() {
+        static STATE_DIR: OnceLock<TempDir> = OnceLock::new();
+        let dir = STATE_DIR.get_or_init(|| TempDir::new().expect("state tempdir"));
+        std::env::set_var("VLERV_STATE_DIR", dir.path());
+    }
+
+    fn setup_root_with_file(name: &str) -> (TempDir, std::path::PathBuf, security::RootSet) {
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let file_path = dir.path().join(name);
+        fs::write(&file_path, "content").expect("write");
+        let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
+        (dir, file_path, roots)
+    }
+
+    #[test]
+    fn open_intent_within_root_returns_open_event() {
+        let (_dir, file_path, roots) = setup_root_with_file("hello.html");
+        let url = format!("vlerv://open?path={}", file_path.display());
+
+        let event = dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert_eq!(event.intent, DeepLinkIntentKind::Open);
+        assert_eq!(event.path, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn reveal_intent_within_root_returns_reveal_event() {
+        let (_dir, file_path, roots) = setup_root_with_file("revealme.txt");
+        let url = format!("vlerv://reveal?path={}", file_path.display());
+
+        let event = dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert_eq!(event.intent, DeepLinkIntentKind::Reveal);
+        assert_eq!(event.path, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn path_outside_roots_returns_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("tempdir-outside");
+        let outside_file = outside.path().join("a.html");
+        fs::write(&outside_file, "x").expect("write");
+        let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
+        let url = format!("vlerv://open?path={}", outside_file.display());
+
+        let err = dispatch_deep_link(&url, &roots).expect_err("expected error");
+
+        assert_eq!(err.url, url);
+        assert!(err.reason.contains("out of root"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn malformed_url_returns_parse_error() {
+        let roots = security::RootSet::new(vec![std::env::temp_dir()]);
+        let err = dispatch_deep_link("notaurl://garbage", &roots).expect_err("err");
+        assert_eq!(err.url, "notaurl://garbage");
+        assert!(!err.reason.is_empty());
+    }
 }
