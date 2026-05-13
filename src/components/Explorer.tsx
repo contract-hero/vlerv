@@ -1,12 +1,21 @@
 // Explorer — recursive file tree with inline folder expansion + native drag-out.
 import * as React from "react";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
+import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
 
-// Absolute path to the drag-preview icon. macOS NSImage chokes on tiny or
-// non-image paths, so we always pass this 32×32 placeholder. (Adjust to the
-// resource path resolver when packaging for production.)
-const DRAG_ICON = "/Users/alilloig/workspace/vlerv-code/src-tauri/icons/drag-icon.png";
+// Drag-preview icon: resolved from the bundled `resources` declaration in
+// tauri.conf.json. Cached on first call so subsequent drags don't hit IPC.
+let cachedDragIcon: string | null = null;
+async function dragIcon(): Promise<string | null> {
+  if (cachedDragIcon !== null) return cachedDragIcon;
+  try {
+    cachedDragIcon = await resolveResource("icons/drag-icon.png");
+    return cachedDragIcon;
+  } catch {
+    return null;
+  }
+}
 
 const DEFAULT_IGNORED = new Set([
   ".git", "node_modules", "target", "dist", "build", ".next", ".venv",
@@ -114,13 +123,13 @@ function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.
       draggable
       onDragStart={(e) => {
         e.preventDefault();
-        // Initiate a native macOS drag with the file URL via tauri-plugin-drag.
-        void startDrag({
-          item: [entry.path],
-          icon: DRAG_ICON,
-        }).catch(() => {
-          // ignore — plugin may not be available in some environments
-        });
+        void (async () => {
+          const icon = await dragIcon();
+          if (!icon) return;
+          await startDrag({ item: [entry.path], icon }).catch(() => {
+            // ignore — plugin may not be available in some environments
+          });
+        })();
       }}
       data-path={entry.path}
       data-kind="file"
