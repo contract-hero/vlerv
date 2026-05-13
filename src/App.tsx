@@ -19,8 +19,16 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   >(null);
 
   const handleDeepLinkIntent = React.useCallback(
-    ({ path }: OpenFilePayload) => {
-      setSelectedFile(path);
+    ({ path, intent }: OpenFilePayload) => {
+      if (intent === "open") {
+        setSelectedFile(path);
+      } else {
+        // Reveal: per deeplink.rs, "selects + expands the tree without
+        // switching the preview". Tree expansion needs hoisting of
+        // FolderNode.expanded state — tracked as a follow-up. For now we
+        // honor the negative half of the contract (don't auto-load preview).
+        console.warn("vlerv: reveal intent received; tree-expansion not yet wired", path);
+      }
     },
     [],
   );

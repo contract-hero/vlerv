@@ -267,9 +267,24 @@ pub fn run() {
 mod dispatch_deep_link_tests {
     use super::*;
     use std::fs;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
 
+    // Redirect state_store writes to a tempdir for the whole test binary.
+    // Without this, `recents::push` → `state_store::set_state_field` spawns a
+    // debounced thread (DEBOUNCE_MS=250) that outlives the test and writes to
+    // the developer's real ~/Library/Application Support/Vlerv/state.json.
+    // Set once per process — `std::env::set_var` is process-global, and cargo
+    // runs tests in parallel threads, so racing per-test set_vars would point
+    // the debounced writer at TempDirs that have already been dropped.
+    fn ensure_isolated_state_dir() {
+        static STATE_DIR: OnceLock<TempDir> = OnceLock::new();
+        let dir = STATE_DIR.get_or_init(|| TempDir::new().expect("state tempdir"));
+        std::env::set_var("VLERV_STATE_DIR", dir.path());
+    }
+
     fn setup_root_with_file(name: &str) -> (TempDir, std::path::PathBuf, security::RootSet) {
+        ensure_isolated_state_dir();
         let dir = TempDir::new().expect("tempdir");
         let file_path = dir.path().join(name);
         fs::write(&file_path, "content").expect("write");
