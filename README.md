@@ -1,60 +1,54 @@
-# Vlerv — Claude Code companion app for macOS
+# Vlervcode
 
-Read-only workspace browser + HTML/Markdown viewer with `vlerv://` URL scheme and Finicky integration. **Status: post-incident salvage — see `STATUS.md`.**
+A macOS companion app for Claude Code: read-only workspace browser, full-fidelity HTML/Markdown viewer, native file drag-out, and `vlerv://` URL scheme for deep-linking from Claude Code or any other tool.
+
+Built with Tauri 2 + React + TypeScript. Ships as an **11 MB** native `.app` (no Node runtime needed once built).
+
+## Install
+
+```bash
+./scripts/build-app.sh
+cp -R target/release/bundle/macos/Vlervcode.app /Applications/
+```
+
+First launch: right-click → Open (Gatekeeper prompt — the app isn't notarized).
+
+## Use
+
+- **Pick workspace**: first launch shows "Choose workspace folder…" — pick any directory; it's remembered.
+- **Browse**: chevron-expand folders inline, click files to preview.
+- **Preview**:
+  - `.html` → full inline CSS/JS/SVG render (browser fidelity), `<base href>` injected so relative resources resolve.
+  - `.md` → marked + shiki + mermaid + katex, centered, dark theme.
+  - Code/text → shiki-highlighted.
+  - Images → data URI raster / inline SVG (scripts stripped).
+- **Drag files out**: drag any file row into Finder, Slack, Mail, Telegram, upload zones — produces a real macOS `kUTTypeFileURL` drop.
+- **Switch workspace**: top of sidebar → ⤴ button.
+
+## CLI
+
+```bash
+cd cli && cargo build --release
+./target/release/vlerv open ~/workspace/some-project/README.md
+```
+
+`vlerv open <path>` shells `open vlerv://open?path=<encoded>` — the running app catches the deep-link and opens the file.
 
 ## Stack
 
-- **Frontend**: React 18 + TypeScript + Vite (`@tauri-apps/api` for IPC).
-- **Renderers**: `marked` + `shiki` + `mermaid` + `katex` for Markdown; sandboxed iframe for HTML; `shiki` for code; inline SVG / data-URI for images.
-- **Backend**: Tauri 2 + Rust. Modules:
-  - `workspace.rs` — directory scanner with canonical-path cache + log-and-skip per-entry errors.
-  - `reader.rs` — file reader with root-anchored security gate + 6 typed error variants.
-  - `security.rs` — `RootSet` boundary; `canonicalize_and_check_root` is the load-bearing check.
-  - `deeplink.rs` — `vlerv://open?path=…&line=N` and `vlerv://reveal?path=…` parsing.
-  - `state_store.rs` — `~/Library/Application Support/Vlerv/state.json` round-trip (unknown-field tolerant).
-  - `recents.rs` — last-10 recents with MRU dedup.
-  - `watcher.rs` — `notify`-based file watcher emitting Tauri events.
-  - `drag_spike.rs` — drag-out payload contract (`public.file-url` + percent-encoded `file://` URL).
-- **CLI shim**: `cli/src/main.rs` → builds `vlerv` binary that shells `open vlerv://open?path=…` / `vlerv://reveal?path=…`.
+- Tauri 2 (Rust shell + WKWebView), React 18 + TS + Vite
+- Plugins: `tauri-plugin-deep-link`, `tauri-plugin-dialog`, `tauri-plugin-drag`
+- Render libs: `marked`, `shiki`, `mermaid`, `katex`
 
-## Run
+## Develop
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
 
-First cold build pulls Tauri 2's macOS toolchain (~3 min).
+Vite serves the frontend at http://localhost:1420; cargo runs the Tauri shell with hot reload of both the React side and the Rust side.
 
-The placeholder icon at `src-tauri/icons/icon.png` is a 1×1 RGBA PNG just so `tauri::generate_context!()` succeeds. Replace with a real iconset before shipping.
+## Status / next steps
 
-## CLI
-
-```bash
-cargo build -p vlerv-cli
-./target/debug/vlerv open ~/workspace/some-project/README.md
-./target/debug/vlerv reveal ~/workspace/some-project/
-```
-
-## Finicky integration
-
-Add to `~/workspace/dotfiles/.finicky.js` (inside `handlers: [ … ]`):
-
-```js
-{
-  match: ({ url }) => url.protocol === 'vlerv:' || url.protocol === 'vlerv',
-  browser: 'Vlerv',
-},
-```
-
-The `vlerv://` scheme is already declared in `src-tauri/Info.plist` (`CFBundleURLTypes`) and `tauri.conf.json` (`plugins.deep-link.desktop.schemes`).
-
-## iTerm2 Semantic History
-
-In iTerm2 → Preferences → Profiles → Advanced → Semantic History, choose "Run command…" and enter:
-
-```
-/Users/alilloig/.local/bin/vlerv open \1
-```
-
-(Symlink `target/debug/vlerv` to `~/.local/bin/vlerv` first.)
+See `STATUS.md` for the current state and open items.
