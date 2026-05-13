@@ -1,8 +1,10 @@
 // Explorer — recursive file tree with inline folder expansion + native drag-out.
 import * as React from "react";
+import { ChevronRight } from "lucide-react";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
+import { FileGlyph, FolderGlyph } from "./FileIcon";
 
 // Drag-preview icon: resolved from the bundled `resources` declaration in
 // tauri.conf.json. Cached on first call so subsequent drags don't hit IPC.
@@ -73,8 +75,12 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
         data-path={entry.path}
         data-kind="dir"
       >
-        <span className={`chevron ${expanded ? "open" : ""}`}>▸</span>
-        <span className="icon folder-icon" aria-hidden>{expanded ? "📂" : "📁"}</span>
+        <span className={`chevron ${expanded ? "open" : ""}`}>
+          <ChevronRight size={12} strokeWidth={2} />
+        </span>
+        <span className="icon folder-icon" aria-hidden>
+          <FolderGlyph open={expanded} />
+        </span>
         <span className="label">{entry.name}</span>
       </div>
       {expanded && error !== null && (
@@ -134,8 +140,10 @@ function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.
       data-path={entry.path}
       data-kind="file"
     >
-      <span className="chevron-placeholder" aria-hidden>·</span>
-      <span className="icon file-icon" aria-hidden>📄</span>
+      <span className="chevron-placeholder" aria-hidden> </span>
+      <span className="icon file-icon" aria-hidden>
+        <FileGlyph name={entry.name} />
+      </span>
       <span className="label">{entry.name}</span>
     </div>
   );
