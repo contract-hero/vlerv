@@ -1,0 +1,28 @@
+node_modules/
+target/
+dist/
+.DS_Store
+*.log
+.env
+.env.local
+
+# pnpm
+.pnpm-store/
+
+# Tauri build
+src-tauri/target/
+src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Stray drops
+orkskullz.webp
+
+# Forge artifacts (lost in the rsync incident; do not gitignore future runs)
+# .forge/

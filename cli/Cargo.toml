@@ -1,0 +1,11 @@
+[package]
+name = "vlerv-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vlerv"
+path = "src/main.rs"
+
+[dependencies]
+percent-encoding = "2"
