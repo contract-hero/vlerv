@@ -1,0 +1,119 @@
+// IPC surface between the React frontend and the Rust Tauri core.
+
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+
+export interface ProjectEntry {
+  name: string;
+  path: string;
+}
+
+export interface TreeEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+}
+
+export interface FilePayload {
+  path: string;
+  size: number;
+  mtime: number;
+  is_binary: boolean;
+  oversized: boolean;
+  content: string | null;
+}
+
+export interface RecentEntry {
+  path: string;
+  opened_at: number;
+}
+
+export interface SettingsState {
+  schema_version: number;
+  roots: string[];
+  preferences: {
+    ignore_globs: string[];
+    drag_out_mode: "file" | "url";
+  };
+}
+
+export interface IpcSurface {
+  listProjects(): Promise<ProjectEntry[] | string[]>;
+  listDir(projectPath: string): Promise<TreeEntry[]>;
+  readFile(path: string): Promise<FilePayload>;
+  setWorkspaceRoot?(path: string): void;
+  refreshProject?(projectPath: string): Promise<void>;
+  getState?(): Promise<SettingsState>;
+  setStateField?(key: string, value: unknown): Promise<void>;
+  pickDirectory?(): Promise<string | null>;
+  listRecents?(): Promise<RecentEntry[]>;
+  pushRecent?(path: string): Promise<void>;
+}
+
+const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
+
+function loadWorkspaceRoot(): string | null {
+  try {
+    return globalThis.localStorage?.getItem(WORKSPACE_ROOT_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWorkspaceRoot(path: string): void {
+  try {
+    globalThis.localStorage?.setItem(WORKSPACE_ROOT_KEY, path);
+  } catch {
+    // ignore
+  }
+}
+
+class TauriIpc implements IpcSurface {
+  private workspaceRoot: string | null = loadWorkspaceRoot();
+
+  setWorkspaceRoot(path: string): void {
+    this.workspaceRoot = path;
+    saveWorkspaceRoot(path);
+  }
+
+  async listProjects(): Promise<ProjectEntry[]> {
+    if (!this.workspaceRoot) {
+      throw new Error("NO_WORKSPACE_ROOT");
+    }
+    return await invoke<ProjectEntry[]>("list_workspace_roots", {
+      path: this.workspaceRoot,
+    });
+  }
+
+  async listDir(projectPath: string): Promise<TreeEntry[]> {
+    return await invoke<TreeEntry[]>("list_dir", { path: projectPath });
+  }
+
+  async readFile(path: string): Promise<FilePayload> {
+    return await invoke<FilePayload>("read_file", { path });
+  }
+
+  async pickDirectory(): Promise<string | null> {
+    const result = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose workspace folder",
+    });
+    if (typeof result === "string") return result;
+    return null;
+  }
+}
+
+export const tauriIpc: IpcSurface = new TauriIpc();
+
+export const defaultIpc: IpcSurface = {
+  async listProjects() {
+    throw new Error("ipc.listProjects: not wired");
+  },
+  async listDir(_p) {
+    throw new Error("ipc.listDir: not wired");
+  },
+  async readFile(_p) {
+    throw new Error("ipc.readFile: not wired");
+  },
+};
