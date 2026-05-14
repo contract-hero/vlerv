@@ -142,10 +142,13 @@ pub fn start_watching(
 }
 
 fn is_ignored(path: &PathBuf, ignore_globs: &[String]) -> bool {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    for glob in ignore_globs {
-        if matches_glob(file_name, glob) {
-            return true;
+    for component in path.components() {
+        if let Some(name) = component.as_os_str().to_str() {
+            for glob in ignore_globs {
+                if matches_glob(name, glob) {
+                    return true;
+                }
+            }
         }
     }
     false

@@ -56,15 +56,20 @@ fn read_file(
 fn set_workspace_root(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
+    roots: tauri::State<src_tauri::security::RootSet>,
     path: String,
 ) -> Result<(), String> {
     let root = std::path::PathBuf::from(&path);
-    if !root.exists() {
-        return Err(format!("path does not exist: {path}"));
-    }
+    let canonical = src_tauri::security::canonicalize_and_check_root(&root, &roots)
+        .map_err(|e| e.to_string())?;
+
+    let ignore_globs: Vec<String> = src_tauri::workspace::DEFAULT_IGNORED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = src_tauri::watcher::start_watching(vec![root], Vec::new(), tx)
+    let handle = src_tauri::watcher::start_watching(vec![canonical], ignore_globs, tx)
         .map_err(|e| format!("{e:?}"))?;
 
     {
