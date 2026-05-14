@@ -72,10 +72,9 @@ fn set_workspace_root(
         *guard = Some(handle);
     }
 
-    let app_handle = app.clone();
     std::thread::spawn(move || {
         for change in rx {
-            let _ = app_handle.emit("vlerv://tree-changed", change);
+            let _ = app.emit("vlerv://tree-changed", change);
         }
     });
 
