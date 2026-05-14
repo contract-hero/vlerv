@@ -5,6 +5,19 @@ import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
 import { FileGlyph, FolderGlyph } from "./FileIcon";
+import { useWatcher } from "../hooks/useWatcher";
+import type { TreeChangedPayload } from "../hooks/useWatcher";
+
+// Path-keyed cache-version map. FolderNode reads its own path's version from
+// context; bumping it re-fires that node's listDir effect without touching
+// siblings or its own expansion state.
+const FolderCacheContext = React.createContext<ReadonlyMap<string, number>>(new Map());
+
+// POSIX dirname. macOS-only app, so `/` separator is safe.
+function parentDir(absPath: string): string {
+  const idx = absPath.lastIndexOf("/");
+  return idx <= 0 ? "/" : absPath.slice(0, idx);
+}
 
 // Drag-preview icon: resolved from the bundled `resources` declaration in
 // tauri.conf.json. Cached on first call so subsequent drags don't hit IPC.
@@ -49,19 +62,24 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
   const [expanded, setExpanded] = React.useState(false);
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const versions = React.useContext(FolderCacheContext);
+  const version = versions.get(entry.path) ?? 0;
 
   React.useEffect(() => {
-    if (!expanded || entries !== null) return;
+    if (!expanded) return;
     let cancelled = false;
     ipc.listDir(entry.path)
       .then((list) => {
-        if (!cancelled) setEntries(list.filter((e) => !DEFAULT_IGNORED.has(e.name)));
+        if (!cancelled) {
+          setEntries(list.filter((e) => !DEFAULT_IGNORED.has(e.name)));
+          setError(null);
+        }
       })
       .catch((e: Error) => {
         if (!cancelled) setError(e.message);
       });
     return () => { cancelled = true; };
-  }, [expanded, entry.path, entries, ipc]);
+  }, [expanded, entry.path, ipc, version]);
 
   const indentPx = 12 + depth * 16;
   const isSelected = selectedFile === entry.path;
@@ -152,20 +170,58 @@ function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.
 export default function Explorer({ ipc, root, onSelectFile, selectedFile }: ExplorerProps): React.ReactElement {
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
 
+  const invalidate = React.useCallback((path: string) => {
+    setVersions((prev) => {
+      const next = new Map(prev);
+      next.set(path, (prev.get(path) ?? 0) + 1);
+      return next;
+    });
+  }, []);
+
+  const rootVersion = versions.get(root) ?? 0;
+
+  // Start the backend filesystem watcher for the current root. Replaces any
+  // previous watcher on the Rust side (see set_workspace_root in main.rs).
   React.useEffect(() => {
-    let cancelled = false;
+    if (!ipc.watchRoot) return;
+    void ipc.watchRoot(root).catch((e: unknown) => {
+      console.warn("vlerv: failed to start backend watcher for", root, e);
+    });
+  }, [ipc, root]);
+
+  // Bridge backend events into the cache: invalidate the parent dir of the
+  // changed path so just that folder re-fetches.
+  const handleChange = React.useCallback((payload: TreeChangedPayload) => {
+    invalidate(parentDir(payload.path));
+  }, [invalidate]);
+  useWatcher(handleChange);
+
+  // Blank visible state when the user picks a different workspace folder, so
+  // we don't briefly render stale entries under a new header.
+  React.useEffect(() => {
     setEntries(null);
     setError(null);
+  }, [root]);
+
+  // Fetch root listing on mount, root change, or refresh. No setEntries(null)
+  // here — that's the blank effect's job — so a watcher-driven refetch
+  // updates in place without flashing "Loading…".
+  React.useEffect(() => {
+    let cancelled = false;
     ipc.listDir(root)
       .then((list) => {
-        if (!cancelled) setEntries(list.filter((e) => !DEFAULT_IGNORED.has(e.name)));
+        if (!cancelled) {
+          setEntries(list.filter((e) => !DEFAULT_IGNORED.has(e.name)));
+          setError(null);
+        }
       })
       .catch((e: Error) => {
         if (!cancelled) setError(e.message);
       });
     return () => { cancelled = true; };
-  }, [ipc, root]);
+  }, [ipc, root, rootVersion]);
 
   if (error !== null) {
     return <div role="alert" className="explorer-error">{error}</div>;
@@ -175,27 +231,29 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
   }
 
   return (
-    <div className="explorer">
-      {sortEntries(entries).map((entry) =>
-        entry.is_dir ? (
-          <FolderNode
-            key={entry.path}
-            ipc={ipc}
-            entry={entry}
-            depth={0}
-            onSelectFile={onSelectFile}
-            selectedFile={selectedFile}
-          />
-        ) : (
-          <FileRow
-            key={entry.path}
-            entry={entry}
-            depth={0}
-            onSelectFile={onSelectFile}
-            selected={selectedFile === entry.path}
-          />
-        )
-      )}
-    </div>
+    <FolderCacheContext.Provider value={versions}>
+      <div className="explorer">
+        {sortEntries(entries).map((entry) =>
+          entry.is_dir ? (
+            <FolderNode
+              key={entry.path}
+              ipc={ipc}
+              entry={entry}
+              depth={0}
+              onSelectFile={onSelectFile}
+              selectedFile={selectedFile}
+            />
+          ) : (
+            <FileRow
+              key={entry.path}
+              entry={entry}
+              depth={0}
+              onSelectFile={onSelectFile}
+              selected={selectedFile === entry.path}
+            />
+          )
+        )}
+      </div>
+    </FolderCacheContext.Provider>
   );
 }
