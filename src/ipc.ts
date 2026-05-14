@@ -42,6 +42,7 @@ export interface IpcSurface {
   listDir(projectPath: string): Promise<TreeEntry[]>;
   readFile(path: string): Promise<FilePayload>;
   setWorkspaceRoot?(path: string): void;
+  watchRoot?(path: string): Promise<void>;
   refreshProject?(projectPath: string): Promise<void>;
   getState?(): Promise<SettingsState>;
   setStateField?(key: string, value: unknown): Promise<void>;
@@ -91,6 +92,10 @@ class TauriIpc implements IpcSurface {
 
   async readFile(path: string): Promise<FilePayload> {
     return await invoke<FilePayload>("read_file", { path });
+  }
+
+  async watchRoot(path: string): Promise<void> {
+    await invoke<void>("set_workspace_root", { path });
   }
 
   async pickDirectory(): Promise<string | null> {

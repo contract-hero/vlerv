@@ -28,7 +28,6 @@ pub struct Entry {
 #[derive(Default)]
 struct ScannerInner {
     readdir_counts: HashMap<PathBuf, usize>,
-    cache: HashMap<PathBuf, Vec<Entry>>,
     /// C2 (CF3): number of per-entry errors logged-and-skipped during the
     /// most recent `list_dir` against each canonical directory.
     skip_counts: HashMap<PathBuf, usize>,
@@ -63,10 +62,6 @@ impl Scanner {
         })?;
         if !meta.is_dir() {
             return Err(ScanError::NotADirectory(canonical));
-        }
-
-        if let Some(cached) = self.inner.lock().unwrap_or_else(|p| p.into_inner()).cache.get(&canonical) {
-            return Ok(cached.clone());
         }
 
         let read_iter = std::fs::read_dir(&canonical).map_err(|source| ScanError::Io {
@@ -132,8 +127,7 @@ impl Scanner {
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         *inner.readdir_counts.entry(canonical.clone()).or_insert(0) += 1;
-        inner.skip_counts.insert(canonical.clone(), skip_count);
-        inner.cache.insert(canonical, entries.clone());
+        inner.skip_counts.insert(canonical, skip_count);
 
         Ok(entries)
     }
