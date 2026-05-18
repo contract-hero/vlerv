@@ -13,9 +13,36 @@ function isErrorPayload(p: unknown): p is ErrorPayload {
 
 export interface PreviewProps {
   payload: FilePayload | ErrorPayload | null;
+  /**
+   * True when the displayed file lies outside the workspace root — either a
+   * user-picked ad-hoc file or an out-of-root vlerv:// deep link. Renders a
+   * small "external file" badge to signal that the explorer tree won't
+   * navigate to this path.
+   */
+  externalFile?: boolean;
 }
 
-export default function Preview({ payload }: PreviewProps): React.ReactElement {
+function ExternalBadge(): React.ReactElement {
+  return (
+    <span
+      data-testid="preview-external-badge"
+      title="This file is outside the workspace root"
+      style={{
+        marginLeft: "8px",
+        padding: "2px 6px",
+        fontSize: "0.75em",
+        borderRadius: "4px",
+        background: "#3b3b3b",
+        color: "#f0c674",
+        verticalAlign: "middle",
+      }}
+    >
+      external file
+    </span>
+  );
+}
+
+export default function Preview({ payload, externalFile = false }: PreviewProps): React.ReactElement {
   if (payload === null) {
     return (
       <div style={{ padding: "16px", color: "#999" }}>
@@ -28,7 +55,10 @@ export default function Preview({ payload }: PreviewProps): React.ReactElement {
     const { kind, path, reason } = payload.error;
     return (
       <div role="alert" data-testid="preview-error" style={{ padding: "16px" }}>
-        <header>{path}</header>
+        <header>
+          {path}
+          {externalFile ? <ExternalBadge /> : null}
+        </header>
         <p><strong>{kind}</strong></p>
         <p>{reason}</p>
       </div>
@@ -37,7 +67,10 @@ export default function Preview({ payload }: PreviewProps): React.ReactElement {
 
   return (
     <div data-testid="preview-content">
-      <header>{payload.path}</header>
+      <header>
+        {payload.path}
+        {externalFile ? <ExternalBadge /> : null}
+      </header>
       {renderByExtension(payload)}
     </div>
   );

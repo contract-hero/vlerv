@@ -8,6 +8,13 @@ export type DeepLinkIntent = "open" | "reveal";
 export interface OpenFilePayload {
   path: string;
   intent: DeepLinkIntent;
+  /**
+   * True when the canonicalized path falls outside every configured root.
+   * Emitted by `dispatch_deep_link` in src-tauri/src/lib.rs. Older payloads
+   * (pre this change) do not include this field; readers must treat it as
+   * optional and default to false.
+   */
+  out_of_root?: boolean;
 }
 
 export interface DeepLinkErrorPayload {

@@ -3,7 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Mutex;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 pub struct AppState {
@@ -112,6 +112,18 @@ fn main() {
             let app_handle = app.handle().clone();
             let roots = roots_for_setup;
             app.deep_link().on_open_url(move |event| {
+                // Bring the window to the foreground before dispatching, so a
+                // deep-link click from another app raises Vlervcode instead of
+                // silently delivering the file to a backgrounded / minimized /
+                // hidden window. On macOS, `set_focus` activates the app via
+                // NSApp.activate(ignoringOtherApps:) — `macosPrivateApi` is
+                // already enabled in tauri.conf.json. Calls are idempotent, so
+                // an already-focused window sees no flicker.
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
                 for url in event.urls() {
                     let url_str = url.to_string();
                     src_tauri::handle_deep_link(&url_str);
