@@ -7,8 +7,15 @@ const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
 
 export interface SidebarProps {
   ipc: IpcSurface;
-  onSelectFile?: (path: string) => void;
+  onSelectFile?: (path: string, external?: boolean) => void;
   selectedFile?: string | null;
+  /**
+   * Imperative trigger for the "Open File…" picker. The parent assigns this
+   * ref so a keyboard shortcut (e.g. ⌘O in App) can invoke the same path as
+   * clicking the button. Returns nothing — the picked path is delivered via
+   * `onSelectFile(path, external)`.
+   */
+  openFileTrigger?: React.MutableRefObject<(() => void) | null>;
 }
 
 function readSavedRoot(): string | null {
@@ -19,7 +26,18 @@ function readSavedRoot(): string | null {
   }
 }
 
-export default function Sidebar({ ipc, onSelectFile, selectedFile }: SidebarProps): React.ReactElement {
+function isUnderRoot(path: string, root: string | null): boolean {
+  if (!root) return false;
+  const normalized = root.endsWith("/") ? root : `${root}/`;
+  return path === root || path.startsWith(normalized);
+}
+
+export default function Sidebar({
+  ipc,
+  onSelectFile,
+  selectedFile,
+  openFileTrigger,
+}: SidebarProps): React.ReactElement {
   const [workspaceRoot, setWorkspaceRoot] = React.useState<string | null>(readSavedRoot());
 
   const handlePick = async () => {
@@ -33,6 +51,25 @@ export default function Sidebar({ ipc, onSelectFile, selectedFile }: SidebarProp
       // ignore
     }
   };
+
+  const handleOpenFile = React.useCallback(async () => {
+    if (!ipc.pickFile) return;
+    try {
+      const picked = await ipc.pickFile();
+      if (!picked) return;
+      onSelectFile?.(picked, !isUnderRoot(picked, workspaceRoot));
+    } catch {
+      // ignore
+    }
+  }, [ipc, onSelectFile, workspaceRoot]);
+
+  React.useEffect(() => {
+    if (!openFileTrigger) return;
+    openFileTrigger.current = () => void handleOpenFile();
+    return () => {
+      openFileTrigger.current = null;
+    };
+  }, [openFileTrigger, handleOpenFile]);
 
   const handleChange = () => {
     try {
@@ -50,6 +87,13 @@ export default function Sidebar({ ipc, onSelectFile, selectedFile }: SidebarProp
         <button className="sidebar-button" onClick={() => void handlePick()}>
           Choose workspace folder…
         </button>
+        <button
+          className="sidebar-button"
+          onClick={() => void handleOpenFile()}
+          title="Open a single file (⌘O)"
+        >
+          Open file…
+        </button>
       </div>
     );
   }
@@ -60,6 +104,13 @@ export default function Sidebar({ ipc, onSelectFile, selectedFile }: SidebarProp
     <div className="sidebar">
       <div className="sidebar-header">
         <span className="sidebar-header-title" title={workspaceRoot}>{folderName}</span>
+        <button
+          className="sidebar-header-change"
+          onClick={() => void handleOpenFile()}
+          title="Open file… (⌘O)"
+        >
+          📄
+        </button>
         <button className="sidebar-header-change" onClick={handleChange} title="Change workspace folder">
           ⤴
         </button>
@@ -67,7 +118,7 @@ export default function Sidebar({ ipc, onSelectFile, selectedFile }: SidebarProp
       <Explorer
         ipc={ipc}
         root={workspaceRoot}
-        onSelectFile={onSelectFile}
+        onSelectFile={(p) => onSelectFile?.(p, false)}
         selectedFile={selectedFile ?? null}
       />
     </div>

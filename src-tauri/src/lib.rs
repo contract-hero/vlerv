@@ -44,11 +44,14 @@ pub enum DeepLinkIntentKind {
 }
 
 /// Typed payload emitted on `vlerv://open-file` after a deep-link is parsed
-/// and the path is canonicalized against the active `RootSet`.
+/// and the path is canonicalized. `out_of_root` is true when the path
+/// canonicalizes successfully but falls outside every configured root — the
+/// frontend renders these as ad-hoc external files with a visible badge.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpenFileEvent {
     pub path: std::path::PathBuf,
     pub intent: DeepLinkIntentKind,
+    pub out_of_root: bool,
 }
 
 /// Typed payload emitted on `vlerv://deep-link-error` when the URL is
@@ -201,16 +204,27 @@ pub fn dispatch_deep_link(
         deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal),
     };
 
-    let canonical = security::canonicalize_and_check_root(&path, roots)
-        .map_err(|e| make_err(e.to_string()))?;
+    // Branch on the security gate: an `OutOfRoot(canonical)` error means the
+    // path *does* exist and was canonicalized, but lies outside every
+    // configured root. Those become ad-hoc external opens with
+    // `out_of_root: true`. Any other variant (CanonicalizeFailed, EmptyRoots)
+    // is still a hard error — we never open a path the OS can't resolve.
+    let (canonical, out_of_root) = match security::canonicalize_and_check_root(&path, roots) {
+        Ok(canonical) => (canonical, false),
+        Err(security::OutOfRootError::OutOfRoot(canonical)) => (canonical, true),
+        Err(e) => return Err(make_err(e.to_string())),
+    };
 
-    if matches!(kind, DeepLinkIntentKind::Open) {
+    if matches!(kind, DeepLinkIntentKind::Open) && !out_of_root {
+        // Recents is scoped to in-root files; ad-hoc external opens stay
+        // ephemeral until the user adopts a multi-root model.
         let _ = recents::push(&canonical);
     }
 
     Ok(OpenFileEvent {
         path: canonical,
         intent: kind,
+        out_of_root,
     })
 }
 
@@ -301,6 +315,7 @@ mod dispatch_deep_link_tests {
 
         assert_eq!(event.intent, DeepLinkIntentKind::Open);
         assert_eq!(event.path, file_path.canonicalize().unwrap());
+        assert!(!event.out_of_root);
     }
 
     #[test]
@@ -312,10 +327,12 @@ mod dispatch_deep_link_tests {
 
         assert_eq!(event.intent, DeepLinkIntentKind::Reveal);
         assert_eq!(event.path, file_path.canonicalize().unwrap());
+        assert!(!event.out_of_root);
     }
 
     #[test]
-    fn path_outside_roots_returns_error() {
+    fn path_outside_roots_returns_ad_hoc_open_event() {
+        ensure_isolated_state_dir();
         let dir = TempDir::new().expect("tempdir");
         let outside = TempDir::new().expect("tempdir-outside");
         let outside_file = outside.path().join("a.html");
@@ -323,10 +340,24 @@ mod dispatch_deep_link_tests {
         let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
         let url = format!("vlerv://open?path={}", outside_file.display());
 
-        let err = dispatch_deep_link(&url, &roots).expect_err("expected error");
+        let event = dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert_eq!(event.intent, DeepLinkIntentKind::Open);
+        assert_eq!(event.path, outside_file.canonicalize().unwrap());
+        assert!(event.out_of_root);
+    }
+
+    #[test]
+    fn nonexistent_path_still_returns_error() {
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
+        let url = "vlerv://open?path=/no/such/path/exists/here.html";
+
+        let err = dispatch_deep_link(url, &roots).expect_err("expected error");
 
         assert_eq!(err.url, url);
-        assert!(err.reason.contains("out of root"), "got: {}", err.reason);
+        assert!(!err.reason.is_empty());
     }
 
     #[test]

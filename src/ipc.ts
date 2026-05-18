@@ -47,6 +47,7 @@ export interface IpcSurface {
   getState?(): Promise<SettingsState>;
   setStateField?(key: string, value: unknown): Promise<void>;
   pickDirectory?(): Promise<string | null>;
+  pickFile?(): Promise<string | null>;
   listRecents?(): Promise<RecentEntry[]>;
   pushRecent?(path: string): Promise<void>;
 }
@@ -103,6 +104,16 @@ class TauriIpc implements IpcSurface {
       directory: true,
       multiple: false,
       title: "Choose workspace folder",
+    });
+    if (typeof result === "string") return result;
+    return null;
+  }
+
+  async pickFile(): Promise<string | null> {
+    const result = await openDialog({
+      directory: false,
+      multiple: false,
+      title: "Open file",
     });
     if (typeof result === "string") return result;
     return null;
