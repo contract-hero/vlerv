@@ -69,16 +69,18 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   // file renders in-place and the externalFile flag is recomputed against
   // the current workspace root.
   React.useEffect(() => {
+    function isUnderRoot(path: string, root: string | null): boolean {
+      if (!root) return false;
+      const normalized = root.endsWith("/") ? root : `${root}/`;
+      return path === root || path.startsWith(normalized);
+    }
     const onMessage = (e: MessageEvent) => {
       const data = e.data as unknown;
       if (!data || typeof data !== "object") return;
       const d = data as { type?: unknown; path?: unknown };
       if (d.type !== "vlerv:navigate" || typeof d.path !== "string") return;
       const root = globalThis.localStorage?.getItem("vlerv.workspaceRoot") ?? null;
-      const isExternal = !root
-        ? true
-        : !(d.path === root || d.path.startsWith(root.endsWith("/") ? root : `${root}/`));
-      selectFile(d.path, isExternal);
+      selectFile(d.path, !isUnderRoot(d.path, root));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -107,7 +109,7 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
       <aside className="pane pane-sidebar" role="complementary">
         <Sidebar
           ipc={ipc}
-          onSelectFile={(p, external) => selectFile(p, Boolean(external))}
+          onSelectFile={(p, external = false) => selectFile(p, external)}
           selectedFile={selectedFile}
           openFileTrigger={openFileTrigger}
         />

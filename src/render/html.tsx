@@ -22,7 +22,7 @@ const LINK_INTERCEPT_SCRIPT = `
     var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
     if (!a) return;
     var raw = a.getAttribute('href') || '';
-    if (!raw || raw.charAt(0) === '#' || raw.startsWith('mailto:') || raw.startsWith('tel:') || raw.startsWith('javascript:')) {
+    if (!raw || raw.startsWith('#') || raw.startsWith('mailto:') || raw.startsWith('tel:') || raw.startsWith('javascript:')) {
       return;
     }
     var resolved;
