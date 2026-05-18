@@ -8,7 +8,7 @@
  * are known edge cases. The Rust security gate (`canonicalize_and_check_root`)
  * is the authoritative check for any code path that actually reads the file.
  */
-export function isUnderRoot(path: string, root: string | null): boolean {
+export function isUnderRoot(path: string, root: string | null | undefined): boolean {
   if (!root) return false;
   const normalized = root.endsWith("/") ? root : `${root}/`;
   return path === root || path.startsWith(normalized);

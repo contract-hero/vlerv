@@ -6,6 +6,7 @@ import * as React from "react";
 import { ChevronRight } from "lucide-react";
 import { useBookmarks } from "../hooks/useBookmarks";
 import { defaultIpc } from "../ipc";
+import { isUnderRoot } from "../utils/path";
 
 const COLLAPSED_KEY = "vlerv.bookmarks.collapsed";
 
@@ -29,12 +30,6 @@ export interface BookmarksProps {
   ipc?: typeof defaultIpc;
   onSelectFile?: (path: string, external?: boolean) => void;
   workspaceRoot?: string | null;
-}
-
-function isUnderRoot(path: string, root: string | null | undefined): boolean {
-  if (!root) return false;
-  const normalized = root.endsWith("/") ? root : `${root}/`;
-  return path === root || path.startsWith(normalized);
 }
 
 export default function Bookmarks({
