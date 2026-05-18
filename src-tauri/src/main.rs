@@ -42,6 +42,53 @@ fn read_file(
         .map_err(|e| e.to_string())
 }
 
+// ─── state_store + recents + bookmarks IPC ───────────────────────────────────
+// These wrap the existing module functions as Tauri commands. The frontend
+// (src/ipc.ts, src/hooks/useSettings.ts, src/hooks/useRecents.ts,
+// src/hooks/useBookmarks.ts) consumes them through invoke().
+
+#[tauri::command]
+fn get_state() -> serde_json::Value {
+    src_tauri::state_store::current_state_value()
+}
+
+#[tauri::command]
+fn set_state_field(key: String, value: serde_json::Value) -> Result<(), String> {
+    src_tauri::state_store::set_state_field(&key, value)
+}
+
+#[tauri::command]
+fn list_recents() -> Vec<src_tauri::state_store::RecentEntry> {
+    src_tauri::recents::list()
+}
+
+#[tauri::command]
+fn push_recent(path: String) -> Result<(), String> {
+    src_tauri::recents::push(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn list_bookmarks() -> Vec<src_tauri::state_store::BookmarkEntry> {
+    src_tauri::bookmarks::list()
+}
+
+#[tauri::command]
+fn add_bookmark(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    src_tauri::bookmarks::add(std::path::Path::new(&path))?;
+    // Broadcast the updated list so every useBookmarks subscriber (Explorer
+    // star state, Preview-header star, Sidebar Bookmarks section) stays in
+    // sync without each instance maintaining its own optimistic state.
+    let _ = app.emit("vlerv://bookmarks-updated", src_tauri::bookmarks::list());
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_bookmark(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    src_tauri::bookmarks::remove(std::path::Path::new(&path))?;
+    let _ = app.emit("vlerv://bookmarks-updated", src_tauri::bookmarks::list());
+    Ok(())
+}
+
 /// Start (or replace) the filesystem watcher rooted at `path`. Each successful
 /// call drops any previous watcher handle (stopping its OS-level watch) and
 /// spawns a fresh notify-rs watcher plus a bridge thread that forwards
@@ -92,6 +139,12 @@ fn main() {
     let roots = src_tauri::security::RootSet::new(vec![default_root]);
     let roots_for_setup = roots.clone();
 
+    // Eager-load the on-disk state.json into the in-memory global state so the
+    // very first `get_state` / `list_recents` / `list_bookmarks` call after
+    // launch returns the persisted values, not Default. Without this the
+    // frontend silently rehydrates to empty on every cold start.
+    src_tauri::state_store::load();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
@@ -107,6 +160,13 @@ fn main() {
             list_workspace_roots,
             read_file,
             set_workspace_root,
+            get_state,
+            set_state_field,
+            list_recents,
+            push_recent,
+            list_bookmarks,
+            add_bookmark,
+            remove_bookmark,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

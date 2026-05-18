@@ -41,7 +41,7 @@ export default function Tree({
 
   if (error !== null) {
     return (
-      <div role="alert" data-testid="tree-error" style={{ color: "red", padding: "8px" }}>
+      <div role="alert" data-testid="tree-error" className="explorer-error" style={{ padding: "8px" }}>
         {error}
       </div>
     );

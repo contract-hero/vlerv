@@ -28,9 +28,20 @@ export interface RecentEntry {
   opened_at: number;
 }
 
+export interface BookmarkEntry {
+  path: string;
+  bookmarked_at: number;
+}
+
 export interface SettingsState {
   schema_version: number;
   roots: string[];
+  recents?: RecentEntry[];
+  bookmarks?: BookmarkEntry[];
+  panes?: {
+    sidebar_px?: number;
+    preview_px?: number;
+  };
   preferences: {
     ignore_globs: string[];
     drag_out_mode: "file" | "url";
@@ -50,6 +61,9 @@ export interface IpcSurface {
   pickFile?(): Promise<string | null>;
   listRecents?(): Promise<RecentEntry[]>;
   pushRecent?(path: string): Promise<void>;
+  listBookmarks?(): Promise<BookmarkEntry[]>;
+  addBookmark?(path: string): Promise<void>;
+  removeBookmark?(path: string): Promise<void>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -117,6 +131,34 @@ class TauriIpc implements IpcSurface {
     });
     if (typeof result === "string") return result;
     return null;
+  }
+
+  async getState(): Promise<SettingsState> {
+    return await invoke<SettingsState>("get_state");
+  }
+
+  async setStateField(key: string, value: unknown): Promise<void> {
+    await invoke<void>("set_state_field", { key, value });
+  }
+
+  async listRecents(): Promise<RecentEntry[]> {
+    return await invoke<RecentEntry[]>("list_recents");
+  }
+
+  async pushRecent(path: string): Promise<void> {
+    await invoke<void>("push_recent", { path });
+  }
+
+  async listBookmarks(): Promise<BookmarkEntry[]> {
+    return await invoke<BookmarkEntry[]>("list_bookmarks");
+  }
+
+  async addBookmark(path: string): Promise<void> {
+    await invoke<void>("add_bookmark", { path });
+  }
+
+  async removeBookmark(path: string): Promise<void> {
+    await invoke<void>("remove_bookmark", { path });
   }
 }
 

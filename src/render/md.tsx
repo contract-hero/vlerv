@@ -3,6 +3,7 @@
 // HTML is injected via DOMParser → importNode (no innerHTML assignment).
 import * as React from "react";
 import { marked } from "marked";
+import { useTheme } from "../hooks/useTheme";
 
 export interface MdRendererProps {
   source: string;
@@ -13,6 +14,7 @@ export interface MdRendererProps {
 export default function MdRenderer({ source }: MdRendererProps): React.ReactElement {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [shikiReady, setShikiReady] = React.useState(false);
+  const theme = useTheme();
 
   // Initial render: parse markdown to HTML, then inject via DOMParser+importNode.
   React.useEffect(() => {
@@ -41,7 +43,8 @@ export default function MdRenderer({ source }: MdRendererProps): React.ReactElem
           if (lang === "mermaid") continue;
           const raw = code.textContent ?? "";
           try {
-            const highlighted = await codeToHtml(raw, { lang, theme: "github-light" });
+            const shikiTheme = theme === "light" ? "github-light" : "github-dark";
+            const highlighted = await codeToHtml(raw, { lang, theme: shikiTheme });
             if (cancelled) return;
             const replaced = new DOMParser().parseFromString(highlighted, "text/html").body.firstChild;
             if (replaced && code.parentElement) {
@@ -86,7 +89,7 @@ export default function MdRenderer({ source }: MdRendererProps): React.ReactElem
     })();
 
     return () => { cancelled = true; };
-  }, [source]);
+  }, [source, theme]);
 
   return (
     <div

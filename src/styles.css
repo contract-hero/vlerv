@@ -1,4 +1,10 @@
-:root {
+/*
+ * Theme tokens — useTheme() sets `<html data-theme="dark|light">`. The dark
+ * block doubles as the fallback for the very first paint (before the hook
+ * mounts) so we never get a flash of unstyled values.
+ */
+:root,
+:root[data-theme="dark"] {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   font-size: 13px;
   color-scheme: dark;
@@ -11,6 +17,57 @@
   --fg-dim: #6a6a6a;
   --accent: #4dabf7;
   --border: #2a2a2a;
+  --heading-fg: #e8e8e8;
+  --code-bg: #2a2a2a;
+  --code-fg: #f0e8d8;
+  --pre-bg: #161616;
+  --button-hover-bg: #4a4a52;
+  --error-fg: #ff7676;
+  --label-active-fg: #ffffff;
+  --scrollbar-thumb: #3a3a3a;
+  --scrollbar-thumb-hover: #4a4a4a;
+  --iframe-bg: #ffffff;
+  --badge-bg: #3b3b3b;
+  --badge-fg: #f0c674;
+  --empty-fg: #999999;
+  --input-bg: #2a2a2a;
+  --input-border: #3a3a3a;
+  --input-border-focus: #4dabf7;
+  --resizer-hover: #4dabf7;
+  --star-active: #f0c674;
+  --star-idle: #4a4a4a;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-sidebar: #f5f5f5;
+  --bg-row-hover: #ebebeb;
+  --bg-row-selected: #d0e3f8;
+  --fg: #1f1f1f;
+  --fg-muted: #6e6e6e;
+  --fg-dim: #9a9a9a;
+  --accent: #1976d2;
+  --border: #e0e0e0;
+  --heading-fg: #1a1a1a;
+  --code-bg: #f0f0f0;
+  --code-fg: #6e3700;
+  --pre-bg: #fafafa;
+  --button-hover-bg: #d8d8d8;
+  --error-fg: #d32f2f;
+  --label-active-fg: #000000;
+  --scrollbar-thumb: #c0c0c0;
+  --scrollbar-thumb-hover: #a0a0a0;
+  --iframe-bg: #ffffff;
+  --badge-bg: #e8e8e8;
+  --badge-fg: #b8862e;
+  --empty-fg: #888888;
+  --input-bg: #ffffff;
+  --input-border: #c8c8c8;
+  --input-border-focus: #1976d2;
+  --resizer-hover: #1976d2;
+  --star-active: #d4a017;
+  --star-idle: #b8b8b8;
 }
 
 * { box-sizing: border-box; }
@@ -39,13 +96,33 @@ html, body, #root {
 }
 
 .pane-sidebar {
-  width: 280px;
+  /* Width is applied inline by App.tsx (driven by state.panes.sidebar_px).
+     min/max here are the clamp constraints honored by the resizer; we no
+     longer use CSS `resize: horizontal` (it required overflow:auto which we
+     don't want and worked unreliably in the webview). */
   min-width: 200px;
   max-width: 480px;
   flex-shrink: 0;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
-  resize: horizontal;
+  position: relative;
+}
+
+.sidebar-resizer {
+  /* Sibling of .pane-sidebar / .pane-preview in the .app flex row. Sitting
+     in the natural flow keeps it visible — the previous absolute-positioned
+     version got clipped by the parent pane's `overflow: auto`. */
+  flex: 0 0 6px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 120ms ease;
+}
+.sidebar-resizer:hover,
+.sidebar-resizer.dragging {
+  background: var(--resizer-hover);
+  opacity: 0.7;
 }
 
 .pane-preview {
@@ -82,7 +159,23 @@ html, body, #root {
   height: auto !important;
   width: 100%;
   border: none;
-  background: white;
+  background: var(--iframe-bg);
+}
+
+/* Preview empty + external badge (extracted from inline styles) */
+.preview-empty {
+  padding: 16px;
+  color: var(--empty-fg);
+}
+.preview-badge-external {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 6px;
+  font-size: 0.75em;
+  border-radius: 4px;
+  background: var(--badge-bg);
+  color: var(--badge-fg);
+  vertical-align: middle;
 }
 
 /* Markdown rendering */
@@ -95,7 +188,7 @@ html, body, #root {
 [data-testid="md-content"] h2,
 [data-testid="md-content"] h3,
 [data-testid="md-content"] h4 {
-  color: #e8e8e8;
+  color: var(--heading-fg);
   margin-top: 1.6em;
   margin-bottom: 0.6em;
   line-height: 1.25;
@@ -109,13 +202,13 @@ html, body, #root {
 [data-testid="md-content"] code {
   font-family: "SF Mono", ui-monospace, monospace;
   font-size: 0.9em;
-  background: #2a2a2a;
-  color: #f0e8d8;
+  background: var(--code-bg);
+  color: var(--code-fg);
   padding: 0.15em 0.4em;
   border-radius: 4px;
 }
 [data-testid="md-content"] pre {
-  background: #161616;
+  background: var(--pre-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 14px 16px;
@@ -184,8 +277,9 @@ html, body, #root {
   font-weight: 500;
   cursor: pointer;
   transition: background 80ms ease;
+  margin: 4px;
 }
-.sidebar-button:hover { background: #4a4a52; }
+.sidebar-button:hover { background: var(--button-hover-bg); }
 
 /* Sidebar (workspace picked) */
 .sidebar {
@@ -224,6 +318,114 @@ html, body, #root {
 }
 .sidebar-header-change:hover { color: var(--fg); }
 
+/* Path input bar (Feature D) — slim text input between header and explorer */
+.sidebar-path-bar {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  gap: 4px;
+}
+.sidebar-path-bar input {
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--input-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 80ms ease;
+}
+.sidebar-path-bar input:focus {
+  border-color: var(--input-border-focus);
+}
+.sidebar-path-bar .path-bar-error {
+  color: var(--error-fg);
+  font-size: 11px;
+}
+
+/* Bookmarks section (Feature B) — parallel to Recents pattern */
+[data-section="bookmarks"] h4,
+[data-section="recents"] h4 {
+  margin: 8px 12px 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  font-weight: 700;
+}
+[data-section="bookmarks"] .bookmarks-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+}
+[data-section="bookmarks"] .bookmarks-header:hover {
+  color: var(--fg-muted);
+}
+[data-section="bookmarks"] .bookmarks-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  transition: transform 80ms ease;
+}
+[data-section="bookmarks"] .bookmarks-chevron.open {
+  transform: rotate(90deg);
+}
+[data-section="bookmarks"] .bookmarks-count {
+  margin-left: auto;
+  margin-right: 4px;
+  color: var(--fg-dim);
+  font-weight: 600;
+}
+[data-section="bookmarks"] ul,
+[data-section="recents"] ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+[data-section="bookmarks"] li,
+[data-section="recents"] li {
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-section="bookmarks"] li:hover,
+[data-section="recents"] li:hover {
+  background: var(--bg-row-hover);
+  color: var(--fg);
+}
+
+/* Bookmark toggle button in the Preview header (mirrors copy button) */
+.preview-bookmark {
+  background: transparent;
+  border: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: var(--fg-muted);
+  display: inline-flex;
+  align-items: center;
+  border-radius: 3px;
+  flex: 0 0 auto;
+  transition: color 80ms ease, background 80ms ease;
+}
+.preview-bookmark:hover {
+  color: var(--star-active);
+  background: var(--bg-row-hover);
+}
+.preview-bookmark.bookmarked {
+  color: var(--star-active);
+}
+
 /* Explorer */
 .explorer {
   padding: 4px 0 16px;
@@ -235,7 +437,7 @@ html, body, #root {
   color: var(--fg-muted);
   font-size: 12px;
 }
-.explorer-error { color: #ff7676; }
+.explorer-error { color: var(--error-fg); }
 
 .row {
   display: flex;
@@ -277,22 +479,53 @@ html, body, #root {
   overflow: hidden;
   text-overflow: ellipsis;
   font-weight: 400;
+  flex: 1 1 auto;
 }
 
 .row.folder .label { color: var(--fg); font-weight: 500; }
 .row.file .label { color: var(--fg); }
-.row.file:hover .label { color: #ffffff; }
-.row.selected .label { color: #ffffff; }
+.row.file:hover .label { color: var(--label-active-fg); }
+.row.selected .label { color: var(--label-active-fg); }
 
 .row.error-row {
-  color: #ff7676;
+  color: var(--error-fg);
   font-size: 11px;
   font-style: italic;
   cursor: default;
 }
 
+/* Star button on FileRow (Feature B) — always visible so users can discover
+   it; idle state is dimmed, hover/bookmarked is the full accent. */
+.row .star-toggle {
+  background: transparent;
+  border: 0;
+  padding: 2px 4px;
+  margin-left: 4px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  color: var(--star-idle);
+  display: inline-flex;
+  align-items: center;
+  opacity: 0.35;
+  transition: opacity 80ms ease, color 80ms ease;
+}
+.row:hover .star-toggle {
+  opacity: 1;
+}
+.row .star-toggle.bookmarked {
+  color: var(--star-active);
+  opacity: 1;
+}
+.row .star-toggle:hover {
+  color: var(--star-active);
+  opacity: 1;
+}
+
 /* Preview pane */
 header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 6px 14px;
   background: var(--bg-sidebar);
   border-bottom: 1px solid var(--border);
@@ -301,7 +534,29 @@ header {
   font-family: "SF Mono", ui-monospace, monospace;
   white-space: nowrap;
   overflow: hidden;
+}
+header .preview-path {
+  overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Copy-path button (Preview header) */
+.preview-copy-path {
+  background: transparent;
+  border: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: var(--fg-muted);
+  display: inline-flex;
+  align-items: center;
+  border-radius: 3px;
+  flex: 0 0 auto;
+  transition: color 80ms ease, background 80ms ease;
+}
+.preview-copy-path:hover {
+  color: var(--fg);
+  background: var(--bg-row-hover);
 }
 
 pre {
@@ -315,23 +570,13 @@ pre {
   word-break: break-word;
 }
 
-
-[data-section="recents"] h4 {
-  margin: 8px 12px 4px;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--fg-dim);
-  font-weight: 700;
-}
-
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3a3a3a;
+  background: var(--scrollbar-thumb);
   border-radius: 5px;
 }
-::-webkit-scrollbar-thumb:hover { background: #4a4a4a; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }

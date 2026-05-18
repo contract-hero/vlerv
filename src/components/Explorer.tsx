@@ -1,12 +1,13 @@
 // Explorer — recursive file tree with inline folder expansion + native drag-out.
 import * as React from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Star } from "lucide-react";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
 import { FileGlyph, FolderGlyph } from "./FileIcon";
 import { useWatcher } from "../hooks/useWatcher";
 import type { TreeChangedPayload } from "../hooks/useWatcher";
+import { useBookmarks } from "../hooks/useBookmarks";
 
 // Path-keyed cache-version map. FolderNode reads its own path's version from
 // context; bumping it re-fires that node's listDir effect without touching
@@ -64,6 +65,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
   const [error, setError] = React.useState<string | null>(null);
   const versions = React.useContext(FolderCacheContext);
   const version = versions.get(entry.path) ?? 0;
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
 
   React.useEffect(() => {
     if (!expanded) return;
@@ -123,6 +125,8 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
             depth={depth + 1}
             onSelectFile={onSelectFile}
             selected={selectedFile === child.path}
+            bookmarked={isBookmarked(child.path)}
+            onToggleBookmark={(p) => void toggleBookmark(p)}
           />
         )
       )}
@@ -135,9 +139,11 @@ interface FileRowProps {
   depth: number;
   onSelectFile?: (path: string) => void;
   selected: boolean;
+  bookmarked: boolean;
+  onToggleBookmark: (path: string) => void;
 }
 
-function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.ReactElement {
+function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
   const indentPx = 12 + depth * 16;
   return (
     <div
@@ -163,6 +169,19 @@ function FileRow({ entry, depth, onSelectFile, selected }: FileRowProps): React.
         <FileGlyph name={entry.name} />
       </span>
       <span className="label">{entry.name}</span>
+      <button
+        className={`star-toggle${bookmarked ? " bookmarked" : ""}`}
+        data-testid="bookmark-toggle"
+        title={bookmarked ? "Remove bookmark" : "Bookmark"}
+        aria-label={bookmarked ? "Remove bookmark" : "Bookmark"}
+        aria-pressed={bookmarked}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleBookmark(entry.path);
+        }}
+      >
+        <Star size={14} strokeWidth={2} fill={bookmarked ? "currentColor" : "none"} />
+      </button>
     </div>
   );
 }
@@ -171,6 +190,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
 
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
@@ -250,6 +270,8 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
               depth={0}
               onSelectFile={onSelectFile}
               selected={selectedFile === entry.path}
+              bookmarked={isBookmarked(entry.path)}
+              onToggleBookmark={(p) => void toggleBookmark(p)}
             />
           )
         )}

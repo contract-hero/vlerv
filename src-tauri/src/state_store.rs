@@ -20,6 +20,12 @@ pub struct RecentEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookmarkEntry {
+    pub path: PathBuf,
+    pub bookmarked_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowGeom {
     pub x: i32,
@@ -60,6 +66,7 @@ pub struct State {
     pub schema_version: u32,
     pub roots: Vec<PathBuf>,
     pub recents: Vec<RecentEntry>,
+    pub bookmarks: Vec<BookmarkEntry>,
     pub window: WindowGeom,
     pub panes: PaneSizes,
     pub preferences: Preferences,
@@ -71,6 +78,7 @@ impl Default for State {
             schema_version: 1,
             roots: Vec::new(),
             recents: Vec::new(),
+            bookmarks: Vec::new(),
             window: WindowGeom::default(),
             panes: PaneSizes::default(),
             preferences: Preferences::default(),
@@ -114,6 +122,14 @@ fn write_counter_arc() -> &'static Arc<AtomicU64> {
 
 fn pending_write() -> &'static Arc<Mutex<Option<std::time::Instant>>> {
     PENDING_WRITE.get_or_init(|| Arc::new(Mutex::new(None)))
+}
+
+/// Read the current in-memory state as a raw `serde_json::Value` (clones the
+/// global). Preserves unknown fields. Use this for the `get_state` Tauri
+/// command so the frontend sees the full document including any keys this
+/// build doesn't know about.
+pub fn current_state_value() -> serde_json::Value {
+    global_state().lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Read the current in-memory state as a structured State.
