@@ -1,7 +1,11 @@
-// Sidebar — workspace root selection + recursive Explorer.
+// Sidebar — workspace root selection + path input bar + bookmarks list +
+// recursive Explorer. The resize handle is rendered by App as a flex sibling
+// of the sidebar pane so it doesn't get clipped by the pane's overflow.
 import * as React from "react";
 import type { IpcSurface } from "../ipc";
 import Explorer from "./Explorer";
+import Bookmarks from "./Bookmarks";
+import { isUnderRoot, normalizePathBarInput } from "../utils/path";
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
 
@@ -12,10 +16,13 @@ export interface SidebarProps {
   /**
    * Imperative trigger for the "Open File…" picker. The parent assigns this
    * ref so a keyboard shortcut (e.g. ⌘O in App) can invoke the same path as
-   * clicking the button. Returns nothing — the picked path is delivered via
-   * `onSelectFile(path, external)`.
+   * clicking the button.
    */
   openFileTrigger?: React.MutableRefObject<(() => void) | null>;
+  /**
+   * Path-input bar focus ref. The parent assigns this ref to wire ⌘L.
+   */
+  pathBarRef?: React.MutableRefObject<HTMLInputElement | null>;
 }
 
 function readSavedRoot(): string | null {
@@ -26,19 +33,16 @@ function readSavedRoot(): string | null {
   }
 }
 
-function isUnderRoot(path: string, root: string | null): boolean {
-  if (!root) return false;
-  const normalized = root.endsWith("/") ? root : `${root}/`;
-  return path === root || path.startsWith(normalized);
-}
-
 export default function Sidebar({
   ipc,
   onSelectFile,
   selectedFile,
   openFileTrigger,
+  pathBarRef,
 }: SidebarProps): React.ReactElement {
   const [workspaceRoot, setWorkspaceRoot] = React.useState<string | null>(readSavedRoot());
+  const [pathBarValue, setPathBarValue] = React.useState<string>("");
+  const [pathBarError, setPathBarError] = React.useState<string | null>(null);
 
   const handlePick = async () => {
     if (!ipc.pickDirectory) return;
@@ -80,6 +84,51 @@ export default function Sidebar({
     setWorkspaceRoot(null);
   };
 
+  const submitPathBar = React.useCallback(() => {
+    const result = normalizePathBarInput(pathBarValue);
+    if (result.kind === "error") {
+      setPathBarError(result.reason);
+      return;
+    }
+    setPathBarError(null);
+    onSelectFile?.(result.path, !isUnderRoot(result.path, workspaceRoot));
+    setPathBarValue("");
+  }, [pathBarValue, onSelectFile, workspaceRoot]);
+
+  const onPathBarKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitPathBar();
+    } else if (e.key === "Escape") {
+      setPathBarValue("");
+      setPathBarError(null);
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
+  const pathBar = (
+    <div className="sidebar-path-bar">
+      <input
+        ref={pathBarRef ?? null}
+        type="text"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        placeholder="Enter file path… (⌘L)"
+        value={pathBarValue}
+        onChange={(e) => {
+          setPathBarValue(e.target.value);
+          if (pathBarError) setPathBarError(null);
+        }}
+        onKeyDown={onPathBarKeyDown}
+        data-testid="path-bar-input"
+      />
+      {pathBarError ? (
+        <span className="path-bar-error" role="alert">{pathBarError}</span>
+      ) : null}
+    </div>
+  );
+
   if (!workspaceRoot) {
     return (
       <div className="sidebar-empty">
@@ -94,6 +143,7 @@ export default function Sidebar({
         >
           Open file…
         </button>
+        {pathBar}
       </div>
     );
   }
@@ -115,6 +165,12 @@ export default function Sidebar({
           ⤴
         </button>
       </div>
+      {pathBar}
+      <Bookmarks
+        ipc={ipc}
+        onSelectFile={onSelectFile}
+        workspaceRoot={workspaceRoot}
+      />
       <Explorer
         ipc={ipc}
         root={workspaceRoot}

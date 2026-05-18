@@ -6,13 +6,28 @@ import { tauriIpc } from "./ipc";
 import type { IpcSurface, FilePayload } from "./ipc";
 import { useDeepLink } from "./hooks/useDeepLink";
 import type { OpenFilePayload, DeepLinkErrorPayload } from "./hooks/useDeepLink";
+import { useTheme } from "./hooks/useTheme";
+import { isUnderRoot } from "./utils/path";
+import SidebarResizer from "./components/SidebarResizer";
 
 interface AppProps {
   ipc?: IpcSurface;
 }
 
+const DEFAULT_SIDEBAR_PX = 280;
+const MIN_SIDEBAR_PX = 200;
+const MAX_SIDEBAR_PX = 480;
+
+function clampSidebarPx(px: number): number {
+  return Math.max(MIN_SIDEBAR_PX, Math.min(MAX_SIDEBAR_PX, px));
+}
+
 export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactElement {
   const ipc = injectedIpc ?? tauriIpc;
+  // Drives <html data-theme="…"> via side-effect; we don't need the value
+  // here but the hook must mount somewhere.
+  useTheme();
+
   const [selectedFile, setSelectedFile] = React.useState<string | null>(null);
   // True when the current file lies outside the workspace root — either a
   // user-picked ad-hoc file or a vlerv:// deep link that canonicalized
@@ -21,12 +36,36 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   const [payload, setPayload] = React.useState<
     FilePayload | { error: { kind: string; path: string; reason: string } } | null
   >(null);
+  const [sidebarPx, setSidebarPx] = React.useState<number>(DEFAULT_SIDEBAR_PX);
   const openFileTrigger = React.useRef<(() => void) | null>(null);
+  const pathBarRef = React.useRef<HTMLInputElement | null>(null);
 
   const selectFile = React.useCallback((path: string, external: boolean) => {
     setSelectedFile(path);
     setExternalFile(external);
   }, []);
+
+  // Load persisted sidebar width from state_store on mount.
+  React.useEffect(() => {
+    if (!ipc.getState) return;
+    let cancelled = false;
+    ipc.getState().then((s) => {
+      if (cancelled) return;
+      const px = s?.panes?.sidebar_px;
+      if (typeof px === "number" && px > 0) {
+        setSidebarPx(clampSidebarPx(px));
+      }
+    }).catch(() => {
+      // Backend not wired or state.json missing — fall back to default width.
+    });
+    return () => { cancelled = true; };
+  }, [ipc]);
+
+  const handleSidebarResizeCommit = React.useCallback((finalPx: number) => {
+    if (ipc.setStateField) {
+      void ipc.setStateField("panes.sidebar_px", clampSidebarPx(finalPx));
+    }
+  }, [ipc]);
 
   const handleDeepLinkIntent = React.useCallback(
     ({ path, intent, out_of_root }: OpenFilePayload) => {
@@ -51,12 +90,23 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   useDeepLink({ onIntent: handleDeepLinkIntent, onError: handleDeepLinkError });
 
   // ⌘O / Ctrl+O opens the file picker via the Sidebar trigger.
+  // ⌘L / Ctrl+L focuses the path bar (address-bar pattern — fires even when
+  // an input has focus already, just like a browser).
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const cmdOrCtrl = e.metaKey || e.ctrlKey;
-      if (cmdOrCtrl && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "o") {
+      if (!cmdOrCtrl || e.shiftKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "o") {
         e.preventDefault();
         openFileTrigger.current?.();
+      } else if (k === "l") {
+        e.preventDefault();
+        const input = pathBarRef.current;
+        if (input) {
+          input.focus();
+          input.select();
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -69,11 +119,6 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
   // file renders in-place and the externalFile flag is recomputed against
   // the current workspace root.
   React.useEffect(() => {
-    function isUnderRoot(path: string, root: string | null): boolean {
-      if (!root) return false;
-      const normalized = root.endsWith("/") ? root : `${root}/`;
-      return path === root || path.startsWith(normalized);
-    }
     const onMessage = (e: MessageEvent) => {
       const data = e.data as unknown;
       if (!data || typeof data !== "object") return;
@@ -106,14 +151,24 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
 
   return (
     <div className="app">
-      <aside className="pane pane-sidebar" role="complementary">
+      <aside
+        className="pane pane-sidebar"
+        role="complementary"
+        style={{ width: `${sidebarPx}px` }}
+      >
         <Sidebar
           ipc={ipc}
           onSelectFile={(p, external = false) => selectFile(p, external)}
           selectedFile={selectedFile}
           openFileTrigger={openFileTrigger}
+          pathBarRef={pathBarRef}
         />
       </aside>
+      <SidebarResizer
+        width={sidebarPx}
+        onResize={setSidebarPx}
+        onCommit={handleSidebarResizeCommit}
+      />
       <main className="pane pane-preview" role="main">
         <Preview
           payload={payload as React.ComponentProps<typeof Preview>["payload"]}

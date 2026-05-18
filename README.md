@@ -16,12 +16,19 @@ First launch: right-click → Open (Gatekeeper prompt — the app isn't notarize
 ## Use
 
 - **Pick workspace**: first launch shows "Choose workspace folder…" — pick any directory; it's remembered.
-- **Browse**: chevron-expand folders inline, click files to preview.
+- **Browse**: chevron-expand folders inline, click files to preview. Hover any file row for the ⭐ bookmark toggle.
+- **Open any file**: 📄 button or `⌘O` → file picker. Out-of-workspace files render with an "external file" badge.
+- **Path bar**: type or paste an absolute path / `file://` URL / `vlerv://open?path=…` URL and hit Enter to navigate. `⌘L` focuses it.
+- **Bookmarks**: ⭐ on a file row or in the preview header bookmarks it. Collapsible section at the top of the sidebar holds the list; right-click an entry to remove. Persists across restarts.
+- **Resize sidebar**: drag the 6 px gap between the sidebar and the preview pane. Width persists across restarts (clamped 200–480 px).
+- **Theme**: follows the macOS system appearance automatically (Light / Dark / Auto in System Settings → Appearance). HTML iframe background and Shiki code-highlight theme swap with it.
+- **Foreground on deep link**: `vlerv://…` arrivals raise + focus the window even from a backgrounded / minimized / hidden state.
 - **Preview**:
-  - `.html` → full inline CSS/JS/SVG render (browser fidelity), `<base href>` injected so relative resources resolve.
-  - `.md` → marked + shiki + mermaid + katex, centered, dark theme.
+  - `.html` → full inline CSS/JS/SVG render (browser fidelity), `<base href>` injected so relative resources resolve. In-document `<a>` clicks to local files route through the preview pipeline.
+  - `.md` → marked + shiki + mermaid + katex, centered, theme-aware.
   - Code/text → shiki-highlighted.
   - Images → data URI raster / inline SVG (scripts stripped).
+- **Copy path**: click the copy icon in the preview header — copies the absolute path to the clipboard.
 - **Drag files out**: drag any file row into Finder, Slack, Mail, Telegram, upload zones — produces a real macOS `kUTTypeFileURL` drop.
 - **Switch workspace**: top of sidebar → ⤴ button.
 

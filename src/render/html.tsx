@@ -3,12 +3,22 @@
 // links/images/stylesheets resolve against the source file's directory.
 
 import * as React from "react";
+import { useTheme } from "../hooks/useTheme";
 
 export interface HtmlRendererProps {
   /// Raw HTML source (file bytes decoded as UTF-8).
   source: string;
   /// File path (used to build the <base> tag for relative resources).
   path: string;
+}
+
+// Small theme stylesheet injected into the iframe so the iframe's own root
+// background follows the host theme. User-authored HTML stays untouched —
+// most pages set their own background and the injected rule loses to author
+// CSS by specificity (we keep it scoped to `html` with no !important).
+function themeStyle(theme: "dark" | "light"): string {
+  const bg = theme === "dark" ? "#1e1e1e" : "#ffffff";
+  return `<style>html { background: ${bg}; }</style>`;
 }
 
 // Intercepts in-iframe link clicks: any <a href> that resolves to a `file:`
@@ -39,26 +49,30 @@ const LINK_INTERCEPT_SCRIPT = `
 })();
 </script>`;
 
-function injectBase(html: string, basePath: string): string {
+function injectBase(html: string, basePath: string, theme: "dark" | "light"): string {
   // Strip filename → directory path. Trailing slash matters for <base href>.
   const lastSlash = basePath.lastIndexOf("/");
   const dir = lastSlash >= 0 ? basePath.slice(0, lastSlash + 1) : "";
   const baseTag = `<base href="file://${dir}">`;
-  const injection = `${baseTag}\n${LINK_INTERCEPT_SCRIPT}`;
+  const style = themeStyle(theme);
+  // Order matters: <base> first (so relative URLs resolve), then theme style
+  // (low-specificity background fallback), then the link-intercept script.
+  const headPrelude = `${baseTag}\n${style}\n${LINK_INTERCEPT_SCRIPT}`;
+  const headPreludeNoBase = `${style}\n${LINK_INTERCEPT_SCRIPT}`;
 
   if (/<head[^>]*>/i.test(html)) {
-    // Even if a <base> tag already exists, the link-intercept script must run.
-    const headInjection = /<base\b/i.test(html) ? LINK_INTERCEPT_SCRIPT : injection;
-    return html.replace(/(<head[^>]*>)/i, `$1\n${headInjection}`);
+    const inj = /<base\b/i.test(html) ? headPreludeNoBase : headPrelude;
+    return html.replace(/(<head[^>]*>)/i, `$1\n${inj}`);
   }
   if (/<html[^>]*>/i.test(html)) {
-    return html.replace(/(<html[^>]*>)/i, `$1\n<head>${injection}</head>`);
+    return html.replace(/(<html[^>]*>)/i, `$1\n<head>${headPrelude}</head>`);
   }
-  return `<!DOCTYPE html><html><head>${injection}</head><body>${html}</body></html>`;
+  return `<!DOCTYPE html><html><head>${headPrelude}</head><body>${html}</body></html>`;
 }
 
 export default function HtmlRenderer({ source, path }: HtmlRendererProps): React.ReactElement {
-  const srcdoc = injectBase(source, path);
+  const theme = useTheme();
+  const srcdoc = injectBase(source, path, theme);
 
   // Browser-like sandbox: scripts, popups, forms, modals, same-origin so the
   // page sees a "normal" environment. The srcdoc origin is still opaque, so

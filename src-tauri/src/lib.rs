@@ -8,6 +8,7 @@ pub mod drag_spike;
 pub mod security;
 pub mod state_store;
 pub mod recents;
+pub mod bookmarks;
 pub mod watcher;
 
 // `url` crate is used for robust URL parsing in the deep-link handler path.
