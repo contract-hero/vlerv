@@ -161,6 +161,15 @@ html, body, #root {
   border: none;
   background: var(--iframe-bg);
 }
+/* Propagate the host theme into the artifact's srcdoc document. The iframe
+   origin is opaque, so `prefers-color-scheme` inside it does NOT follow the OS
+   on its own (same reason useTheme drives the chrome via the Tauri window-theme
+   API instead of matchMedia). Per CSS Color Adjustment L1, the iframe element's
+   used `color-scheme` informs the embedded document's preferred scheme — so
+   setting it here is what makes a self-contained artifact's
+   `@media (prefers-color-scheme: dark)` token palette actually fire. */
+:root[data-theme="dark"] [data-testid="html-renderer"] > iframe { color-scheme: dark; }
+:root[data-theme="light"] [data-testid="html-renderer"] > iframe { color-scheme: light; }
 
 /* Preview empty + external badge (extracted from inline styles) */
 .preview-empty {
