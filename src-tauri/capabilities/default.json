@@ -9,6 +9,14 @@
     "dialog:default",
     "dialog:allow-open",
     "deep-link:default",
-    "drag:default"
+    "drag:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://*" },
+        { "url": "http://*" },
+        { "url": "mailto:*" }
+      ]
+    }
   ]
 }

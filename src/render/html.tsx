@@ -21,10 +21,13 @@ function themeStyle(theme: "dark" | "light"): string {
   return `<style>html { background: ${bg}; }</style>`;
 }
 
-// Intercepts in-iframe link clicks: any <a href> that resolves to a `file:`
-// URL is rewritten to a `vlerv:navigate` postMessage so the host webview can
-// open the linked file inside Vlervcode instead of letting the sandboxed
-// iframe try (and fail) to navigate to a `file://` URL.
+// Intercepts in-iframe link clicks. The sandboxed iframe can navigate to
+// neither `file://` (blocked) nor external `http(s)://` (no top-level nav),
+// so both are forwarded to the host webview via postMessage:
+//   - `file:`        → { type: 'vlerv:navigate', path }    open inside Vlervcode
+//   - `http:`/`https:` → { type: 'vlerv:openExternal', url } open in the OS
+//     default browser (which on this machine routes through Finicky).
+// `mailto:`/`tel:`/`javascript:`/`#` are left to the iframe's own handling.
 const LINK_INTERCEPT_SCRIPT = `
 <script>
 (function () {
@@ -42,6 +45,9 @@ const LINK_INTERCEPT_SCRIPT = `
       var path;
       try { path = decodeURIComponent(resolved.pathname); } catch (_) { path = resolved.pathname; }
       window.parent.postMessage({ type: 'vlerv:navigate', path: path }, '*');
+    } else if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+      e.preventDefault();
+      window.parent.postMessage({ type: 'vlerv:openExternal', url: resolved.href }, '*');
     }
   }
   document.addEventListener('click', handler, true);

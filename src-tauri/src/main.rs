@@ -149,6 +149,7 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             scanner: Mutex::new(src_tauri::workspace::Scanner::new()),
             roots: roots.clone(),

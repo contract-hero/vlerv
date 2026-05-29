@@ -1,5 +1,6 @@
 // Root app — 2-column layout: recursive Explorer sidebar + Preview pane.
 import * as React from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import Sidebar from "./components/Sidebar";
 import Preview from "./components/Preview";
 import { tauriIpc } from "./ipc";
@@ -122,10 +123,22 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
     const onMessage = (e: MessageEvent) => {
       const data = e.data as unknown;
       if (!data || typeof data !== "object") return;
-      const d = data as { type?: unknown; path?: unknown };
-      if (d.type !== "vlerv:navigate" || typeof d.path !== "string") return;
-      const root = globalThis.localStorage?.getItem("vlerv.workspaceRoot") ?? null;
-      selectFile(d.path, !isUnderRoot(d.path, root));
+      const d = data as { type?: unknown; path?: unknown; url?: unknown };
+      if (d.type === "vlerv:navigate" && typeof d.path === "string") {
+        const root = globalThis.localStorage?.getItem("vlerv.workspaceRoot") ?? null;
+        selectFile(d.path, !isUnderRoot(d.path, root));
+        return;
+      }
+      // External http(s) link from a rendered HTML/Markdown artifact: hand it
+      // to the OS default browser. The opener plugin's capability is scoped to
+      // http/https/mailto, so a malformed or unexpected scheme is rejected at
+      // the Rust layer rather than silently navigating the host webview.
+      if (d.type === "vlerv:openExternal" && typeof d.url === "string") {
+        void openUrl(d.url).catch((err: unknown) => {
+          console.error("vlerv: failed to open external URL", d.url, err);
+        });
+        return;
+      }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
