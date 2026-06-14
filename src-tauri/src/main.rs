@@ -89,6 +89,13 @@ fn remove_bookmark(app: tauri::AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn reorder_bookmarks(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    src_tauri::bookmarks::reorder(&paths)?;
+    let _ = app.emit("vlerv://bookmarks-updated", src_tauri::bookmarks::list());
+    Ok(())
+}
+
 /// Start (or replace) the filesystem watcher rooted at `path`. Each successful
 /// call drops any previous watcher handle (stopping its OS-level watch) and
 /// spawns a fresh notify-rs watcher plus a bridge thread that forwards
@@ -168,6 +175,7 @@ fn main() {
             list_bookmarks,
             add_bookmark,
             remove_bookmark,
+            reorder_bookmarks,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

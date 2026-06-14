@@ -413,6 +413,14 @@ html, body, #root {
   background: var(--bg-row-hover);
   color: var(--fg);
 }
+/* Drag-to-reorder (bookmarks): dim the row being dragged and draw an
+   insertion line above the row currently under the cursor. */
+[data-section="bookmarks"] li.dragging {
+  opacity: 0.4;
+}
+[data-section="bookmarks"] li.drop-target {
+  box-shadow: inset 0 2px 0 0 var(--accent, var(--input-border-focus));
+}
 
 /* Bookmark toggle button in the Preview header (mirrors copy button) */
 .preview-bookmark {

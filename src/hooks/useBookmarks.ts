@@ -13,6 +13,7 @@ export interface UseBookmarksResult {
   isBookmarked: (path: string) => boolean;
   toggle: (path: string) => Promise<void>;
   remove: (path: string) => Promise<void>;
+  reorder: (orderedPaths: string[]) => Promise<void>;
 }
 
 export function useBookmarks(ipc = defaultIpc): UseBookmarksResult {
@@ -83,5 +84,33 @@ export function useBookmarks(ipc = defaultIpc): UseBookmarksResult {
     [ipc],
   );
 
-  return { bookmarks, isBookmarked, toggle, remove };
+  // Reorder to match `orderedPaths` (drag-and-drop). Optimistic: reflect the
+  // new order locally first, then persist. The backend echoes the canonical
+  // list via `vlerv://bookmarks-updated`, which reconciles every subscriber.
+  const reorder = React.useCallback(
+    async (orderedPaths: string[]): Promise<void> => {
+      setBookmarks((prev) => {
+        const byPath = new Map(prev.map((b) => [b.path, b]));
+        const next: BookmarkEntry[] = [];
+        for (const p of orderedPaths) {
+          const entry = byPath.get(p);
+          if (entry) {
+            next.push(entry);
+            byPath.delete(p);
+          }
+        }
+        // Keep any bookmark not named in orderedPaths, preserving its order.
+        for (const b of prev) {
+          if (byPath.has(b.path)) next.push(b);
+        }
+        return next;
+      });
+      if (ipc.reorderBookmarks) {
+        await ipc.reorderBookmarks(orderedPaths);
+      }
+    },
+    [ipc],
+  );
+
+  return { bookmarks, isBookmarked, toggle, remove, reorder };
 }

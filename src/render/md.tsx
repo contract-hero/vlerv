@@ -8,13 +8,61 @@ import { useTheme } from "../hooks/useTheme";
 export interface MdRendererProps {
   source: string;
   path?: string;
-  onSelectFile?: (path: string) => void;
 }
 
-export default function MdRenderer({ source }: MdRendererProps): React.ReactElement {
+export default function MdRenderer({ source, path }: MdRendererProps): React.ReactElement {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [shikiReady, setShikiReady] = React.useState(false);
   const theme = useTheme();
+
+  // Intercept link clicks. Markdown renders into the host DOM (not a sandboxed
+  // iframe like the HTML renderer), so an un-intercepted click would navigate
+  // the whole webview away from the app. Both branches funnel through the same
+  // postMessage channels App listens on (mirroring html.tsx's intercept), so
+  // the open-in-OS-browser policy stays in one place (App + the opener
+  // capability):
+  //   - http(s)/mailto → `vlerv:openExternal` → OS default browser (Finicky → Chrome)
+  //   - file://, absolute, or relative path → `vlerv:navigate` → open in-app.
+  // `#`/`javascript:` anchors keep their default in-page behavior.
+  const onClickCapture = React.useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement | null;
+      const a = target?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!a) return;
+      const raw = a.getAttribute("href") ?? "";
+      // Only in-page `#` anchors keep their default behavior. Everything else
+      // (including `javascript:`) is intercepted — this renders into the host
+      // DOM, so an un-prevented `javascript:` href would execute in the
+      // privileged webview, not a sandbox.
+      if (!raw || raw.startsWith("#")) return;
+
+      if (/^(https?:|mailto:)/i.test(raw)) {
+        e.preventDefault();
+        window.postMessage({ type: "vlerv:openExternal", url: raw }, "*");
+        return;
+      }
+
+      // Any other scheme would otherwise blow away the host webview — block the
+      // default and try to resolve it to a local file we can open in-place.
+      e.preventDefault();
+      let resolved: string | null = null;
+      try {
+        if (raw.startsWith("file://")) {
+          resolved = decodeURIComponent(new URL(raw).pathname);
+        } else if (path) {
+          const dir = path.slice(0, path.lastIndexOf("/") + 1);
+          const u = new URL(raw, `file://${dir}`);
+          if (u.protocol === "file:") resolved = decodeURIComponent(u.pathname);
+        }
+      } catch {
+        resolved = null;
+      }
+      if (resolved) {
+        window.postMessage({ type: "vlerv:navigate", path: resolved }, "*");
+      }
+    },
+    [path],
+  );
 
   // Initial render: parse markdown to HTML, then inject via DOMParser+importNode.
   React.useEffect(() => {
@@ -95,6 +143,7 @@ export default function MdRenderer({ source }: MdRendererProps): React.ReactElem
     <div
       data-testid="md-outer"
       style={{ width: "100%", height: "100%", overflow: "auto" }}
+      onClickCapture={onClickCapture}
     >
       <div
         ref={containerRef}

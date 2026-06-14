@@ -23,6 +23,16 @@ export interface SidebarProps {
    * Path-input bar focus ref. The parent assigns this ref to wire ⌘L.
    */
   pathBarRef?: React.MutableRefObject<HTMLInputElement | null>;
+  /**
+   * Manual refresh trigger — reloads the explorer tree and the current
+   * preview. Invoked by the Refresh button in the sidebar header.
+   */
+  onRefresh?: () => void;
+  /**
+   * Monotonic refresh counter forwarded to the Explorer so a manual refresh
+   * re-fetches every visible folder without collapsing expansion state.
+   */
+  refreshNonce?: number;
 }
 
 function readSavedRoot(): string | null {
@@ -39,6 +49,8 @@ export default function Sidebar({
   selectedFile,
   openFileTrigger,
   pathBarRef,
+  onRefresh,
+  refreshNonce,
 }: SidebarProps): React.ReactElement {
   const [workspaceRoot, setWorkspaceRoot] = React.useState<string | null>(readSavedRoot());
   const [pathBarValue, setPathBarValue] = React.useState<string>("");
@@ -156,6 +168,14 @@ export default function Sidebar({
         <span className="sidebar-header-title" title={workspaceRoot}>{folderName}</span>
         <button
           className="sidebar-header-change"
+          onClick={() => onRefresh?.()}
+          title="Refresh files"
+          aria-label="Refresh files"
+        >
+          ⟳
+        </button>
+        <button
+          className="sidebar-header-change"
           onClick={() => void handleOpenFile()}
           title="Open file… (⌘O)"
         >
@@ -176,6 +196,7 @@ export default function Sidebar({
         root={workspaceRoot}
         onSelectFile={(p) => onSelectFile?.(p, false)}
         selectedFile={selectedFile ?? null}
+        refreshNonce={refreshNonce ?? 0}
       />
     </div>
   );

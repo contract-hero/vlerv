@@ -37,8 +37,29 @@ export default function Bookmarks({
   onSelectFile,
   workspaceRoot = null,
 }: BookmarksProps): React.ReactElement {
-  const { bookmarks, remove } = useBookmarks(ipc);
+  const { bookmarks, remove, reorder } = useBookmarks(ipc);
   const [collapsed, setCollapsed] = React.useState<boolean>(readSavedCollapsed);
+  // Drag-to-reorder state: the path being dragged and the path currently
+  // hovered as a drop target (used to draw the insertion indicator).
+  const [dragPath, setDragPath] = React.useState<string | null>(null);
+  const [overPath, setOverPath] = React.useState<string | null>(null);
+
+  const handleDrop = (targetPath: string) => {
+    const from = dragPath;
+    setDragPath(null);
+    setOverPath(null);
+    if (!from || from === targetPath) return;
+    const order = bookmarks.map((b) => b.path);
+    const fromIdx = order.indexOf(from);
+    const toIdx = order.indexOf(targetPath);
+    if (fromIdx < 0 || toIdx < 0) return;
+    // Drop the dragged row *above* the target (matching the insertion-line
+    // indicator). Removing the source first shifts every later index left by
+    // one, so a downward drag inserts at toIdx-1 to land before the target.
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(fromIdx < toIdx ? toIdx - 1 : toIdx, 0, moved);
+    void reorder(order);
+  };
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -91,10 +112,38 @@ export default function Bookmarks({
             <li
               key={entry.path}
               data-bookmark-path={entry.path}
+              className={
+                dragPath === entry.path
+                  ? "dragging"
+                  : overPath === entry.path && dragPath
+                    ? "drop-target"
+                    : undefined
+              }
+              draggable
+              onDragStart={(e) => {
+                setDragPath(entry.path);
+                e.dataTransfer.effectAllowed = "move";
+                // Required for the drag to actually start in WKWebView (macOS).
+                e.dataTransfer.setData("text/plain", entry.path);
+              }}
+              onDragOver={(e) => {
+                if (!dragPath) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                if (overPath !== entry.path) setOverPath(entry.path);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleDrop(entry.path);
+              }}
+              onDragEnd={() => {
+                setDragPath(null);
+                setOverPath(null);
+              }}
               onClick={() => handleClick(entry.path)}
               onContextMenu={(e) => handleContextMenu(e, entry.path)}
               style={{ cursor: "pointer" }}
-              title={`${entry.path}\n(right-click to remove)`}
+              title={`${entry.path}\n(drag to reorder · right-click to remove)`}
             >
               {entry.path.replace(/^.*\//, "")}
             </li>
