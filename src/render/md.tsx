@@ -3,7 +3,6 @@
 // HTML is injected via DOMParser → importNode (no innerHTML assignment).
 import * as React from "react";
 import { marked } from "marked";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTheme } from "../hooks/useTheme";
 
 export interface MdRendererProps {
@@ -19,10 +18,12 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
 
   // Intercept link clicks. Markdown renders into the host DOM (not a sandboxed
   // iframe like the HTML renderer), so an un-intercepted click would navigate
-  // the whole webview away from the app. Instead:
-  //   - http(s)/mailto → hand to the OS default browser (Finicky → Chrome here)
-  //   - file://, absolute, or relative path → resolve and navigate in-app via
-  //     the same `vlerv:navigate` postMessage channel App already listens on.
+  // the whole webview away from the app. Both branches funnel through the same
+  // postMessage channels App listens on (mirroring html.tsx's intercept), so
+  // the open-in-OS-browser policy stays in one place (App + the opener
+  // capability):
+  //   - http(s)/mailto → `vlerv:openExternal` → OS default browser (Finicky → Chrome)
+  //   - file://, absolute, or relative path → `vlerv:navigate` → open in-app.
   // `#`/`javascript:` anchors keep their default in-page behavior.
   const onClickCapture = React.useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -34,9 +35,7 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
 
       if (/^(https?:|mailto:)/i.test(raw)) {
         e.preventDefault();
-        void openUrl(raw).catch((err: unknown) => {
-          console.error("vlerv: failed to open external URL", raw, err);
-        });
+        window.postMessage({ type: "vlerv:openExternal", url: raw }, "*");
         return;
       }
 

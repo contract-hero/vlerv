@@ -108,12 +108,13 @@ export default function Bookmarks({
             <li
               key={entry.path}
               data-bookmark-path={entry.path}
-              className={[
-                dragPath === entry.path ? "dragging" : "",
-                overPath === entry.path && dragPath && dragPath !== entry.path
-                  ? "drop-target"
-                  : "",
-              ].filter(Boolean).join(" ")}
+              className={
+                dragPath === entry.path
+                  ? "dragging"
+                  : overPath === entry.path && dragPath
+                    ? "drop-target"
+                    : undefined
+              }
               draggable
               onDragStart={(e) => {
                 setDragPath(entry.path);
