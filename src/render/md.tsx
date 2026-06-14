@@ -8,7 +8,6 @@ import { useTheme } from "../hooks/useTheme";
 export interface MdRendererProps {
   source: string;
   path?: string;
-  onSelectFile?: (path: string) => void;
 }
 
 export default function MdRenderer({ source, path }: MdRendererProps): React.ReactElement {
@@ -31,7 +30,11 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
       const a = target?.closest?.("a[href]") as HTMLAnchorElement | null;
       if (!a) return;
       const raw = a.getAttribute("href") ?? "";
-      if (!raw || raw.startsWith("#") || raw.startsWith("javascript:")) return;
+      // Only in-page `#` anchors keep their default behavior. Everything else
+      // (including `javascript:`) is intercepted — this renders into the host
+      // DOM, so an un-prevented `javascript:` href would execute in the
+      // privileged webview, not a sandbox.
+      if (!raw || raw.startsWith("#")) return;
 
       if (/^(https?:|mailto:)/i.test(raw)) {
         e.preventDefault();

@@ -53,7 +53,11 @@ export default function Bookmarks({
     const fromIdx = order.indexOf(from);
     const toIdx = order.indexOf(targetPath);
     if (fromIdx < 0 || toIdx < 0) return;
-    order.splice(toIdx, 0, order.splice(fromIdx, 1)[0]);
+    // Drop the dragged row *above* the target (matching the insertion-line
+    // indicator). Removing the source first shifts every later index left by
+    // one, so a downward drag inserts at toIdx-1 to land before the target.
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(fromIdx < toIdx ? toIdx - 1 : toIdx, 0, moved);
     void reorder(order);
   };
 
@@ -119,6 +123,8 @@ export default function Bookmarks({
               onDragStart={(e) => {
                 setDragPath(entry.path);
                 e.dataTransfer.effectAllowed = "move";
+                // Required for the drag to actually start in WKWebView (macOS).
+                e.dataTransfer.setData("text/plain", entry.path);
               }}
               onDragOver={(e) => {
                 if (!dragPath) return;

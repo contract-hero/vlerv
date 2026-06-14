@@ -65,7 +65,8 @@ pub fn reorder(ordered_paths: &[String]) -> Result<(), String> {
             updated.push(remaining.remove(pos));
         }
     }
-    // Preserve any bookmark the caller did not mention (e.g. added concurrently).
+    // Preserve any bookmark the caller did not name, keeping its relative order
+    // (e.g. one present at read time but absent from `ordered_paths`).
     updated.append(&mut remaining);
 
     let val = serde_json::to_value(&updated).map_err(|e| e.to_string())?;
@@ -109,12 +110,17 @@ mod tests {
     }
 
     #[test]
-    fn reorder_applies_requested_order() {
+    fn reorder_applies_requested_order_and_preserves_timestamps() {
         let _g = guard();
         reset();
         add(Path::new("/ws/a.md")).unwrap();
         add(Path::new("/ws/b.md")).unwrap();
         add(Path::new("/ws/c.md")).unwrap();
+
+        let before: std::collections::HashMap<_, _> = list()
+            .into_iter()
+            .map(|e| (e.path.clone(), e.bookmarked_at))
+            .collect();
 
         reorder(&[
             "/ws/a.md".into(),
@@ -123,11 +129,33 @@ mod tests {
         ])
         .unwrap();
 
+        let after = list();
+        let order: Vec<String> = after
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order, vec!["/ws/a.md", "/ws/c.md", "/ws/b.md"]);
+        // The documented invariant: reorder never alters bookmarked_at.
+        for entry in &after {
+            assert_eq!(before.get(&entry.path), Some(&entry.bookmarked_at));
+        }
+    }
+
+    #[test]
+    fn reorder_with_empty_input_is_a_noop() {
+        let _g = guard();
+        reset();
+        add(Path::new("/ws/a.md")).unwrap();
+        add(Path::new("/ws/b.md")).unwrap();
+
+        reorder(&[]).unwrap();
+
         let order: Vec<String> = list()
             .into_iter()
             .map(|e| e.path.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(order, vec!["/ws/a.md", "/ws/c.md", "/ws/b.md"]);
+        // Nothing named → every bookmark kept in its existing (insertion) order.
+        assert_eq!(order, vec!["/ws/b.md", "/ws/a.md"]);
     }
 
     #[test]
