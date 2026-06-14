@@ -64,6 +64,7 @@ export interface IpcSurface {
   listBookmarks?(): Promise<BookmarkEntry[]>;
   addBookmark?(path: string): Promise<void>;
   removeBookmark?(path: string): Promise<void>;
+  reorderBookmarks?(paths: string[]): Promise<void>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -159,6 +160,10 @@ class TauriIpc implements IpcSurface {
 
   async removeBookmark(path: string): Promise<void> {
     await invoke<void>("remove_bookmark", { path });
+  }
+
+  async reorderBookmarks(paths: string[]): Promise<void> {
+    await invoke<void>("reorder_bookmarks", { paths });
   }
 }
 

@@ -14,6 +14,11 @@ import { useBookmarks } from "../hooks/useBookmarks";
 // siblings or its own expansion state.
 const FolderCacheContext = React.createContext<ReadonlyMap<string, number>>(new Map());
 
+// Monotonic manual-refresh counter. Every FolderNode's listDir effect depends
+// on it, so bumping it (via the sidebar Refresh button) re-fetches every
+// expanded folder at once while preserving each node's expansion state.
+const RefreshContext = React.createContext<number>(0);
+
 // POSIX dirname. macOS-only app, so `/` separator is safe.
 function parentDir(absPath: string): string {
   const idx = absPath.lastIndexOf("/");
@@ -42,6 +47,8 @@ export interface ExplorerProps {
   root: string;
   onSelectFile?: (path: string) => void;
   selectedFile?: string | null;
+  /** Bumped by the sidebar Refresh button to force a full tree re-fetch. */
+  refreshNonce?: number;
 }
 
 function sortEntries(entries: TreeEntry[]): TreeEntry[] {
@@ -65,6 +72,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
   const [error, setError] = React.useState<string | null>(null);
   const versions = React.useContext(FolderCacheContext);
   const version = versions.get(entry.path) ?? 0;
+  const refreshNonce = React.useContext(RefreshContext);
   const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
 
   React.useEffect(() => {
@@ -81,7 +89,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
         if (!cancelled) setError(e.message);
       });
     return () => { cancelled = true; };
-  }, [expanded, entry.path, ipc, version]);
+  }, [expanded, entry.path, ipc, version, refreshNonce]);
 
   const indentPx = 12 + depth * 16;
   const isSelected = selectedFile === entry.path;
@@ -186,7 +194,7 @@ function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBoo
   );
 }
 
-export default function Explorer({ ipc, root, onSelectFile, selectedFile }: ExplorerProps): React.ReactElement {
+export default function Explorer({ ipc, root, onSelectFile, selectedFile, refreshNonce = 0 }: ExplorerProps): React.ReactElement {
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
@@ -241,7 +249,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
         if (!cancelled) setError(e.message);
       });
     return () => { cancelled = true; };
-  }, [ipc, root, rootVersion]);
+  }, [ipc, root, rootVersion, refreshNonce]);
 
   if (error !== null) {
     return <div role="alert" className="explorer-error">{error}</div>;
@@ -252,6 +260,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
 
   return (
     <FolderCacheContext.Provider value={versions}>
+      <RefreshContext.Provider value={refreshNonce}>
       <div className="explorer">
         {sortEntries(entries).map((entry) =>
           entry.is_dir ? (
@@ -276,6 +285,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile }: Expl
           )
         )}
       </div>
+      </RefreshContext.Provider>
     </FolderCacheContext.Provider>
   );
 }

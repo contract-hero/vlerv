@@ -43,11 +43,34 @@ pub fn remove(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// List bookmarks ordered by bookmarked_at desc (most-recent-first).
+/// List bookmarks in stored order. New bookmarks are inserted at the head by
+/// `add`, so the default order is most-recent-first; an explicit `reorder`
+/// (drag-and-drop in the Sidebar) overrides that and is preserved verbatim.
 pub fn list() -> Vec<BookmarkEntry> {
-    let mut entries = list_from_global();
-    entries.sort_by(|a, b| b.bookmarked_at.cmp(&a.bookmarked_at));
-    entries
+    list_from_global()
+}
+
+/// Rewrite the bookmark list in the order given by `ordered_paths`. Paths are
+/// matched against existing entries (preserving each entry's `bookmarked_at`);
+/// unknown paths are ignored and any existing entry not named in
+/// `ordered_paths` is appended at the end, keeping its relative order. This is
+/// idempotent and never invents or drops bookmarks.
+pub fn reorder(ordered_paths: &[String]) -> Result<(), String> {
+    let mut remaining = list_from_global();
+    let mut updated: Vec<BookmarkEntry> = Vec::with_capacity(remaining.len());
+
+    for raw in ordered_paths {
+        let wanted = Path::new(raw);
+        if let Some(pos) = remaining.iter().position(|e| e.path == wanted) {
+            updated.push(remaining.remove(pos));
+        }
+    }
+    // Preserve any bookmark the caller did not mention (e.g. added concurrently).
+    updated.append(&mut remaining);
+
+    let val = serde_json::to_value(&updated).map_err(|e| e.to_string())?;
+    crate::state_store::set_state_field("bookmarks", val)?;
+    Ok(())
 }
 
 fn list_from_global() -> Vec<BookmarkEntry> {
@@ -63,4 +86,64 @@ fn list_from_global() -> Vec<BookmarkEntry> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    // Bookmarks mutate the process-global state object, so these tests must run
+    // serially and against an isolated state dir (mirrors lib.rs's pattern).
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        static STATE_DIR: OnceLock<TempDir> = OnceLock::new();
+        let dir = STATE_DIR.get_or_init(|| TempDir::new().expect("state tempdir"));
+        std::env::set_var("VLERV_STATE_DIR", dir.path());
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reset() {
+        let _ = crate::state_store::set_state_field("bookmarks", serde_json::json!([]));
+    }
+
+    #[test]
+    fn reorder_applies_requested_order() {
+        let _g = guard();
+        reset();
+        add(Path::new("/ws/a.md")).unwrap();
+        add(Path::new("/ws/b.md")).unwrap();
+        add(Path::new("/ws/c.md")).unwrap();
+
+        reorder(&[
+            "/ws/a.md".into(),
+            "/ws/c.md".into(),
+            "/ws/b.md".into(),
+        ])
+        .unwrap();
+
+        let order: Vec<String> = list()
+            .into_iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order, vec!["/ws/a.md", "/ws/c.md", "/ws/b.md"]);
+    }
+
+    #[test]
+    fn reorder_appends_unmentioned_and_ignores_unknown() {
+        let _g = guard();
+        reset();
+        add(Path::new("/ws/x.md")).unwrap();
+        add(Path::new("/ws/y.md")).unwrap();
+
+        // Only mention y, plus an unknown path; x must survive at the end.
+        reorder(&["/ws/y.md".into(), "/ws/ghost.md".into()]).unwrap();
+
+        let order: Vec<String> = list()
+            .into_iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order, vec!["/ws/y.md", "/ws/x.md"]);
+    }
 }

@@ -38,6 +38,14 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
     FilePayload | { error: { kind: string; path: string; reason: string } } | null
   >(null);
   const [sidebarPx, setSidebarPx] = React.useState<number>(DEFAULT_SIDEBAR_PX);
+  // Bumped by the sidebar Refresh button. Drives both a re-read of the current
+  // preview file and a re-fetch of the explorer tree (threaded through Sidebar
+  // → Explorer), so a manual refresh reloads everything the watcher might have
+  // missed without collapsing expanded folders.
+  const [refreshNonce, setRefreshNonce] = React.useState<number>(0);
+  const handleRefresh = React.useCallback(() => {
+    setRefreshNonce((n) => n + 1);
+  }, []);
   const openFileTrigger = React.useRef<(() => void) | null>(null);
   const pathBarRef = React.useRef<HTMLInputElement | null>(null);
 
@@ -160,7 +168,7 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
         }
       });
     return () => { cancelled = true; };
-  }, [selectedFile, ipc]);
+  }, [selectedFile, ipc, refreshNonce]);
 
   return (
     <div className="app">
@@ -175,6 +183,8 @@ export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactEle
           selectedFile={selectedFile}
           openFileTrigger={openFileTrigger}
           pathBarRef={pathBarRef}
+          onRefresh={handleRefresh}
+          refreshNonce={refreshNonce}
         />
       </aside>
       <SidebarResizer
