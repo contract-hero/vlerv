@@ -45,7 +45,16 @@ export interface SettingsState {
   preferences: {
     ignore_globs: string[];
     drag_out_mode: "file" | "url";
+    slack_target?: string | null;
   };
+}
+
+/** Anchor rect for the native share popover, from getBoundingClientRect(). */
+export interface ShareAnchor {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface IpcSurface {
@@ -65,6 +74,7 @@ export interface IpcSurface {
   addBookmark?(path: string): Promise<void>;
   removeBookmark?(path: string): Promise<void>;
   reorderBookmarks?(paths: string[]): Promise<void>;
+  shareFile?(paths: string[], anchor: ShareAnchor): Promise<void>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -164,6 +174,10 @@ class TauriIpc implements IpcSurface {
 
   async reorderBookmarks(paths: string[]): Promise<void> {
     await invoke<void>("reorder_bookmarks", { paths });
+  }
+
+  async shareFile(paths: string[], anchor: ShareAnchor): Promise<void> {
+    await invoke<void>("share_file", { paths, anchor });
   }
 }
 

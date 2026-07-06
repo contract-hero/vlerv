@@ -176,6 +176,7 @@ fn main() {
             add_bookmark,
             remove_bookmark,
             reorder_bookmarks,
+            src_tauri::share::share_file,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

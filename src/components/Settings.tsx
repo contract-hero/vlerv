@@ -56,6 +56,11 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
     await setStateField("preferences.drag_out_mode", mode);
   };
 
+  const handleSlackTargetCommit = async (value: string) => {
+    const trimmed = value.trim();
+    await setStateField("preferences.slack_target", trimmed.length > 0 ? trimmed : null);
+  };
+
   return (
     <div data-testid="settings-panel">
       <section>
@@ -119,6 +124,29 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
           />
           Drag a URL (Slack-friendly)
         </label>
+      </section>
+
+      <section>
+        <h3>Slack Share Target</h3>
+        <p>
+          Slack has no macOS share-sheet extension, so Vlervcode opens your
+          channel via a deep link instead — drag the file in from there.
+          Accepts <code>TEAMID/CHANNELID</code> (e.g.{" "}
+          <code>T0123ABCD/C0456EFGH</code>) or a full <code>slack://</code> URL.
+        </p>
+        <input
+          type="text"
+          data-field="slack-target"
+          aria-label="Slack share target"
+          defaultValue={state.preferences?.slack_target ?? ""}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              void handleSlackTargetCommit(e.currentTarget.value);
+            }
+          }}
+          onBlur={(e) => void handleSlackTargetCommit(e.currentTarget.value)}
+          placeholder="T0123ABCD/C0456EFGH"
+        />
       </section>
     </div>
   );

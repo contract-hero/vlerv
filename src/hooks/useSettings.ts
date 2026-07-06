@@ -10,6 +10,7 @@ export interface UseSettingsState {
   preferences: {
     ignore_globs: string[];
     drag_out_mode: "file" | "url";
+    slack_target?: string | null;
   };
 }
 

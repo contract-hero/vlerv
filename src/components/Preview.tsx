@@ -1,9 +1,12 @@
 // Preview — dispatches to the right renderer for the selected file.
 import * as React from "react";
-import { Check, Copy, Star } from "lucide-react";
+import { Check, Copy, Share, Slack, Star } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { FilePayload } from "../ipc";
 import { renderByExtension } from "../render/router";
 import { useBookmarks } from "../hooks/useBookmarks";
+import { useSettings } from "../hooks/useSettings";
+import { slackUrlFromTarget } from "../utils/slack";
 import { tauriIpc } from "../ipc";
 
 type ErrorPayload = {
@@ -98,6 +101,65 @@ function CopyPathButton({ path }: { path: string }): React.ReactElement {
   );
 }
 
+function ShareButton({ path }: { path: string }): React.ReactElement | null {
+  if (!tauriIpc.shareFile) return null;
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Capture the rect synchronously — it's viewport-relative and goes stale
+    // if the pane scrolls between click and native display.
+    const r = e.currentTarget.getBoundingClientRect();
+    void tauriIpc
+      .shareFile!([path], { x: r.x, y: r.y, width: r.width, height: r.height })
+      .catch(() => {
+        // Share errors (path vanished, non-macOS) fail silently, matching
+        // CopyPathButton's clipboard fallback.
+      });
+  };
+  return (
+    <button
+      type="button"
+      className="preview-share"
+      data-testid="preview-share"
+      title="Share…"
+      aria-label="Share file"
+      onClick={handleClick}
+    >
+      <Share size={12} strokeWidth={2} />
+    </button>
+  );
+}
+
+/**
+ * Slack ships no macOS share extension, so the share sheet can't reach it.
+ * When a Slack target is configured in Settings this button foregrounds
+ * Slack on that channel/DM; the file itself travels by drag-out or paste.
+ */
+function OpenInSlackButton(): React.ReactElement | null {
+  const { state } = useSettings(tauriIpc);
+  const target = state?.preferences?.slack_target;
+  const url = target ? slackUrlFromTarget(target) : null;
+  if (!url) return null;
+  return (
+    <button
+      type="button"
+      className="preview-share"
+      data-testid="preview-open-in-slack"
+      title="Open Slack channel (drag the file in to share)"
+      aria-label="Open Slack channel"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void openUrl(url).catch(() => {
+          // Opener scope or missing Slack app — fail silently.
+        });
+      }}
+    >
+      <Slack size={12} strokeWidth={2} />
+    </button>
+  );
+}
+
 export default function Preview({ payload, externalFile = false }: PreviewProps): React.ReactElement {
   if (payload === null) {
     return (
@@ -115,6 +177,8 @@ export default function Preview({ payload, externalFile = false }: PreviewProps)
           <span className="preview-path">{path}</span>
           <BookmarkToggleButton path={path} />
           <CopyPathButton path={path} />
+          <ShareButton path={path} />
+          <OpenInSlackButton />
           {externalFile ? <ExternalBadge /> : null}
         </header>
         <p><strong>{kind}</strong></p>
@@ -129,6 +193,8 @@ export default function Preview({ payload, externalFile = false }: PreviewProps)
         <span className="preview-path">{payload.path}</span>
         <BookmarkToggleButton path={payload.path} />
         <CopyPathButton path={payload.path} />
+        <ShareButton path={payload.path} />
+        <OpenInSlackButton />
         {externalFile ? <ExternalBadge /> : null}
       </header>
       {renderByExtension(payload)}

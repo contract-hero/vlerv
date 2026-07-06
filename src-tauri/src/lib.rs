@@ -6,6 +6,7 @@ pub mod reader;
 pub mod deeplink;
 pub mod drag_spike;
 pub mod security;
+pub mod share;
 pub mod state_store;
 pub mod recents;
 pub mod bookmarks;
