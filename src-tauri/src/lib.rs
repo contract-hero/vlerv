@@ -6,6 +6,7 @@ pub mod reader;
 pub mod deeplink;
 pub mod drag_spike;
 pub mod security;
+pub mod share;
 pub mod state_store;
 pub mod recents;
 pub mod bookmarks;
@@ -205,16 +206,12 @@ pub fn dispatch_deep_link(
         deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal),
     };
 
-    // Branch on the security gate: an `OutOfRoot(canonical)` error means the
-    // path *does* exist and was canonicalized, but lies outside every
-    // configured root. Those become ad-hoc external opens with
-    // `out_of_root: true`. Any other variant (CanonicalizeFailed, EmptyRoots)
-    // is still a hard error — we never open a path the OS can't resolve.
-    let (canonical, out_of_root) = match security::canonicalize_and_check_root(&path, roots) {
-        Ok(canonical) => (canonical, false),
-        Err(security::OutOfRootError::OutOfRoot(canonical)) => (canonical, true),
-        Err(e) => return Err(make_err(e.to_string())),
-    };
+    // Ad-hoc external-open policy: paths that exist but lie outside every
+    // configured root are allowed with `out_of_root: true`; anything the OS
+    // can't resolve (CanonicalizeFailed) — or an empty root set (EmptyRoots)
+    // — is a hard error.
+    let (canonical, out_of_root) =
+        security::canonicalize_allow_external(&path, roots).map_err(|e| make_err(e.to_string()))?;
 
     if matches!(kind, DeepLinkIntentKind::Open) && !out_of_root {
         // Recents is scoped to in-root files; ad-hoc external opens stay

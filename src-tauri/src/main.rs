@@ -53,8 +53,13 @@ fn get_state() -> serde_json::Value {
 }
 
 #[tauri::command]
-fn set_state_field(key: String, value: serde_json::Value) -> Result<(), String> {
-    src_tauri::state_store::set_state_field(&key, value)
+fn set_state_field(app: tauri::AppHandle, key: String, value: serde_json::Value) -> Result<(), String> {
+    src_tauri::state_store::set_state_field(&key, value)?;
+    // Broadcast the updated document so useSettings subscribers (e.g. the
+    // Preview header's Slack button) pick up preference changes without an
+    // app restart — the listener predates this emitter and was dead code.
+    let _ = app.emit("vlerv://state-updated", src_tauri::state_store::current_state_value());
+    Ok(())
 }
 
 #[tauri::command]
@@ -176,6 +181,7 @@ fn main() {
             add_bookmark,
             remove_bookmark,
             reorder_bookmarks,
+            src_tauri::share::share_file,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

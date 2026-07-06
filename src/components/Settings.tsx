@@ -1,4 +1,4 @@
-// Settings panel — workspace roots / ignore-set / drag-out preference. C3.
+// Settings panel — workspace roots / ignore-set / drag-out / Slack share target.
 import * as React from "react";
 import { useSettings } from "../hooks/useSettings";
 import { defaultIpc } from "../ipc";
@@ -10,6 +10,10 @@ export interface SettingsProps {
 export default function Settings({ ipc = defaultIpc }: SettingsProps): React.ReactElement {
   const { state, setStateField } = useSettings(ipc);
   const [newGlob, setNewGlob] = React.useState("");
+  // Last committed Slack target; null = nothing committed this session yet.
+  // Tracked in a ref (not from `state`) because the hook state doesn't
+  // refresh after a write, and Enter-then-blur would double-commit.
+  const lastSlackTarget = React.useRef<string | null>(null);
 
   if (!state) {
     return <div data-testid="settings-panel">Loading…</div>;
@@ -54,6 +58,20 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
 
   const handleDragModeChange = async (mode: "file" | "url") => {
     await setStateField("preferences.drag_out_mode", mode);
+  };
+
+  const handleSlackTargetCommit = async (value: string) => {
+    const trimmed = value.trim();
+    // Enter-then-blur fires this twice; skip the redundant IPC write.
+    const previous = lastSlackTarget.current ?? (state.preferences?.slack_target ?? "");
+    if (trimmed === previous) return;
+    lastSlackTarget.current = trimmed;
+    try {
+      await setStateField("preferences.slack_target", trimmed.length > 0 ? trimmed : null);
+    } catch {
+      // Roll back so a retry with the same value isn't silently skipped.
+      lastSlackTarget.current = previous;
+    }
   };
 
   return (
@@ -119,6 +137,29 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
           />
           Drag a URL (Slack-friendly)
         </label>
+      </section>
+
+      <section>
+        <h3>Slack Share Target</h3>
+        <p>
+          Slack has no macOS share-sheet extension, so Vlervcode opens your
+          channel via a deep link instead — drag the file in from there.
+          Accepts <code>TEAMID/CHANNELID</code> (e.g.{" "}
+          <code>T0123ABCD/C0456EFGH</code>) or a full <code>slack://</code> URL.
+        </p>
+        <input
+          type="text"
+          data-field="slack-target"
+          aria-label="Slack share target"
+          defaultValue={state.preferences?.slack_target ?? ""}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              void handleSlackTargetCommit(e.currentTarget.value);
+            }
+          }}
+          onBlur={(e) => void handleSlackTargetCommit(e.currentTarget.value)}
+          placeholder="T0123ABCD/C0456EFGH"
+        />
       </section>
     </div>
   );

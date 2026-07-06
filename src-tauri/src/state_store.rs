@@ -52,11 +52,16 @@ pub struct PaneSizes {
 pub struct Preferences {
     pub ignore_globs: Vec<String>,
     pub drag_out_mode: String,
+    /// Slack share target: a full `slack://…` URL or a `TEAMID/CHANNELID`
+    /// shorthand the frontend expands. None = the Open-in-Slack affordance
+    /// stays hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_target: Option<String>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { ignore_globs: Vec::new(), drag_out_mode: "file".to_string() }
+        Self { ignore_globs: Vec::new(), drag_out_mode: "file".to_string(), slack_target: None }
     }
 }
 

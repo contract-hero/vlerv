@@ -558,8 +558,9 @@ header .preview-path {
   min-width: 0;
 }
 
-/* Copy-path button (Preview header) */
-.preview-copy-path {
+/* Copy-path + Share + Open-in-Slack buttons (Preview header) — one idiom */
+.preview-copy-path,
+.preview-share {
   background: transparent;
   border: 0;
   padding: 2px 4px;
@@ -571,7 +572,8 @@ header .preview-path {
   flex: 0 0 auto;
   transition: color 80ms ease, background 80ms ease;
 }
-.preview-copy-path:hover {
+.preview-copy-path:hover,
+.preview-share:hover {
   color: var(--fg);
   background: var(--bg-row-hover);
 }
