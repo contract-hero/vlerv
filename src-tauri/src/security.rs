@@ -66,3 +66,20 @@ pub fn canonicalize_and_check_root(
     }
     Ok(canonical)
 }
+
+/// The "ad-hoc external file" policy: resolve `path`, allowing paths that
+/// exist but lie outside every root (Preview legitimately displays those —
+/// user-picked files and out-of-root deep links). Returns the canonical path
+/// plus `out_of_root`. Unresolvable paths and an empty root set stay hard
+/// errors. Shared by the deep-link dispatcher and the share command so the
+/// external-file policy lives in exactly one place.
+pub fn canonicalize_allow_external(
+    path: &Path,
+    roots: &RootSet,
+) -> Result<(PathBuf, bool), OutOfRootError> {
+    match canonicalize_and_check_root(path, roots) {
+        Ok(canonical) => Ok((canonical, false)),
+        Err(OutOfRootError::OutOfRoot(canonical)) => Ok((canonical, true)),
+        Err(e) => Err(e),
+    }
+}

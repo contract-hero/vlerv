@@ -558,7 +558,8 @@ header .preview-path {
   min-width: 0;
 }
 
-/* Share + Open-in-Slack buttons (Preview header) — same idiom as copy-path */
+/* Copy-path + Share + Open-in-Slack buttons (Preview header) — one idiom */
+.preview-copy-path,
 .preview-share {
   background: transparent;
   border: 0;
@@ -571,25 +572,8 @@ header .preview-path {
   flex: 0 0 auto;
   transition: color 80ms ease, background 80ms ease;
 }
+.preview-copy-path:hover,
 .preview-share:hover {
-  color: var(--fg);
-  background: var(--bg-row-hover);
-}
-
-/* Copy-path button (Preview header) */
-.preview-copy-path {
-  background: transparent;
-  border: 0;
-  padding: 2px 4px;
-  cursor: pointer;
-  color: var(--fg-muted);
-  display: inline-flex;
-  align-items: center;
-  border-radius: 3px;
-  flex: 0 0 auto;
-  transition: color 80ms ease, background 80ms ease;
-}
-.preview-copy-path:hover {
   color: var(--fg);
   background: var(--bg-row-hover);
 }

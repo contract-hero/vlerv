@@ -10,6 +10,10 @@ export interface SettingsProps {
 export default function Settings({ ipc = defaultIpc }: SettingsProps): React.ReactElement {
   const { state, setStateField } = useSettings(ipc);
   const [newGlob, setNewGlob] = React.useState("");
+  // Last committed Slack target; null = nothing committed this session yet.
+  // Tracked in a ref (not from `state`) because the hook state doesn't
+  // refresh after a write, and Enter-then-blur would double-commit.
+  const lastSlackTarget = React.useRef<string | null>(null);
 
   if (!state) {
     return <div data-testid="settings-panel">Loading…</div>;
@@ -58,6 +62,10 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
 
   const handleSlackTargetCommit = async (value: string) => {
     const trimmed = value.trim();
+    // Enter-then-blur fires this twice; skip the redundant IPC write.
+    const previous = lastSlackTarget.current ?? (state.preferences?.slack_target ?? "");
+    if (trimmed === previous) return;
+    lastSlackTarget.current = trimmed;
     await setStateField("preferences.slack_target", trimmed.length > 0 ? trimmed : null);
   };
 

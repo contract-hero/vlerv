@@ -14,12 +14,12 @@ pub struct AnchorRect {
     pub height: f64,
 }
 
-/// Canonicalize share candidates through the root gate before touching
-/// AppKit. Out-of-root files that resolve are shareable on purpose: Preview
-/// legitimately displays them (ad-hoc opens, out-of-root deep links), so this
-/// mirrors `dispatch_deep_link`'s `OutOfRoot(canonical)` branch. Anything the
-/// OS can't resolve — or an empty root set — is rejected. Factored out of the
-/// command so the non-AppKit half is unit-testable.
+/// Canonicalize share candidates through the shared external-file policy
+/// (`security::canonicalize_allow_external`): out-of-root files that resolve
+/// are shareable on purpose — Preview legitimately displays them (ad-hoc
+/// opens, out-of-root deep links). Anything the OS can't resolve — or an
+/// empty root set — is rejected. Factored out of the command so the
+/// non-AppKit half is unit-testable.
 fn resolve_paths(paths: &[String], roots: &RootSet) -> Result<Vec<String>, String> {
     if paths.is_empty() {
         return Err("nothing to share".into());
@@ -27,13 +27,10 @@ fn resolve_paths(paths: &[String], roots: &RootSet) -> Result<Vec<String>, Strin
     paths
         .iter()
         .map(|p| {
-            match security::canonicalize_and_check_root(std::path::Path::new(p), roots) {
-                Ok(canonical) | Err(security::OutOfRootError::OutOfRoot(canonical)) => {
-                    Ok(canonical.to_string_lossy().into_owned())
-                }
+            security::canonicalize_allow_external(std::path::Path::new(p), roots)
+                .map(|(canonical, _out_of_root)| canonical.to_string_lossy().into_owned())
                 // Same no-existence-leak wording as the deep-link reveal handler.
-                Err(_) => Err("path not found or out of root".to_string()),
-            }
+                .map_err(|_| "path not found or out of root".to_string())
         })
         .collect()
 }
@@ -86,19 +83,14 @@ mod macos {
         let picker =
             NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items);
 
-        // CSS client coords are top-left-origin. WKWebView is a flipped
-        // NSView, so they map 1:1 (CSS px == AppKit points). Defensive
-        // conversion in case the anchor view is ever non-flipped.
-        let bounds = view.bounds();
-        let height = anchor.height.max(1.0);
-        let anchor_y = if view.isFlipped() {
-            anchor.y
-        } else {
-            bounds.size.height - anchor.y - height
-        };
+        // CSS client coords are top-left-origin. WKWebView overrides
+        // isFlipped to YES, so they map 1:1 (CSS px == AppKit points) with
+        // no y-flip. The assert guards the invariant if the anchor view
+        // ever changes.
+        debug_assert!(view.isFlipped(), "share anchor view must be flipped (WKWebView)");
         let rect = NSRect::new(
-            NSPoint::new(anchor.x, anchor_y),
-            NSSize::new(anchor.width.max(1.0), height),
+            NSPoint::new(anchor.x, anchor.y),
+            NSSize::new(anchor.width.max(1.0), anchor.height.max(1.0)),
         );
 
         // NSMinYEdge: AppKit applies the edge after converting to screen
@@ -111,10 +103,14 @@ mod macos {
 /// Share one or more files via the native macOS share sheet, anchored at a
 /// webview-relative client rect. Fire-and-forget: the picker's outcome
 /// (service chosen / dismissed) is not reported back.
+///
+/// `async` so the per-path canonicalize syscalls run on the runtime pool
+/// instead of the main thread (sync commands execute on the main thread);
+/// only the picker needs the main thread, and `with_webview` hops there.
 #[tauri::command]
-pub fn share_file(
+pub async fn share_file(
     webview: tauri::WebviewWindow,
-    roots: tauri::State<RootSet>,
+    roots: tauri::State<'_, RootSet>,
     paths: Vec<String>,
     anchor: AnchorRect,
 ) -> Result<(), String> {

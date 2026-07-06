@@ -3,16 +3,11 @@
 import * as React from "react";
 import { listen } from "@tauri-apps/api/event";
 import { defaultIpc } from "../ipc";
+import type { SettingsState } from "../ipc";
 
-export interface UseSettingsState {
-  schema_version: number;
-  roots: string[];
-  preferences: {
-    ignore_globs: string[];
-    drag_out_mode: "file" | "url";
-    slack_target?: string | null;
-  };
-}
+// The IPC layer owns the wire shape; keep a single definition so a new
+// preference field can't be added to one copy and silently missed in the other.
+export type UseSettingsState = SettingsState;
 
 export interface UseSettingsResult {
   state: UseSettingsState | null;

@@ -101,8 +101,7 @@ function CopyPathButton({ path }: { path: string }): React.ReactElement {
   );
 }
 
-function ShareButton({ path }: { path: string }): React.ReactElement | null {
-  if (!tauriIpc.shareFile) return null;
+function ShareButton({ path }: { path: string }): React.ReactElement {
   const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -110,7 +109,7 @@ function ShareButton({ path }: { path: string }): React.ReactElement | null {
     // if the pane scrolls between click and native display.
     const r = e.currentTarget.getBoundingClientRect();
     void tauriIpc
-      .shareFile!([path], { x: r.x, y: r.y, width: r.width, height: r.height })
+      .shareFile?.([path], { x: r.x, y: r.y, width: r.width, height: r.height })
       .catch(() => {
         // Share errors (path vanished, non-macOS) fail silently, matching
         // CopyPathButton's clipboard fallback.
@@ -135,11 +134,7 @@ function ShareButton({ path }: { path: string }): React.ReactElement | null {
  * When a Slack target is configured in Settings this button foregrounds
  * Slack on that channel/DM; the file itself travels by drag-out or paste.
  */
-function OpenInSlackButton(): React.ReactElement | null {
-  const { state } = useSettings(tauriIpc);
-  const target = state?.preferences?.slack_target;
-  const url = target ? slackUrlFromTarget(target) : null;
-  if (!url) return null;
+function OpenInSlackButton({ url }: { url: string }): React.ReactElement {
   return (
     <button
       type="button"
@@ -160,7 +155,34 @@ function OpenInSlackButton(): React.ReactElement | null {
   );
 }
 
+function PreviewHeader({
+  path,
+  externalFile,
+  slackUrl,
+}: {
+  path: string;
+  externalFile: boolean;
+  slackUrl: string | null;
+}): React.ReactElement {
+  return (
+    <header>
+      <span className="preview-path">{path}</span>
+      <BookmarkToggleButton path={path} />
+      <CopyPathButton path={path} />
+      <ShareButton path={path} />
+      {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
+      {externalFile ? <ExternalBadge /> : null}
+    </header>
+  );
+}
+
 export default function Preview({ payload, externalFile = false }: PreviewProps): React.ReactElement {
+  // One settings subscription for the whole pane (Preview stays mounted
+  // across payload switches, unlike the per-branch header buttons).
+  const { state } = useSettings(tauriIpc);
+  const target = state?.preferences?.slack_target;
+  const slackUrl = target ? slackUrlFromTarget(target) : null;
+
   if (payload === null) {
     return (
       <div className="preview-empty">
@@ -173,14 +195,7 @@ export default function Preview({ payload, externalFile = false }: PreviewProps)
     const { kind, path, reason } = payload.error;
     return (
       <div role="alert" data-testid="preview-error" style={{ padding: "16px" }}>
-        <header>
-          <span className="preview-path">{path}</span>
-          <BookmarkToggleButton path={path} />
-          <CopyPathButton path={path} />
-          <ShareButton path={path} />
-          <OpenInSlackButton />
-          {externalFile ? <ExternalBadge /> : null}
-        </header>
+        <PreviewHeader path={path} externalFile={externalFile} slackUrl={slackUrl} />
         <p><strong>{kind}</strong></p>
         <p>{reason}</p>
       </div>
@@ -189,14 +204,7 @@ export default function Preview({ payload, externalFile = false }: PreviewProps)
 
   return (
     <div data-testid="preview-content">
-      <header>
-        <span className="preview-path">{payload.path}</span>
-        <BookmarkToggleButton path={payload.path} />
-        <CopyPathButton path={payload.path} />
-        <ShareButton path={payload.path} />
-        <OpenInSlackButton />
-        {externalFile ? <ExternalBadge /> : null}
-      </header>
+      <PreviewHeader path={payload.path} externalFile={externalFile} slackUrl={slackUrl} />
       {renderByExtension(payload)}
     </div>
   );
