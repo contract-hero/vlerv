@@ -1,4 +1,4 @@
-// Settings panel — workspace roots / ignore-set / drag-out preference. C3.
+// Settings panel — workspace roots / ignore-set / drag-out / Slack share target.
 import * as React from "react";
 import { useSettings } from "../hooks/useSettings";
 import { defaultIpc } from "../ipc";
@@ -66,7 +66,12 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
     const previous = lastSlackTarget.current ?? (state.preferences?.slack_target ?? "");
     if (trimmed === previous) return;
     lastSlackTarget.current = trimmed;
-    await setStateField("preferences.slack_target", trimmed.length > 0 ? trimmed : null);
+    try {
+      await setStateField("preferences.slack_target", trimmed.length > 0 ? trimmed : null);
+    } catch {
+      // Roll back so a retry with the same value isn't silently skipped.
+      lastSlackTarget.current = previous;
+    }
   };
 
   return (

@@ -185,6 +185,43 @@ mod tests {
         let roots = RootSet::new(vec![dir.path().to_path_buf()]);
         let (other_dir, other_file) = root_and_file();
         let _keep = other_dir;
-        assert!(resolve_paths(&[other_file.to_string_lossy().into_owned()], &roots).is_ok());
+        let resolved =
+            resolve_paths(&[other_file.to_string_lossy().into_owned()], &roots).expect("external");
+        assert_eq!(
+            resolved,
+            vec![other_file.canonicalize().unwrap().to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn one_bad_path_rejects_the_whole_batch() {
+        // Fail-closed: a share is all-or-nothing, never a silent subset.
+        let (dir, file) = root_and_file();
+        let roots = RootSet::new(vec![dir.path().to_path_buf()]);
+        let paths = [
+            file.to_string_lossy().into_owned(),
+            "/definitely/not/a/real/path".to_string(),
+        ];
+        assert_eq!(
+            resolve_paths(&paths, &roots).unwrap_err(),
+            "path not found or out of root"
+        );
+    }
+
+    #[test]
+    fn resolves_multiple_paths_in_input_order() {
+        let (dir, a) = root_and_file();
+        let roots = RootSet::new(vec![dir.path().to_path_buf()]);
+        let b = dir.path().join("second.txt");
+        std::fs::write(&b, "y").expect("write");
+        let resolved = resolve_paths(
+            &[a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()],
+            &roots,
+        )
+        .expect("both in-root");
+        assert_eq!(resolved, vec![
+            a.canonicalize().unwrap().to_string_lossy().into_owned(),
+            b.canonicalize().unwrap().to_string_lossy().into_owned(),
+        ]);
     }
 }

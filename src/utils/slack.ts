@@ -9,7 +9,8 @@
  * slack:// URL. Accepted forms:
  *  - a full `slack://…` URL (passed through untouched)
  *  - `TEAMID/CHANNELID` shorthand (e.g. `T0123ABCD/C0456EFGH`) — expands to
- *    `slack://channel?team=…&id=…`. A `D…` id (DM) expands via slack://user.
+ *    `slack://channel?team=…&id=…` (a legacy `G…` private-channel id works
+ *    the same). A `D…` id (DM) expands via slack://user.
  * Anything else returns null and the affordance stays hidden.
  */
 export function slackUrlFromTarget(target: string): string | null {

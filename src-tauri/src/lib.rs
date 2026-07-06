@@ -208,7 +208,8 @@ pub fn dispatch_deep_link(
 
     // Ad-hoc external-open policy: paths that exist but lie outside every
     // configured root are allowed with `out_of_root: true`; anything the OS
-    // can't resolve (CanonicalizeFailed, EmptyRoots) is a hard error.
+    // can't resolve (CanonicalizeFailed) — or an empty root set (EmptyRoots)
+    // — is a hard error.
     let (canonical, out_of_root) =
         security::canonicalize_allow_external(&path, roots).map_err(|e| make_err(e.to_string()))?;
 
