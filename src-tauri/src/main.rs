@@ -97,15 +97,11 @@ fn reorder_bookmarks(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), St
 }
 
 /// Start (or replace) the filesystem watcher rooted at `path`. Each successful
-/// call drops any previous watcher handle (stopping its OS-level watch) and
-/// spawns a fresh notify-rs watcher plus a bridge thread that forwards
-/// `TreeChange` events to the webview as `vlerv://tree-changed`.
-///
-/// KNOWN LEAK: the previous run's flush thread (inside `watcher.rs`) and its
-/// matching bridge thread here block forever — `start_watching` has no
-/// shutdown signal for those. In practice this means a few stranded threads
-/// per workspace switch, which is fine for a single-user dev tool but
-/// warrants a proper shutdown channel before that pattern multiplies.
+/// call drops any previous watcher handle, which shuts down its entire
+/// pipeline (watcher, flush thread, raw-event thread, and the bridge thread
+/// below via channel disconnect), then spawns a fresh notify-rs watcher plus
+/// a bridge thread that forwards `TreeChange` events to the webview as
+/// `vlerv://tree-changed`.
 #[tauri::command]
 fn set_workspace_root(
     app: tauri::AppHandle,

@@ -5,6 +5,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,9 +33,20 @@ pub enum WatcherError {
     InvalidRoot(PathBuf),
 }
 
-/// Handle returned by `start_watching`. Dropping it stops the watcher.
+/// Handle returned by `start_watching`. Dropping it stops the watcher AND
+/// terminates the whole pipeline: the flush thread exits via the shutdown
+/// flag, the raw-event thread exits when the dropped watcher releases its
+/// handler closure (disconnecting `raw_rx`), and any downstream bridge
+/// thread exits when the flush thread drops the last `Sender<TreeChange>`.
 pub struct WatcherHandle {
     _watcher: RecommendedWatcher,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for WatcherHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Debug for WatcherHandle {
@@ -45,7 +57,7 @@ impl std::fmt::Debug for WatcherHandle {
 
 impl WatcherHandle {
     pub fn stop(self) {
-        // Dropping the watcher stops it. `self` is moved here and dropped.
+        // Moving `self` here drops it, which triggers the shutdown cascade.
     }
 }
 
@@ -75,16 +87,24 @@ pub fn start_watching(
     let pending: Arc<Mutex<HashMap<PathBuf, (TreeChangeKind, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let roots_for_handler = roots.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     let pending_for_handler = Arc::clone(&pending);
     let ignore_globs_clone = ignore_globs.clone();
     let tx_clone = tx.clone();
 
     // Debounce flush thread: polls the pending map and emits when quiet.
+    // Exits when the WatcherHandle is dropped; the original `tx` drops at the
+    // end of this function, so the flush thread's exit releases the last
+    // Sender and disconnects the caller's receiver.
     let pending_for_flush = Arc::clone(&pending);
     let roots_for_flush = roots.clone();
+    let shutdown_for_flush = Arc::clone(&shutdown);
     std::thread::spawn(move || {
         loop {
+            if shutdown_for_flush.load(Ordering::SeqCst) {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(50));
             let now = Instant::now();
             let mut map = pending_for_flush.lock().unwrap_or_else(|p| p.into_inner());
@@ -116,7 +136,8 @@ pub fn start_watching(
     }
 
     // Event processing thread: reads from raw_rx, applies ignore filter,
-    // and updates the debounce map.
+    // and updates the debounce map. Exits when the watcher (and with it the
+    // handler closure owning `raw_tx`) is dropped.
     std::thread::spawn(move || {
         for event in raw_rx {
             let kind = match event.kind {
@@ -138,7 +159,10 @@ pub fn start_watching(
         }
     });
 
-    Ok(WatcherHandle { _watcher: watcher })
+    Ok(WatcherHandle {
+        _watcher: watcher,
+        shutdown,
+    })
 }
 
 fn is_ignored(path: &PathBuf, ignore_globs: &[String]) -> bool {
@@ -175,4 +199,53 @@ fn find_root(path: &PathBuf, roots: &[PathBuf]) -> PathBuf {
         }
     }
     roots.first().cloned().unwrap_or_else(|| path.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use tempfile::TempDir;
+
+    #[test]
+    fn dropping_handle_disconnects_channel() {
+        let dir = TempDir::new().expect("tempdir");
+        let (tx, rx) = channel();
+        let handle =
+            start_watching(vec![dir.path().to_path_buf()], vec![], tx).expect("start");
+        drop(handle);
+
+        // The flush thread notices the shutdown flag within one 50 ms tick and
+        // exits, dropping the last Sender. Drain any stray events first.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Err(RecvTimeoutError::Disconnected) => return, // pass
+                Ok(_) => continue,                             // stray event, keep draining
+                Err(RecvTimeoutError::Timeout) => {
+                    if Instant::now() > deadline {
+                        panic!("channel never disconnected after handle drop");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn event_delivery_still_works() {
+        let dir = TempDir::new().expect("tempdir");
+        let (tx, rx) = channel();
+        let _handle =
+            start_watching(vec![dir.path().to_path_buf()], vec![], tx).expect("start");
+
+        // FSEvents needs a beat to arm before it reports changes.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dir.path().join("artifact.html"), "<html></html>").expect("write");
+
+        // Generous timeout: FSEvents latency + 250 ms debounce + flush tick.
+        let change = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a TreeChange event");
+        assert!(change.path.ends_with("artifact.html"));
+    }
 }
