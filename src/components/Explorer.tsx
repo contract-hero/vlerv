@@ -7,6 +7,7 @@ import type { IpcSurface, TreeEntry } from "../ipc";
 import { FileGlyph, FolderGlyph } from "./FileIcon";
 import { useWatcherBus } from "../state/watcher-bus";
 import { useBookmarksContext } from "../state/bookmarks-context";
+import { useExplorerUi } from "../state/explorer-ui";
 import { openOptsFromClick } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
@@ -68,7 +69,10 @@ interface NodeProps {
 }
 
 function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps): React.ReactElement {
-  const [expanded, setExpanded] = React.useState(false);
+  // Expansion is hoisted into ExplorerUiContext so reveal() can expand whole
+  // ancestor chains and expansion survives node remounts.
+  const { expandedPaths, toggle, focusedPath } = useExplorerUi();
+  const expanded = expandedPaths.has(entry.path);
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const versions = React.useContext(FolderCacheContext);
@@ -100,9 +104,13 @@ function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps):
       <div
         className={`row folder ${isSelected ? "selected" : ""}`}
         style={{ paddingLeft: `${indentPx}px` }}
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => toggle(entry.path)}
         data-path={entry.path}
         data-kind="dir"
+        role="treeitem"
+        aria-expanded={expanded}
+        aria-level={depth + 1}
+        tabIndex={focusedPath === entry.path ? 0 : -1}
       >
         <span className={`chevron ${expanded ? "open" : ""}`}>
           <ChevronRight size={14} strokeWidth={2} />
@@ -154,10 +162,28 @@ interface FileRowProps {
 
 function FileRow({ entry, depth, onOpenFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
   const indentPx = 12 + depth * 16;
+  const { revealTarget, focusedPath } = useExplorerUi();
+  const rowRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Reveal: scroll into view when this row is the armed target. Runs on
+  // mount and on nonce bumps, so it fires exactly when the async ancestor
+  // expand-cascade finally renders the row.
+  const isRevealTarget = revealTarget?.path === entry.path;
+  React.useEffect(() => {
+    if (isRevealTarget) {
+      rowRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [isRevealTarget, revealTarget?.nonce]);
+
   return (
     <div
+      ref={rowRef}
       className={`row file ${selected ? "selected" : ""}`}
       style={{ paddingLeft: `${indentPx}px` }}
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-selected={selected}
+      tabIndex={focusedPath === entry.path ? 0 : -1}
       onClick={(e) => onOpenFile?.(entry.path, openOptsFromClick(e))}
       onAuxClick={(e) => {
         if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
@@ -203,7 +229,85 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
   const [error, setError] = React.useState<string | null>(null);
   const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
   const { isBookmarked, toggle: toggleBookmark } = useBookmarksContext();
+  const { expandedPaths, expand, collapse, focusedPath, setFocusedPath } = useExplorerUi();
   const bus = useWatcherBus();
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Tree keyboard navigation: roving tabindex over the rendered rows (the
+  // recursive render produces flat DOM order, so querySelectorAll walks the
+  // visible tree top-to-bottom).
+  const onTreeKeyDown = React.useCallback(
+    (e: React.KeyboardEvent) => {
+      const container = containerRef.current;
+      if (!container) return;
+      const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-path]"));
+      if (rows.length === 0) return;
+      const currentIdx = rows.findIndex((r) => r.dataset.path === focusedPath);
+
+      const focusRow = (idx: number) => {
+        const row = rows[Math.max(0, Math.min(rows.length - 1, idx))];
+        if (!row) return;
+        setFocusedPath(row.dataset.path ?? null);
+        row.focus();
+        row.scrollIntoView({ block: "nearest" });
+      };
+
+      const current = currentIdx >= 0 ? rows[currentIdx] : null;
+      const currentPath = current?.dataset.path ?? null;
+      const isDir = current?.dataset.kind === "dir";
+
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          focusRow(currentIdx < 0 ? 0 : currentIdx + 1);
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          focusRow(currentIdx < 0 ? 0 : currentIdx - 1);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (isDir && currentPath) {
+            if (!expandedPaths.has(currentPath)) expand(currentPath);
+            else focusRow(currentIdx + 1); // first child is the next row
+          }
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          if (isDir && currentPath && expandedPaths.has(currentPath)) {
+            collapse(currentPath);
+          } else if (currentPath) {
+            // Move to the parent row.
+            const parent = parentDir(currentPath);
+            const parentIdx = rows.findIndex((r) => r.dataset.path === parent);
+            if (parentIdx >= 0) focusRow(parentIdx);
+          }
+          break;
+        case "Home":
+          e.preventDefault();
+          focusRow(0);
+          break;
+        case "End":
+          e.preventDefault();
+          focusRow(rows.length - 1);
+          break;
+        case "Enter":
+        case " ":
+          e.preventDefault();
+          if (isDir && currentPath) {
+            if (expandedPaths.has(currentPath)) collapse(currentPath);
+            else expand(currentPath);
+          } else if (currentPath) {
+            onOpenFile?.(
+              currentPath,
+              e.metaKey || e.ctrlKey ? { newTab: true, background: !e.shiftKey } : undefined,
+            );
+          }
+          break;
+      }
+    },
+    [focusedPath, setFocusedPath, expandedPaths, expand, collapse, onOpenFile],
+  );
 
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
@@ -260,7 +364,16 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
   return (
     <FolderCacheContext.Provider value={versions}>
       <RefreshContext.Provider value={refreshNonce}>
-      <div className="explorer">
+      <div
+        className="explorer"
+        role="tree"
+        aria-label="Workspace files"
+        ref={containerRef}
+        // Tab-reachable even before any row has been focused; the keydown
+        // handler treats "no focused row" as "start at the first row".
+        tabIndex={focusedPath ? -1 : 0}
+        onKeyDown={onTreeKeyDown}
+      >
         {sortEntries(entries).map((entry) =>
           entry.is_dir ? (
             <FolderNode

@@ -18,6 +18,8 @@ import { WatcherProvider } from "./state/watcher-bus";
 import { BookmarksProvider } from "./state/bookmarks-context";
 import { RecentsProvider } from "./state/recents-context";
 import { ScrollMemoryProvider } from "./state/scroll-memory";
+import { ExplorerUiProvider, useExplorerUi } from "./state/explorer-ui";
+import { isUnderRoot } from "./utils/path";
 import {
   TabsProvider,
   useActiveTab,
@@ -60,7 +62,9 @@ function ProviderShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
         <RecentsProvider ipc={ipc}>
           <TabsProvider ipc={ipc}>
             <ScrollMemoryProvider>
-              <AppShell ipc={ipc} />
+              <ExplorerUiProvider>
+                <AppShell ipc={ipc} />
+              </ExplorerUiProvider>
             </ScrollMemoryProvider>
           </TabsProvider>
         </RecentsProvider>
@@ -75,6 +79,15 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   const active = useActiveTab();
   const entry = currentEntry(active);
   const openFile = useOpenFile(ipc, root);
+  const { reveal } = useExplorerUi();
+
+  // Auto-reveal: keep the tree pointing at the active tab's file.
+  const activePath = entry?.path ?? null;
+  React.useEffect(() => {
+    if (activePath && root && isUnderRoot(activePath, root)) {
+      reveal(activePath, root);
+    }
+  }, [activePath, root, reveal]);
 
   const [sidebarPx, setSidebarPx] = React.useState<number>(DEFAULT_SIDEBAR_PX);
   const [refreshNonce, setRefreshNonce] = React.useState<number>(0);
@@ -139,13 +152,12 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       if (intent === "open") {
         dispatch({ type: "FOCUS_OR_OPEN", path, external: Boolean(out_of_root) });
       } else {
-        // Reveal: select + expand in the tree without switching the preview.
-        // Tree expansion hoisting lands with the reveal feature; for now we
-        // honor the negative half of the contract (don't switch the preview).
-        console.warn("vlerv: reveal intent received; tree-expansion not yet wired", path);
+        // Reveal: expand + scroll to the file in the tree WITHOUT switching
+        // the preview (per the deeplink.rs contract).
+        reveal(path, root);
       }
     },
-    [dispatch],
+    [dispatch, reveal, root],
   );
   const handleDeepLinkError = React.useCallback(
     ({ reason, url }: DeepLinkErrorPayload) => {
