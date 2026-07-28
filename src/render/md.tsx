@@ -8,9 +8,12 @@ import { useTheme } from "../hooks/useTheme";
 export interface MdRendererProps {
   source: string;
   path?: string;
+  /** Fired after the markdown DOM lands (before async shiki/mermaid passes)
+   *  so the host can restore scroll position. */
+  onRendered?: () => void;
 }
 
-export default function MdRenderer({ source, path }: MdRendererProps): React.ReactElement {
+export default function MdRenderer({ source, path, onRendered }: MdRendererProps): React.ReactElement {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [shikiReady, setShikiReady] = React.useState(false);
   const theme = useTheme();
@@ -42,6 +45,12 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
         return;
       }
 
+      const clickMods = {
+        meta: e.metaKey || e.ctrlKey,
+        shift: e.shiftKey,
+        middle: e.button === 1,
+      };
+
       // Any other scheme would otherwise blow away the host webview — block the
       // default and try to resolve it to a local file we can open in-place.
       e.preventDefault();
@@ -58,7 +67,7 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
         resolved = null;
       }
       if (resolved) {
-        window.postMessage({ type: "vlerv:navigate", path: resolved }, "*");
+        window.postMessage({ type: "vlerv:navigate", path: resolved, ...clickMods }, "*");
       }
     },
     [path],
@@ -80,6 +89,9 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
         el.appendChild(document.importNode(child, true));
       }
     }
+
+    // Content is in the DOM — let the host restore scroll position.
+    onRendered?.();
 
     (async () => {
       // Shiki async pass for code blocks.
@@ -142,7 +154,7 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
   return (
     <div
       data-testid="md-outer"
-      style={{ width: "100%", height: "100%", overflow: "auto" }}
+      style={{ width: "100%" }}
       onClickCapture={onClickCapture}
     >
       <div

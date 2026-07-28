@@ -1,0 +1,47 @@
+// RecentsProvider — one recents subscription for the whole app (StartPage).
+import * as React from "react";
+import type { IpcSurface, RecentEntry } from "../ipc";
+import { useTauriEvent } from "../hooks/useTauriEvent";
+
+export interface RecentsContextValue {
+  recents: RecentEntry[];
+  /** Re-fetch from the backend (recents have no update event today). */
+  refresh: () => void;
+}
+
+const RecentsContext = React.createContext<RecentsContextValue>({
+  recents: [],
+  refresh: () => {},
+});
+
+export function useRecentsContext(): RecentsContextValue {
+  return React.useContext(RecentsContext);
+}
+
+export function RecentsProvider({
+  ipc,
+  children,
+}: {
+  ipc: IpcSurface;
+  children: React.ReactNode;
+}): React.ReactElement {
+  const [recents, setRecents] = React.useState<RecentEntry[]>([]);
+
+  const refresh = React.useCallback(() => {
+    if (!ipc.listRecents) return;
+    ipc.listRecents().then(setRecents).catch(() => {
+      // backend not wired; ignore
+    });
+  }, [ipc]);
+
+  React.useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  // Fired by the backend after deep-link opens push recents; harmless if never
+  // emitted (kept for forward compat with a backend that broadcasts updates).
+  useTauriEvent<RecentEntry[]>("vlerv://recents-updated", setRecents);
+
+  const value = React.useMemo(() => ({ recents, refresh }), [recents, refresh]);
+  return <RecentsContext.Provider value={value}>{children}</RecentsContext.Provider>;
+}

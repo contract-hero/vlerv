@@ -1,0 +1,214 @@
+// Toolbar — browser-style navigation row above the preview: back/forward/
+// reload, an editable address bar showing the active tab's path, bookmark
+// star, copy-path, external badge, and zoom controls.
+import * as React from "react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  Copy,
+  RotateCw,
+  Star,
+} from "lucide-react";
+import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
+import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
+import { useBookmarksContext } from "../state/bookmarks-context";
+import { normalizePathBarInput } from "../utils/path";
+
+export interface ToolbarProps {
+  addressBarRef: React.MutableRefObject<HTMLInputElement | null>;
+  onSubmitPath: (path: string) => void;
+}
+
+function IconButton({
+  title,
+  disabled,
+  onClick,
+  children,
+}: {
+  title: string;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}): React.ReactElement {
+  return (
+    <button
+      type="button"
+      className="toolbar-button"
+      title={title}
+      aria-label={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function CopyPathButton({ path }: { path: string }): React.ReactElement {
+  const [copied, setCopied] = React.useState(false);
+  const resetTimer = React.useRef<number | null>(null);
+
+  React.useEffect(() => {
+    return () => {
+      if (resetTimer.current) window.clearTimeout(resetTimer.current);
+    };
+  }, []);
+
+  return (
+    <button
+      type="button"
+      className="toolbar-button"
+      data-testid="preview-copy-path"
+      title={copied ? "Copied!" : "Copy path"}
+      aria-label="Copy file path"
+      onClick={() => {
+        void navigator.clipboard
+          ?.writeText(path)
+          .then(() => {
+            setCopied(true);
+            if (resetTimer.current) window.clearTimeout(resetTimer.current);
+            resetTimer.current = window.setTimeout(() => setCopied(false), 1200);
+          })
+          .catch(() => {});
+      }}
+    >
+      {copied ? <Check size={13} strokeWidth={2.5} /> : <Copy size={13} strokeWidth={2} />}
+    </button>
+  );
+}
+
+export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): React.ReactElement {
+  const tab = useActiveTab();
+  const dispatch = useTabsDispatch();
+  const { isBookmarked, toggle } = useBookmarksContext();
+
+  const entry = currentEntry(tab);
+  const currentPath = entry?.path ?? "";
+
+  // The input is controlled locally; it resyncs to the tab's path whenever
+  // the tab or its current entry changes, and tracks user edits in between.
+  const [draft, setDraft] = React.useState(currentPath);
+  const [editing, setEditing] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!editing) {
+      setDraft(currentPath);
+      setError(null);
+    }
+  }, [currentPath, tab.id, editing]);
+
+  const submit = () => {
+    const result = normalizePathBarInput(draft);
+    if (result.kind === "error") {
+      setError(result.reason);
+      return;
+    }
+    setError(null);
+    setEditing(false);
+    onSubmitPath(result.path);
+    addressBarRef.current?.blur();
+  };
+
+  const bookmarked = entry ? isBookmarked(entry.path) : false;
+  const zoomPct = Math.round(tab.zoom * 100);
+
+  return (
+    <div className="toolbar">
+      <IconButton
+        title="Back (⌘[)"
+        disabled={!canGoBack(tab)}
+        onClick={() => dispatch({ type: "GO_BACK" })}
+      >
+        <ArrowLeft size={15} strokeWidth={2} />
+      </IconButton>
+      <IconButton
+        title="Forward (⌘])"
+        disabled={!canGoForward(tab)}
+        onClick={() => dispatch({ type: "GO_FORWARD" })}
+      >
+        <ArrowRight size={15} strokeWidth={2} />
+      </IconButton>
+      <IconButton
+        title="Reload (⌘R)"
+        disabled={!entry}
+        onClick={() => dispatch({ type: "RELOAD" })}
+      >
+        <RotateCw size={13.5} strokeWidth={2} />
+      </IconButton>
+
+      <div className="address-bar" data-error={error ? "true" : undefined}>
+        <input
+          ref={addressBarRef}
+          type="text"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          placeholder="Enter a file path, file:// or vlerv:// URL  (⌘L)"
+          value={draft}
+          data-testid="path-bar-input"
+          onFocus={() => setEditing(true)}
+          onBlur={() => setEditing(false)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            if (error) setError(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              submit();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setDraft(currentPath);
+              setError(null);
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+        />
+        {error ? (
+          <span className="address-bar-error" role="alert">
+            {error}
+          </span>
+        ) : null}
+        {entry?.external ? (
+          <span
+            className="preview-badge-external"
+            data-testid="preview-external-badge"
+            title="This file is outside the workspace root"
+          >
+            external
+          </span>
+        ) : null}
+      </div>
+
+      {entry ? (
+        <>
+          <button
+            type="button"
+            className={`toolbar-button${bookmarked ? " star-active" : ""}`}
+            data-testid="preview-bookmark-toggle"
+            title={bookmarked ? "Remove bookmark" : "Bookmark this file"}
+            aria-label={bookmarked ? "Remove bookmark" : "Bookmark this file"}
+            aria-pressed={bookmarked}
+            onClick={() => void toggle(entry.path)}
+          >
+            <Star size={13.5} strokeWidth={2} fill={bookmarked ? "currentColor" : "none"} />
+          </button>
+          <CopyPathButton path={entry.path} />
+        </>
+      ) : null}
+
+      {zoomPct !== 100 ? (
+        <button
+          type="button"
+          className="toolbar-zoom"
+          title="Reset zoom (⌘0)"
+          onClick={() => dispatch({ type: "SET_ZOOM", tabId: tab.id, zoom: 1 })}
+        >
+          {zoomPct}%
+        </button>
+      ) : null}
+    </div>
+  );
+}

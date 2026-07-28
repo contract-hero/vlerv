@@ -4,9 +4,9 @@
 // (state persisted to localStorage so the choice survives reloads).
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
-import { useBookmarks } from "../hooks/useBookmarks";
-import { defaultIpc } from "../ipc";
-import { isUnderRoot } from "../utils/path";
+import { useBookmarksContext } from "../state/bookmarks-context";
+import { openOptsFromClick } from "../state/TabsProvider";
+import type { OpenFileOptions } from "../state/TabsProvider";
 
 const COLLAPSED_KEY = "vlerv.bookmarks.collapsed";
 
@@ -27,17 +27,11 @@ function saveCollapsed(collapsed: boolean): void {
 }
 
 export interface BookmarksProps {
-  ipc?: typeof defaultIpc;
-  onSelectFile?: (path: string, external?: boolean) => void;
-  workspaceRoot?: string | null;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
 }
 
-export default function Bookmarks({
-  ipc = defaultIpc,
-  onSelectFile,
-  workspaceRoot = null,
-}: BookmarksProps): React.ReactElement {
-  const { bookmarks, remove, reorder } = useBookmarks(ipc);
+export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactElement {
+  const { bookmarks, remove, reorder } = useBookmarksContext();
   const [collapsed, setCollapsed] = React.useState<boolean>(readSavedCollapsed);
   // Drag-to-reorder state: the path being dragged and the path currently
   // hovered as a drop target (used to draw the insertion indicator).
@@ -73,8 +67,8 @@ export default function Bookmarks({
     return <div data-section="bookmarks" data-testid="bookmarks-group" />;
   }
 
-  const handleClick = (path: string) => {
-    onSelectFile?.(path, !isUnderRoot(path, workspaceRoot));
+  const handleClick = (e: React.MouseEvent, path: string) => {
+    onOpenFile?.(path, openOptsFromClick(e));
   };
 
   const handleContextMenu = (e: React.MouseEvent, path: string) => {
@@ -140,7 +134,10 @@ export default function Bookmarks({
                 setDragPath(null);
                 setOverPath(null);
               }}
-              onClick={() => handleClick(entry.path)}
+              onClick={(e) => handleClick(e, entry.path)}
+              onAuxClick={(e) => {
+                if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
+              }}
               onContextMenu={(e) => handleContextMenu(e, entry.path)}
               style={{ cursor: "pointer" }}
               title={`${entry.path}\n(drag to reorder · right-click to remove)`}

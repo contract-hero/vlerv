@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
+    "test": "vitest run",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -28,6 +29,7 @@
     "@types/react-dom": "^18",
     "@vitejs/plugin-react": "^4",
     "typescript": "^5",
-    "vite": "^5"
+    "vite": "^5",
+    "vitest": "^2.1.9"
   }
 }

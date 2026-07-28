@@ -20,7 +20,17 @@ export interface FilePayload {
   mtime: number;
   is_binary: boolean;
   oversized: boolean;
+  /** How `content` is encoded: UTF-8 text or base64 (raster images). */
+  encoding?: "text" | "base64";
   content: string | null;
+}
+
+/** Flat recursive file index returned by `list_files_recursive` (⌘P). */
+export interface FileIndex {
+  root: string;
+  /** Paths relative to `root`, BFS (shallow-first) order. */
+  files: string[];
+  truncated: boolean;
 }
 
 export interface RecentEntry {
@@ -65,6 +75,13 @@ export interface IpcSurface {
   addBookmark?(path: string): Promise<void>;
   removeBookmark?(path: string): Promise<void>;
   reorderBookmarks?(paths: string[]): Promise<void>;
+  listFilesRecursive?(root: string): Promise<FileIndex>;
+  /**
+   * Replace the set of individually watched out-of-root files (open external
+   * tabs). Empty array clears the watcher. Changes arrive as
+   * `vlerv://file-changed` events.
+   */
+  watchExternalPaths?(paths: string[]): Promise<void>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -164,6 +181,14 @@ class TauriIpc implements IpcSurface {
 
   async reorderBookmarks(paths: string[]): Promise<void> {
     await invoke<void>("reorder_bookmarks", { paths });
+  }
+
+  async listFilesRecursive(root: string): Promise<FileIndex> {
+    return await invoke<FileIndex>("list_files_recursive", { path: root });
+  }
+
+  async watchExternalPaths(paths: string[]): Promise<void> {
+    await invoke<void>("watch_external_paths", { paths });
   }
 }
 

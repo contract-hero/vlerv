@@ -5,9 +5,10 @@ import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
 import { FileGlyph, FolderGlyph } from "./FileIcon";
-import { useWatcher } from "../hooks/useWatcher";
-import type { TreeChangedPayload } from "../hooks/useWatcher";
-import { useBookmarks } from "../hooks/useBookmarks";
+import { useWatcherBus } from "../state/watcher-bus";
+import { useBookmarksContext } from "../state/bookmarks-context";
+import { openOptsFromClick } from "../state/TabsProvider";
+import type { OpenFileOptions } from "../state/TabsProvider";
 
 // Path-keyed cache-version map. FolderNode reads its own path's version from
 // context; bumping it re-fires that node's listDir effect without touching
@@ -45,7 +46,7 @@ const DEFAULT_IGNORED = new Set([
 export interface ExplorerProps {
   ipc: IpcSurface;
   root: string;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selectedFile?: string | null;
   /** Bumped by the sidebar Refresh button to force a full tree re-fetch. */
   refreshNonce?: number;
@@ -62,18 +63,18 @@ interface NodeProps {
   ipc: IpcSurface;
   entry: TreeEntry;
   depth: number;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selectedFile?: string | null;
 }
 
-function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps): React.ReactElement {
+function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps): React.ReactElement {
   const [expanded, setExpanded] = React.useState(false);
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const versions = React.useContext(FolderCacheContext);
   const version = versions.get(entry.path) ?? 0;
   const refreshNonce = React.useContext(RefreshContext);
-  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarksContext();
 
   React.useEffect(() => {
     if (!expanded) return;
@@ -123,7 +124,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
             ipc={ipc}
             entry={child}
             depth={depth + 1}
-            onSelectFile={onSelectFile}
+            onOpenFile={onOpenFile}
             selectedFile={selectedFile}
           />
         ) : (
@@ -131,7 +132,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
             key={child.path}
             entry={child}
             depth={depth + 1}
-            onSelectFile={onSelectFile}
+            onOpenFile={onOpenFile}
             selected={selectedFile === child.path}
             bookmarked={isBookmarked(child.path)}
             onToggleBookmark={(p) => void toggleBookmark(p)}
@@ -145,19 +146,22 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
 interface FileRowProps {
   entry: TreeEntry;
   depth: number;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selected: boolean;
   bookmarked: boolean;
   onToggleBookmark: (path: string) => void;
 }
 
-function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
+function FileRow({ entry, depth, onOpenFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
   const indentPx = 12 + depth * 16;
   return (
     <div
       className={`row file ${selected ? "selected" : ""}`}
       style={{ paddingLeft: `${indentPx}px` }}
-      onClick={() => onSelectFile?.(entry.path)}
+      onClick={(e) => onOpenFile?.(entry.path, openOptsFromClick(e))}
+      onAuxClick={(e) => {
+        if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
+      }}
       draggable
       onDragStart={(e) => {
         e.preventDefault();
@@ -194,11 +198,12 @@ function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBoo
   );
 }
 
-export default function Explorer({ ipc, root, onSelectFile, selectedFile, refreshNonce = 0 }: ExplorerProps): React.ReactElement {
+export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshNonce = 0 }: ExplorerProps): React.ReactElement {
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
-  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarksContext();
+  const bus = useWatcherBus();
 
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
@@ -210,21 +215,15 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
 
   const rootVersion = versions.get(root) ?? 0;
 
-  // Start the backend filesystem watcher for the current root. Replaces any
-  // previous watcher on the Rust side (see set_workspace_root in main.rs).
-  React.useEffect(() => {
-    if (!ipc.watchRoot) return;
-    void ipc.watchRoot(root).catch((e: unknown) => {
-      console.warn("vlerv: failed to start backend watcher for", root, e);
-    });
-  }, [ipc, root]);
-
   // Bridge backend events into the cache: invalidate the parent dir of the
-  // changed path so just that folder re-fetches.
-  const handleChange = React.useCallback((payload: TreeChangedPayload) => {
-    invalidate(parentDir(payload.path));
-  }, [invalidate]);
-  useWatcher(handleChange);
+  // changed path so just that folder re-fetches. (The backend watcher itself
+  // is started by WatcherProvider.)
+  React.useEffect(() => {
+    return bus.subscribe((change) => {
+      if (change.source !== "tree") return;
+      invalidate(parentDir(change.path));
+    });
+  }, [bus, invalidate]);
 
   // Blank visible state when the user picks a different workspace folder, so
   // we don't briefly render stale entries under a new header.
@@ -269,7 +268,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
               ipc={ipc}
               entry={entry}
               depth={0}
-              onSelectFile={onSelectFile}
+              onOpenFile={onOpenFile}
               selectedFile={selectedFile}
             />
           ) : (
@@ -277,7 +276,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
               key={entry.path}
               entry={entry}
               depth={0}
-              onSelectFile={onSelectFile}
+              onOpenFile={onOpenFile}
               selected={selectedFile === entry.path}
               bookmarked={isBookmarked(entry.path)}
               onToggleBookmark={(p) => void toggleBookmark(p)}
