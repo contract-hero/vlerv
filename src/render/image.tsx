@@ -20,6 +20,8 @@ const MIME: Record<string, string> = {
   ".gif": "image/gif",
   ".webp": "image/webp",
   ".bmp": "image/bmp",
+  ".ico": "image/x-icon",
+  ".avif": "image/avif",
 };
 
 export default function ImageRenderer({ payload }: ImageRendererProps): React.ReactElement {

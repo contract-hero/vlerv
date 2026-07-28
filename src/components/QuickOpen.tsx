@@ -35,6 +35,7 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
   const staleRef = React.useRef(false);
   React.useEffect(() => {
     let cancelled = false;
+    let refreshTimer: number | null = null;
     const fetchIndex = () => {
       if (!ipc.listFilesRecursive) return;
       ipc
@@ -53,7 +54,8 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
       if (change.source !== "tree" || staleRef.current) return;
       staleRef.current = true;
       // Refresh at most once per second of churn.
-      window.setTimeout(() => {
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null;
         staleRef.current = false;
         fetchIndex();
       }, 1000);
@@ -61,6 +63,9 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
     return () => {
       cancelled = true;
       unsubscribe();
+      // Don't let a pending refresh fire a full workspace walk after ⌘P is
+      // already dismissed.
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
     };
   }, [ipc, root, bus]);
 

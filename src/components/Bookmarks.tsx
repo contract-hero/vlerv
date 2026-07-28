@@ -1,7 +1,7 @@
 // Bookmarks group — collapsible section in the Sidebar above the Explorer.
-// Click → open the file; right-click → remove from bookmarks. Mirrors
-// Recents.tsx for layout but with a chevron-driven expand/collapse header
-// (state persisted to localStorage so the choice survives reloads).
+// Click → open the file; ✕ → remove; right-click → the shared file context
+// menu (useFileMenu); drag rows to reorder. Collapse state persisted to
+// localStorage so the choice survives reloads.
 import * as React from "react";
 import { ChevronRight, X } from "lucide-react";
 import { useBookmarksContext } from "../state/bookmarks-context";

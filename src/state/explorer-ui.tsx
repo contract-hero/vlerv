@@ -96,11 +96,14 @@ export function ExplorerUiProvider({ children }: { children: React.ReactNode }):
       return next;
     });
     revealNonce.current += 1;
-    setRevealTarget({ path, nonce: revealNonce.current });
+    // Capture the nonce NOW: reading the ref at fire time would let an older
+    // timer clear a newer reveal target before its row has scrolled into view.
+    const nonce = revealNonce.current;
+    setRevealTarget({ path, nonce });
     // Clear after the async expand-cascade has had time to render, so stale
     // targets don't re-scroll on later unrelated re-mounts.
     window.setTimeout(() => {
-      setRevealTarget((cur) => (cur?.nonce === revealNonce.current ? null : cur));
+      setRevealTarget((cur) => (cur?.nonce === nonce ? null : cur));
     }, 2000);
   }, []);
 

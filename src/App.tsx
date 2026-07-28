@@ -39,6 +39,17 @@ const DEFAULT_SIDEBAR_PX = 280;
 const MIN_SIDEBAR_PX = 200;
 const MAX_SIDEBAR_PX = 480;
 
+// Chords honored when forwarded from a preview iframe (tab/nav/zoom only —
+// nothing that opens native dialogs or steals focus). Must stay in sync with
+// the FORWARD map in the injected script in src/render/html.tsx.
+const IFRAME_FORWARDABLE = new Set([
+  "mod+t", "mod+w", "ctrl+tab", "ctrl+shift+tab",
+  "mod+shift+bracketright", "mod+shift+bracketleft",
+  "mod+bracketleft", "mod+bracketright", "mod+r",
+  "mod+equal", "mod+shift+equal", "mod+minus",
+  ...Array.from({ length: 10 }, (_, i) => `mod+digit${i}`),
+]);
+
 function clampSidebarPx(px: number): number {
   return Math.max(MIN_SIDEBAR_PX, Math.min(MAX_SIDEBAR_PX, px));
 }
@@ -246,9 +257,17 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
         });
         return;
       }
-      // Global chords forwarded from the focused HTML preview iframe.
+      // Global chords forwarded from the focused HTML preview iframe. Only a
+      // safe subset is honored — rendered artifact content is untrusted and
+      // can postMessage this shape directly, so it must never synthesize a
+      // chord that opens a native dialog (⌘O), seizes the address bar (⌘L),
+      // or pops an overlay (⌘P).
       if (d.type === "vlerv:keydown") {
-        dispatchChord(d as unknown as ChordEvent, bindingsRef.current, false);
+        dispatchChord(
+          d as unknown as ChordEvent,
+          bindingsRef.current.filter((b) => IFRAME_FORWARDABLE.has(b.combo)),
+          false,
+        );
         return;
       }
     };

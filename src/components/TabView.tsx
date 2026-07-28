@@ -77,5 +77,8 @@ export default function TabView({
     return <div className="preview-empty">Loading…</div>;
   }
 
-  return <Preview payload={tab.payload} tabId={tab.id} zoom={tab.zoom} />;
+  // Keyed per (tab, path): forces a fresh renderer (and iframe) per document,
+  // so late scroll messages from an outgoing document fail the e.source check
+  // instead of stamping their offsets onto the incoming document's key.
+  return <Preview key={`${tab.id}::${entry.path}`} payload={tab.payload} tabId={tab.id} zoom={tab.zoom} />;
 }

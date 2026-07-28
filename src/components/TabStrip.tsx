@@ -123,7 +123,10 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
               {entry ? <FileGlyph name={tabTitle(tab)} size={13} /> : <Plus size={13} strokeWidth={2} />}
             </span>
             <span className="tab-label">{tabTitle(tab)}</span>
-            {isLoading(tab) && entry ? <span className="tab-loading" aria-hidden /> : null}
+            {/* Background tabs load lazily on activation — only the active
+                tab can genuinely be "loading", so don't show background tabs
+                as perpetually busy. */}
+            {isLoading(tab) && entry && active ? <span className="tab-loading" aria-hidden /> : null}
             <button
               className="tab-close"
               title="Close tab (⌘W)"

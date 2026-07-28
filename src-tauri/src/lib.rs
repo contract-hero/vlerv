@@ -150,20 +150,16 @@ fn e2e_echo(path: &std::path::Path) {
 mod dispatch_deep_link_tests {
     use super::*;
     use std::fs;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
 
-    // Redirect state_store writes to a tempdir for the whole test binary.
-    // Without this, `recents::push` → `state_store::set_state_field` spawns a
+    // Redirect state_store writes to the crate-shared test tempdir. Without
+    // this, `recents::push` → `state_store::set_state_field` spawns a
     // debounced thread (DEBOUNCE_MS=250) that outlives the test and writes to
     // the developer's real ~/Library/Application Support/Vlerv/state.json.
-    // Set once per process — `std::env::set_var` is process-global, and cargo
-    // runs tests in parallel threads, so racing per-test set_vars would point
-    // the debounced writer at TempDirs that have already been dropped.
+    // The tempdir + set_var live in state_store::ensure_shared_test_state_dir
+    // so this module and bookmarks::tests stop racing each other's env value.
     fn ensure_isolated_state_dir() {
-        static STATE_DIR: OnceLock<TempDir> = OnceLock::new();
-        let dir = STATE_DIR.get_or_init(|| TempDir::new().expect("state tempdir"));
-        std::env::set_var("VLERV_STATE_DIR", dir.path());
+        crate::state_store::ensure_shared_test_state_dir();
     }
 
     fn setup_root_with_file(name: &str) -> (TempDir, std::path::PathBuf, security::RootSet) {
@@ -281,5 +277,46 @@ mod dispatch_deep_link_tests {
     fn reveal_rejects_nul_bytes() {
         let err = deeplink::parse("vlerv://reveal?path=/tmp/a%00b").expect_err("err");
         assert!(err.to_string().contains("NUL"));
+    }
+
+    // ── Recents side effect (the `!out_of_root` guard's actual purpose) ──
+
+    fn recents_contains(path: &std::path::Path) -> bool {
+        recents::list().iter().any(|r| r.path == path)
+    }
+
+    #[test]
+    fn in_root_open_pushes_recents() {
+        let (_dir, file_path, roots) = setup_root_with_file("recorded.md");
+        let url = format!("vlerv://open?path={}", file_path.display());
+
+        dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert!(recents_contains(&file_path.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn out_of_root_open_stays_out_of_recents() {
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("tempdir-outside");
+        let outside_file = outside.path().join("ephemeral.md");
+        fs::write(&outside_file, "x").expect("write");
+        let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
+        let url = format!("vlerv://open?path={}", outside_file.display());
+
+        dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert!(!recents_contains(&outside_file.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn reveal_does_not_push_recents() {
+        let (_dir, file_path, roots) = setup_root_with_file("revealed-not-recorded.md");
+        let url = format!("vlerv://reveal?path={}", file_path.display());
+
+        dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert!(!recents_contains(&file_path.canonicalize().unwrap()));
     }
 }

@@ -271,6 +271,32 @@ mod image_tests {
     }
 
     #[test]
+    fn encoding_serializes_to_the_lowercase_wire_shape() {
+        // The TypeScript side (src/ipc.ts) declares `encoding?: "text" |
+        // "base64"` and the router branches on those literal strings — pin
+        // the serde representation, not just the Rust enum.
+        let dir = TempDir::new().unwrap();
+        let png = dir.path().join("wire.png");
+        std::fs::write(&png, PNG_MAGIC).unwrap();
+        let v = serde_json::to_value(read_file(&png).unwrap()).unwrap();
+        assert_eq!(v["encoding"], "base64");
+
+        let txt = dir.path().join("wire.txt");
+        std::fs::write(&txt, "hi").unwrap();
+        let v = serde_json::to_value(read_file(&txt).unwrap()).unwrap();
+        assert_eq!(v["encoding"], "text");
+    }
+
+    #[test]
+    fn missing_encoding_field_deserializes_to_text() {
+        // Payloads serialized by older builds have no `encoding` key; the
+        // #[serde(default)] must keep them deserializable as Text.
+        let json = r#"{"path":"/tmp/a.md","size":1,"mtime":0,"is_binary":false,"oversized":false,"content":"x"}"#;
+        let payload: FilePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.encoding, Encoding::Text);
+    }
+
+    #[test]
     fn svg_stays_on_text_path() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("icon.svg");

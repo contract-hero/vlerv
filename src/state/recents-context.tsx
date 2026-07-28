@@ -38,8 +38,8 @@ export function RecentsProvider({
     refresh();
   }, [refresh]);
 
-  // Fired by the backend after deep-link opens push recents; harmless if never
-  // emitted (kept for forward compat with a backend that broadcasts updates).
+  // No backend emits `vlerv://recents-updated` today; the subscription is
+  // kept for forward compat with a backend that broadcasts recents updates.
   useTauriEvent<RecentEntry[]>("vlerv://recents-updated", setRecents);
 
   const value = React.useMemo(() => ({ recents, refresh }), [recents, refresh]);

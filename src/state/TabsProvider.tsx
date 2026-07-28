@@ -3,6 +3,7 @@
 import * as React from "react";
 import type { IpcSurface } from "../ipc";
 import { isUnderRoot } from "../utils/path";
+import type { OpenFileOptions } from "./open-opts";
 import { useWatcherBus } from "./watcher-bus";
 import {
   activeTab,
@@ -131,12 +132,8 @@ export function TabsProvider({ ipc, children }: TabsProviderProps): React.ReactE
   );
 }
 
-export interface OpenFileOptions {
-  newTab?: boolean;
-  background?: boolean;
-  /** Override the computed in-root/external classification. */
-  external?: boolean;
-}
+export { openOptsFromClick } from "./open-opts";
+export type { OpenFileOptions } from "./open-opts";
 
 /**
  * The single producer funnel: tree clicks, bookmarks, address bar, ⌘O,
@@ -159,21 +156,4 @@ export function useOpenFile(
     },
     [dispatch, ipc, workspaceRoot],
   );
-}
-
-/**
- * Standard modifier interpretation for row/link clicks:
- * ⌘-click → background new tab, ⌘⇧-click → foreground new tab,
- * middle-click → background new tab.
- */
-export function openOptsFromClick(e: {
-  metaKey?: boolean;
-  ctrlKey?: boolean;
-  shiftKey?: boolean;
-  button?: number;
-}): OpenFileOptions | undefined {
-  const meta = Boolean(e.metaKey || e.ctrlKey);
-  const middle = e.button === 1;
-  if (!meta && !middle) return undefined;
-  return { newTab: true, background: !e.shiftKey };
 }

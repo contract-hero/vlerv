@@ -63,17 +63,18 @@ export function parseCombo(combo: string): ParsedCombo {
 const IS_MAC =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform ?? "");
 
-export function matchesCombo(e: ChordEvent, parsed: ParsedCombo): boolean {
-  if (e.code !== parsed.code) return false;
-  const modKey = IS_MAC ? e.metaKey : e.ctrlKey;
-  if (parsed.mod !== modKey) return false;
-  if (IS_MAC) {
+export function matchesCombo(e: ChordEvent, parsed: ParsedCombo, isMac: boolean = IS_MAC): boolean {
+  // Case-insensitive: parseCombo lowercases the whole combo string, so tokens
+  // like "bracketleft" reach here lowercased while e.code is "BracketLeft".
+  if (e.code.toLowerCase() !== parsed.code.toLowerCase()) return false;
+  if (isMac) {
     // Exact match: "mod+[" must not swallow "ctrl+[" and vice versa.
+    if (parsed.mod !== e.metaKey) return false;
     if (parsed.ctrl !== e.ctrlKey) return false;
-  } else if (parsed.ctrl && !parsed.mod && !e.ctrlKey) {
-    // Non-mac: mod already means Ctrl; an explicit ctrl-only binding still
-    // requires the key.
-    return false;
+  } else {
+    // Non-mac: mod means Ctrl, so a binding needs Ctrl iff it names mod or ctrl.
+    if (e.metaKey) return false;
+    if ((parsed.mod || parsed.ctrl) !== e.ctrlKey) return false;
   }
   if (parsed.shift !== e.shiftKey) return false;
   if (parsed.alt !== e.altKey) return false;

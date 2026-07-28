@@ -43,6 +43,28 @@ describe("tabsReducer", () => {
     expect(activeTab(s).history).toHaveLength(1);
   });
 
+  it("NAVIGATE mode:replace overwrites the current entry, keeping history around it", () => {
+    let s = nav(initialTabsState(), "/a");
+    s = nav(s, "/b");
+    s = tabsReducer(s, { type: "NAVIGATE", path: "/c", external: false, mode: "replace" });
+    const tab = activeTab(s);
+    expect(tab.history.map((h) => h.path)).toEqual(["/a", "/c"]);
+    expect(tab.historyIndex).toBe(1);
+    expect(canGoBack(tab)).toBe(true);
+  });
+
+  it("NAVIGATE mode:replace on an empty tab pushes instead", () => {
+    const s = tabsReducer(initialTabsState(), {
+      type: "NAVIGATE",
+      path: "/a",
+      external: false,
+      mode: "replace",
+    });
+    const tab = activeTab(s);
+    expect(tab.history.map((h) => h.path)).toEqual(["/a"]);
+    expect(tab.historyIndex).toBe(0);
+  });
+
   it("history is capped", () => {
     let s = initialTabsState();
     for (let i = 0; i < HISTORY_CAP + 10; i++) {
@@ -151,6 +173,32 @@ describe("tabsReducer", () => {
     expect(isLoading(activeTab(s))).toBe(true);
   });
 
+  it("LOAD_ERROR lands for the current path and is dropped when stale", () => {
+    let s = nav(initialTabsState(), "/a");
+    const tabId = s.activeTabId;
+    s = tabsReducer(s, {
+      type: "LOAD_ERROR",
+      tabId,
+      path: "/a",
+      nonce: 0,
+      error: { kind: "Io", path: "/a", reason: "boom" },
+    });
+    expect(activeTab(s).payload).toEqual({ error: { kind: "Io", path: "/a", reason: "boom" } });
+    expect(isLoading(activeTab(s))).toBe(false);
+
+    // Stale: navigated away before the error arrived.
+    s = nav(s, "/b");
+    s = tabsReducer(s, {
+      type: "LOAD_ERROR",
+      tabId,
+      path: "/a",
+      nonce: 0,
+      error: { kind: "Io", path: "/a", reason: "stale" },
+    });
+    expect(isLoading(activeTab(s))).toBe(true);
+    expect(activeTab(s).payload).toEqual({ error: { kind: "Io", path: "/a", reason: "boom" } });
+  });
+
   it("FILE_CHANGED reloads matching tabs; FILE_REMOVED marks deleted; re-add clears", () => {
     let s = nav(initialTabsState(), "/a");
     s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b", background: true });
@@ -165,11 +213,23 @@ describe("tabsReducer", () => {
     expect(s.tabs.find((t) => currentEntry(t)?.path === "/b")!.deleted).toBe(false);
   });
 
-  it("SET_ZOOM clamps", () => {
+  it("SET_ZOOM clamps, quantizes float drift, and is per-tab", () => {
     let s = nav(initialTabsState(), "/a");
     s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 99 });
     expect(activeTab(s).zoom).toBe(3);
     s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 0.01 });
     expect(activeTab(s).zoom).toBe(0.25);
+    // ⌘+ steps accumulate float error (0.1 + 0.2 === 0.30000000000000004);
+    // the reducer must store exactly two decimals or the % indicator drifts.
+    s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 0.1 + 0.2 });
+    expect(activeTab(s).zoom).toBe(0.3);
+
+    // Per-tab: zooming the active tab leaves others untouched, and an
+    // unknown tabId is a no-op.
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b", background: true });
+    const other = s.tabs.find((t) => t.id !== s.activeTabId)!;
+    s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 2 });
+    expect(s.tabs.find((t) => t.id === other.id)!.zoom).toBe(1);
+    expect(tabsReducer(s, { type: "SET_ZOOM", tabId: "nope", zoom: 2 })).toEqual(s);
   });
 });

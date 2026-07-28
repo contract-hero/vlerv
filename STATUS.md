@@ -7,7 +7,7 @@
 - **Toolbar**: back/forward/reload, editable address bar showing the active path (⌘L, accepts absolute / `file://` / `vlerv://` inputs), bookmark star, copy path, external badge, zoom indicator.
 - **Start page** on empty tabs: New York serif wordmark, bookmarks + recents lists, open/pick actions.
 - **Quick open (⌘P)**: fuzzy palette over `list_files_recursive` (BFS, 20k cap, ignore/hidden/symlink policy), in-house subsequence scorer, cache invalidated by watcher events.
-- **Keyboard registry** (`src/keyboard/shortcuts.ts`): declarative combos, `e.code`-based exact-modifier matching; HTML preview iframes forward chords via `vlerv:keydown` so shortcuts survive iframe focus.
+- **Keyboard registry** (`src/keyboard/shortcuts.ts`): declarative combos, `e.code`-based exact-modifier matching; HTML preview iframes forward tab/nav/zoom chords via `vlerv:keydown` so those survive iframe focus (dialog/focus chords ⌘O/⌘L/⌘P are deliberately not forwardable — page content could synthesize them).
 - **Per-tab zoom** (⌘+/−/0) via CSS `zoom` — host content directly, iframes via `vlerv:setZoom`.
 
 ### Live reload (the headline feature)
@@ -18,7 +18,7 @@
 ### Explorer
 - Hoisted expansion state (`ExplorerUiProvider`); `reveal(path)` expands ancestor chains in one update — the deep-link `reveal` intent works, and the active tab's file auto-reveals.
 - Tree keyboard navigation (arrows/Enter/Home/End), `role=tree/treeitem`, `aria-expanded/level`, roving tabindex.
-- Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Open in Default App, Copy Path, Bookmark toggle.
+- Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Copy Path, Bookmark toggle. ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
 
 ### Rendering
 - HTML: sandboxed iframe, scripts on, `<base href>` injection, host-bridge script (link intercept with modifiers, scroll report/restore, zoom, chord forwarding).
@@ -38,8 +38,8 @@
 - Production `.app` build via `./scripts/build-app.sh` (~13 MB `Vlervtifacts.app`).
 
 ### Tests
-- Rust: 29 (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace, reader image matrix, recursive walk, RootSet sharing, deep-link dispatch matrix, bookmarks.
-- Frontend: 23 (`pnpm test`) — tabs reducer (history semantics, tab lifecycle, watcher actions, zoom clamp), fuzzy scorer, `ancestorsWithin`.
+- Rust: 39 (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace/delete-kind/dedup, reader image + serde wire-shape matrix, recursive walk incl. BFS-truncation invariant, RootSet sharing, deep-link dispatch + recents side-effect matrix, bookmarks.
+- Frontend: 59 (`pnpm test`) — tabs reducer (history semantics incl. replace/LOAD_ERROR, tab lifecycle, watcher actions, zoom clamp+quantize), keyboard chord matching/dispatch, address-bar input normalization, click-modifier convention, fuzzy scorer, `ancestorsWithin`.
 
 ## Deliberately unchanged (display-only rebrand)
 

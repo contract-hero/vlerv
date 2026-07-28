@@ -1,6 +1,8 @@
 // Markdown renderer — marked + lazy shiki for code highlighting + lazy mermaid.
-// Renders the user's own trusted markdown from their workspace. The parsed
-// HTML is injected via DOMParser → importNode (no innerHTML assignment).
+// Markdown may come from anywhere (address bar, deep links, external tabs),
+// so raw HTML passthrough is sanitized before entering the host DOM. The
+// parsed HTML is injected via DOMParser → importNode (no innerHTML
+// assignment).
 import * as React from "react";
 import { Marked } from "marked";
 import markedKatex from "marked-katex-extension";
@@ -90,6 +92,25 @@ export default function MdRenderer({ source, path, onRendered }: MdRendererProps
 
     while (el.firstChild) el.removeChild(el.firstChild);
     const doc = new DOMParser().parseFromString(`<div>${html}</div>`, "text/html");
+    // Markdown lands in the PRIVILEGED host DOM (Tauri IPC is in scope here),
+    // and marked passes raw HTML through unsanitized. DOMParser neuters
+    // <script>, but inline `onerror=` handlers and `javascript:` URLs still
+    // fire once nodes go live — strip them before importNode below.
+    for (const node of Array.from(doc.body.querySelectorAll("*"))) {
+      if (/^(SCRIPT|IFRAME|OBJECT|EMBED|BASE)$/.test(node.tagName)) {
+        node.remove();
+        continue;
+      }
+      for (const attr of Array.from(node.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value.replace(/[\s\u0000-\u001f]/g, "").toLowerCase();
+        const isUrlAttr =
+          name === "href" || name === "src" || name === "xlink:href" || name === "srcset";
+        if (name.startsWith("on") || (isUrlAttr && value.startsWith("javascript:"))) {
+          node.removeAttribute(attr.name);
+        }
+      }
+    }
     const wrapper = doc.body.firstChild;
     if (wrapper) {
       for (const child of Array.from(wrapper.childNodes)) {

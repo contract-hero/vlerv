@@ -32,7 +32,7 @@ Files open in tabs **auto-reload when they change on disk** — edit an artifact
 
 - **Pick workspace**: first launch shows "Choose workspace folder…" — pick any directory; it's remembered.
 - **Tree**: chevron-expand folders inline; full keyboard navigation (arrows, Enter, Home/End) with VoiceOver-friendly ARIA. The active tab's file auto-reveals in the tree.
-- **Right-click** any file row, bookmark, or tab: Open in New Tab, Reveal in Finder, Open in Default App, Copy Path, Bookmark.
+- **Right-click** any file row, bookmark, or tab: Open in New Tab, Reveal in Finder, Copy Path, Bookmark. (No "Open in Default App" — that would need an arbitrary-program-launch capability grant; use Reveal in Finder instead.)
 - **Bookmarks**: ☆ on a file row or the toolbar star. Drag to reorder, hover ✕ to remove. Persists across restarts.
 - **Open any file**: `⌘O` → file picker. Out-of-workspace files render with an "external" badge.
 - **Drag files out**: drag any file row into Finder, Slack, Mail, upload zones — a real macOS `kUTTypeFileURL` drop.

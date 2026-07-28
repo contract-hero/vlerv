@@ -190,6 +190,18 @@ fn spawn_pipeline(
                 .collect();
             for (path, kind) in ready {
                 map.remove(&path);
+                // FSEvents replays coalesced flag sets as SEPARATE events (a
+                // delete arrives as Create+Remove+Modify for one path), so
+                // last-write-wins on kind is unreliable. Existence at flush
+                // time is authoritative.
+                let kind = if path.exists() {
+                    match kind {
+                        TreeChangeKind::Remove => TreeChangeKind::Modify,
+                        k => k,
+                    }
+                } else {
+                    TreeChangeKind::Remove
+                };
                 let project_root = find_root(&path, &payload_roots);
                 let _ = tx_clone.send(TreeChange { project_root, kind, path });
             }
@@ -326,10 +338,102 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("expected a change for the watched file");
         assert_eq!(change.path, canonical_target);
-        // And nothing further (the sibling event was dropped).
-        match rx.recv_timeout(Duration::from_millis(600)) {
-            Err(_) => {}
-            Ok(extra) => assert_eq!(extra.path, canonical_target, "unexpected sibling event"),
+        // Drain everything that arrives in the quiet window — a sibling leak
+        // can show up behind a coalesced second event for the target — and
+        // treat a disconnect as pipeline death, not as silence.
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(extra) => assert_eq!(extra.path, canonical_target, "unexpected sibling event"),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => panic!("watcher pipeline died"),
+            }
+        }
+    }
+
+    #[test]
+    fn watch_files_skips_nonexistent_inputs() {
+        let dir = TempDir::new().expect("tempdir");
+        let existing = dir.path().join("real.html");
+        std::fs::write(&existing, "a").unwrap();
+        let missing = dir.path().join("deleted-tab.html");
+
+        let (tx, rx) = channel();
+        // Must not error: a tab can reference a since-deleted file, and one
+        // bad path must not kill watching for every other external tab.
+        let _handle =
+            watch_files(vec![existing.clone(), missing], tx).expect("watch with missing input");
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::write(&existing, "changed").unwrap();
+        let change = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("existing file still watched");
+        assert_eq!(change.path, existing.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn watch_files_all_nonexistent_is_noop_handle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (tx, _rx) = channel();
+        let handle = watch_files(vec![dir.path().join("gone.html")], tx);
+        assert!(handle.is_ok(), "all-skipped input set must yield a no-op handle");
+    }
+
+    #[test]
+    fn watch_files_same_parent_dir_both_emit() {
+        let dir = TempDir::new().expect("tempdir");
+        let a = dir.path().join("a.html");
+        let b = dir.path().join("b.html");
+        std::fs::write(&a, "1").unwrap();
+        std::fs::write(&b, "1").unwrap();
+
+        let (tx, rx) = channel();
+        let _handle = watch_files(vec![a.clone(), b.clone()], tx).expect("watch");
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::write(&a, "2").unwrap();
+        std::fs::write(&b, "2").unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.len() < 2 && Instant::now() < deadline {
+            if let Ok(change) = rx.recv_timeout(Duration::from_millis(200)) {
+                seen.insert(change.path);
+            }
+        }
+        assert!(seen.contains(&a.canonicalize().unwrap()), "missing event for a.html");
+        assert!(seen.contains(&b.canonicalize().unwrap()), "missing event for b.html");
+    }
+
+
+    #[test]
+    fn watch_files_delete_emits_remove_kind() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("doomed.html");
+        std::fs::write(&target, "x").unwrap();
+        let canonical = target.canonicalize().unwrap();
+
+        let (tx, rx) = channel();
+        let _handle = watch_files(vec![target.clone()], tx).expect("watch");
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::remove_file(&target).unwrap();
+
+        // Drain until we see the Remove for the target (FSEvents may coalesce
+        // or precede it with Modify events).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(change) if change.path == canonical && change.kind == TreeChangeKind::Remove => {
+                    return;
+                }
+                Ok(_) => continue,
+                Err(_) if Instant::now() >= deadline => {
+                    panic!("no Remove event for deleted watched file")
+                }
+                Err(_) => continue,
+            }
         }
     }
 

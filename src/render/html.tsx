@@ -93,10 +93,12 @@ const HOST_BRIDGE_SCRIPT = `
     }
   });
 
-  // Forward global-shortcut chords to the host. Only the codes the host
-  // actually binds are intercepted, so in-page ⌘C/⌘V/⌘A keep working.
+  // Forward global-shortcut chords to the host. Only tab/nav/zoom codes are
+  // intercepted (the host ignores anything else — see IFRAME_FORWARDABLE in
+  // App.tsx), so in-page ⌘C/⌘V/⌘A keep working and dialog-opening chords
+  // (⌘O/⌘L/⌘P) can't be synthesized by page content.
   var FORWARD = {
-    KeyT: 1, KeyW: 1, KeyR: 1, KeyL: 1, KeyO: 1, KeyP: 1,
+    KeyT: 1, KeyW: 1, KeyR: 1,
     BracketLeft: 1, BracketRight: 1, Equal: 1, Minus: 1,
     Digit0: 1, Digit1: 1, Digit2: 1, Digit3: 1, Digit4: 1,
     Digit5: 1, Digit6: 1, Digit7: 1, Digit8: 1, Digit9: 1
@@ -195,8 +197,12 @@ export default function HtmlRenderer({
   }, [zoom]);
 
   // Browser-like sandbox: scripts, popups, forms, modals, same-origin so the
-  // page sees a "normal" environment. The srcdoc origin is still opaque, so
-  // this can't reach the parent webview's globals.
+  // page sees a "normal" environment. NOTE: `allow-same-origin` on a srcdoc
+  // frame keeps the PARENT's origin rather than forcing an opaque one, so the
+  // frame is NOT isolated from the host webview — a hostile artifact can
+  // reach the parent's globals (and via them, Tauri IPC). Acceptable only
+  // because content here is the user's own local artifacts; tracked as a
+  // follow-up to re-evaluate dropping allow-same-origin.
   const sandbox =
     "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads allow-same-origin";
 

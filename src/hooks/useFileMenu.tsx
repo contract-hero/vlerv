@@ -1,16 +1,20 @@
 // useFileMenu — builds the standard right-click menu for a file path:
-// open / open in new tab / reveal in Finder / open in default app /
-// copy path / bookmark toggle. Used by tree rows, bookmark rows and tabs.
+// open in new tab / reveal in Finder / copy path / bookmark toggle.
+// Used by tree rows, bookmark rows and tabs.
+//
+// Deliberately NO "Open in Default App": that requires the broad
+// `opener:allow-open-path` capability, which would hand arbitrary program
+// launch to anything that can reach IPC from the webview — too big a grant
+// for a convenience reachable via Reveal in Finder + double-click.
 import * as React from "react";
 import {
   Copy,
-  ExternalLink,
   FilePlus2,
   Folder,
   Star,
   StarOff,
 } from "lucide-react";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MenuSection } from "../components/ContextMenu";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import type { OpenFileOptions } from "../state/TabsProvider";
@@ -36,11 +40,6 @@ export function useFileMenu(
             label: "Reveal in Finder",
             icon: <Folder size={13} strokeWidth={2} />,
             onSelect: () => void revealItemInDir(path).catch(() => {}),
-          },
-          {
-            label: "Open in Default App",
-            icon: <ExternalLink size={13} strokeWidth={2} />,
-            onSelect: () => void openPath(path).catch(() => {}),
           },
           {
             label: "Copy Path",

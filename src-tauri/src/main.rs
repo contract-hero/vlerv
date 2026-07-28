@@ -54,7 +54,7 @@ fn list_files_recursive(
 
 // ─── state_store + recents + bookmarks IPC ───────────────────────────────────
 // These wrap the existing module functions as Tauri commands. The frontend
-// (src/ipc.ts, src/hooks/useSettings.ts, src/hooks/useRecents.ts,
+// (src/ipc.ts, src/state/recents-context.tsx, src/state/bookmarks-context.tsx,
 // src/hooks/useBookmarks.ts) consumes them through invoke().
 
 #[tauri::command]
@@ -176,18 +176,35 @@ fn watch_external_paths(
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let path_bufs = paths.iter().map(std::path::PathBuf::from).collect();
+        let path_bufs: Vec<std::path::PathBuf> =
+            paths.iter().map(std::path::PathBuf::from).collect();
+
+        // The watcher canonicalizes inputs and emits CANONICAL paths, but the
+        // frontend keys reloads by the exact string stored in its tab state
+        // (e.g. "/tmp/x.html", which canonicalizes to "/private/tmp/x.html"
+        // on macOS). Map canonical → caller-supplied so emitted events match
+        // what the frontend is listening for.
+        let originals: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf> =
+            path_bufs
+                .iter()
+                .filter_map(|p| p.canonicalize().ok().map(|c| (c, p.clone())))
+                .collect();
+
         let handle = src_tauri::watcher::watch_files(path_bufs, tx)
             .map_err(|e| format!("{e:?}"))?;
         *guard = Some(handle);
 
         std::thread::spawn(move || {
             for change in rx {
+                let path = originals
+                    .get(&change.path)
+                    .cloned()
+                    .unwrap_or(change.path);
                 let _ = app.emit(
                     "vlerv://file-changed",
                     src_tauri::watcher::FileChange {
                         kind: change.kind,
-                        path: change.path,
+                        path,
                     },
                 );
             }

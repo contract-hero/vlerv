@@ -1,11 +1,11 @@
-// Workspace scanner — enumerates directory entries with lazy expansion and an
-// in-session cache.
+// Workspace scanner — enumerates directory entries with lazy expansion.
 //
 // Public API has two enumeration functions:
 //   - `list_workspace_roots`: dirs-only (sidebar's project list view).
 //   - `list_dir`: directories and files (project-tree view).
-// Both share the same ordering / hidden-grouping / default-ignore semantics
-// and the same in-session readdir cache.
+// Both share the same ordering / hidden-grouping / default-ignore semantics.
+// (The Scanner keeps per-directory readdir/skip COUNTERS for tests — it does
+// not cache directory contents.)
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -328,6 +328,27 @@ mod walk_tests {
         let idx = walk_files(dir.path(), 3).unwrap();
         assert_eq!(idx.files.len(), 3);
         assert!(idx.truncated);
+    }
+
+    #[test]
+    fn truncation_keeps_shallow_paths_bfs() {
+        // The BFS order is the design goal: shallow paths must survive
+        // truncation (better quick-open hits). A depth-first walk would pass
+        // the flat truncates_at_cap test above but fail this one.
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("a.txt"));
+        touch(&dir.path().join("b.txt"));
+        touch(&dir.path().join("deep/d1.txt"));
+        touch(&dir.path().join("deep/deeper/d2.txt"));
+
+        let idx = walk_files(dir.path(), 3).unwrap();
+        assert!(idx.truncated);
+        assert!(idx.files.contains(&"a.txt".to_string()));
+        assert!(idx.files.contains(&"b.txt".to_string()));
+        assert!(
+            !idx.files.iter().any(|f| f.starts_with("deep/deeper/")),
+            "deepest path must be the one truncated away"
+        );
     }
 
     #[test]
