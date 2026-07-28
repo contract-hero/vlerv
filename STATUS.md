@@ -2,39 +2,57 @@
 
 ## What ships
 
-- **Production `.app` build** via `./scripts/build-app.sh` (~12 MB output).
-- **Orcskull icon** baked into the bundle: full Tauri icon set generated from the source webp.
-- **Folder picker** on first launch (tauri-plugin-dialog); workspace choice persisted in `localStorage`.
-- **Recursive file explorer** with chevron-expanded folders, hover + selection states, 28 px rows.
-- **HTML preview**: scripts on, full CSS/JS/SVG, `<base href="file://…">` injected for relative resources. In-iframe `<a>` clicks to local files route back through the host preview via `postMessage`.
-- **Markdown preview**: `marked` + lazy `shiki` + lazy `mermaid` + `katex`; centered 900 px max-width.
-- **Text/code preview**: shiki for known extensions, plain mono for unknown.
-- **Image preview**: data-URI raster, inline SVG with scripts stripped.
-- **Metadata card** for oversize / binary fallback.
-- **Native file drag-out** via `tauri-plugin-drag` — produces a real macOS `kUTTypeFileURL` drag that Finder, Slack, Mail, and browser upload zones accept.
-- **CLI shim** (`cli/src/main.rs`): `vlerv open <path>` and `vlerv reveal <path>` shell to `open vlerv://…`.
-- **`vlerv://` URL scheme** declared in `Info.plist` + `tauri.conf.json` (deep-link plugin); the running app catches and dispatches.
-- **Foreground on deep link** (PR #18): every `vlerv://` arrival raises + focuses the window from backgrounded / minimized / hidden states.
-- **Ad-hoc external file open** (PR #18): ⌘O / "Open File…" picker plus a path input bar (⌘L) accept absolute paths, `file://` URLs, and `vlerv://` URLs anywhere on disk; out-of-workspace files render with an "external file" badge.
-- **Auto Light/Dark theme** following macOS system appearance via Tauri's `getCurrentWindow().theme()` + `onThemeChanged()`; iframe background + Shiki code-highlight theme swap with it.
-- **Bookmarks**: ⭐ toggle on every file row and in the preview header; collapsible Bookmarks section at the top of the sidebar; persisted across restarts via `state.bookmarks`. Backend emits `vlerv://bookmarks-updated` for cross-pane sync.
-- **Resizable sidebar**: 6 px drag handle between the sidebar and preview panes; width persisted to `state.panes.sidebar_px` (clamped 200–480 px).
-- **Copy-path button** in the preview header (clipboard API + check-icon feedback).
-- **State persistence pipeline wired end-to-end**: `state_store` JSON document at `~/Library/Application Support/Vlerv/state.json`, with `get_state` / `set_state_field` / `list_recents` / `push_recent` / `list_bookmarks` / `add_bookmark` / `remove_bookmark` Tauri commands and matching frontend hooks (`useSettings`, `useRecents`, `useBookmarks`). Recents and Settings now actually persist (previously silent no-op).
-- **Filesystem watcher** (PR #17): notify-rs single-root watch with 250 ms debounce, emits `vlerv://tree-changed` for live tree refresh.
+### Chrome & navigation
+- **Browser-style tabs** with per-tab back/forward history (cap 50), pure reducer (`src/state/tabs.ts`, vitest-covered), drag-to-reorder, ⌘T/⌘W/⌃Tab/⌘⇧[]/⌘1-9, middle-click close, "Close Others / Close to the Right" context menu.
+- **Toolbar**: back/forward/reload, editable address bar showing the active path (⌘L, accepts absolute / `file://` / `vlerv://` inputs), bookmark star, copy path, external badge, zoom indicator.
+- **Start page** on empty tabs: New York serif wordmark, bookmarks + recents lists, open/pick actions.
+- **Quick open (⌘P)**: fuzzy palette over `list_files_recursive` (BFS, 20k cap, ignore/hidden/symlink policy), in-house subsequence scorer, cache invalidated by watcher events.
+- **Keyboard registry** (`src/keyboard/shortcuts.ts`): declarative combos, `e.code`-based exact-modifier matching; HTML preview iframes forward chords via `vlerv:keydown` so shortcuts survive iframe focus.
+- **Per-tab zoom** (⌘+/−/0) via CSS `zoom` — host content directly, iframes via `vlerv:setZoom`.
+
+### Live reload (the headline feature)
+- Workspace watcher events + dedicated `vlerv://file-changed` events fan out through a subscription bus (`src/state/watcher-bus.tsx`) to (a) surgical Explorer folder invalidation and (b) tab auto-reload (150 ms/path debounce). Open out-of-root files are individually watched via `watch_external_paths` (parent-dir NonRecursive watches → survives atomic rename saves).
+- **Scroll position survives reloads and tab switches**: iframe `vlerv:scroll`/`vlerv:restoreScroll` protocol (source-filtered), container scrollTop for md/text, `ScrollMemoryProvider` keyed `tabId::path`.
+- `remove` events show a "File deleted" notice (tab kept); re-add auto-recovers.
+
+### Explorer
+- Hoisted expansion state (`ExplorerUiProvider`); `reveal(path)` expands ancestor chains in one update — the deep-link `reveal` intent works, and the active tab's file auto-reveals.
+- Tree keyboard navigation (arrows/Enter/Home/End), `role=tree/treeitem`, `aria-expanded/level`, roving tabindex.
+- Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Open in Default App, Copy Path, Bookmark toggle.
+
+### Rendering
+- HTML: sandboxed iframe, scripts on, `<base href>` injection, host-bridge script (link intercept with modifiers, scroll report/restore, zoom, chord forwarding).
+- Markdown: marked + KaTeX (`marked-katex-extension`, wired for real now) + shiki + mermaid, theme-aware.
+- Code/text: **ShikiBlock actually highlights** (was silently broken — created a highlighter and discarded it), theme-aware.
+- Images: PNG/JPEG/GIF/WebP/BMP/ICO/AVIF render via backend base64 (`FilePayload.encoding`, 20 MiB cap); SVG inline with scripts stripped.
+
+### Backend (Rust)
+- Watcher pipeline refactored (`spawn_pipeline`): shutdown flag + channel-disconnect cascade — **the thread leak per workspace switch is fixed**.
+- `RootSet` is Arc-shared; `set_workspace_root` `add_root()`s the picked folder, so deep links into the real workspace classify in-root. `EmptyRoots` falls through to `out_of_root: true` for existing paths (fresh installs accept deep links). `line=N` plumbed into `OpenFileEvent`. `reveal` gets absolute/NUL validation.
+- `state_store::flush()` on `RunEvent::Exit` — no more lost writes on fast quit.
+- Dead code removed: gated `read_file_cmd`/`read_file_with_roots`/`SecuredFilePayload`, superseded deep-link helpers, `url` crate. `read_file` is deliberately ungated (single-user local viewer; rationale in `reader.rs`).
+- `tauri-plugin-window-state`: window geometry persists.
+
+### Design
+- Token system in `styles.css` (type/space/radius/motion/elevation/color). Warm **ink** dark theme + **paper** light theme; signature **lamplight amber** accent (active-tab underline, selected-row edge, focus rings, stars, resizer). Native overlay title bar. `:focus-visible` rings, `prefers-reduced-motion` respected.
+- Production `.app` build via `./scripts/build-app.sh` (~13 MB `Vlervtifacts.app`).
+
+### Tests
+- Rust: 29 (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace, reader image matrix, recursive walk, RootSet sharing, deep-link dispatch matrix, bookmarks.
+- Frontend: 23 (`pnpm test`) — tabs reducer (history semantics, tab lifecycle, watcher actions, zoom clamp), fuzzy scorer, `ancestorsWithin`.
+
+## Deliberately unchanged (display-only rebrand)
+
+`vlerv://` scheme, `vlerv` CLI binary, bundle id `dev.vlerv.Vlervcode`, state dir `~/Library/Application Support/Vlerv/`, `vlerv.*` localStorage keys, `vlerv://*` event names — external tooling (Finicky, CLAUDE.md deep-link instructions) depends on the scheme; the rest avoids a pointless migration. Delete the old `Vlervcode.app` from `/Applications` after installing so LaunchServices doesn't route `vlerv://` to the stale binary.
 
 ## Open items
 
-- `read_file_cmd` (in `lib.rs`, root-gated via `RootSet`) is currently dead code; the live `read_file` command in `main.rs` reads any path. The path bar and ⌘O picker make this surface easier to reach — tighten before letting untrusted content trigger reads.
-- `dispatch_deep_link` still hard-errors `EmptyRoots` and `CanonicalizeFailed`; fresh installs with no `~/workspace` dir reject every deep link. Should fall through to `out_of_root: true`.
-- Markdown renderer doesn't intercept `<a>` link clicks (HTML iframe does). Relative MD-to-MD links navigate the host webview itself.
-- `Settings.tsx`'s `roots[]` array writes through but Explorer ignores it (multi-root tree is half-built; deferred).
-- DMG bundling fails inside the AppleScript-driven `bundle_dmg.sh` (Finder permission). The `.app` bundles fine; just `cp -R` to `/Applications/`.
-- Tauri build still emits the two pre-existing warnings (`unused_variable: roots_for_handler` in `watcher.rs`; `dead_code: read_file_cmd` in `lib.rs`).
-- Frontend has no test runner yet (Vitest not set up). Rust side has 5 unit tests in `dispatch_deep_link_tests`.
+- Deep-link `line=N` reaches the frontend but no renderer scrolls to a line yet.
+- Recents list is push-only from opens; no backend broadcast event (StartPage refreshes on mount).
+- `preferences.ignore_globs` / `drag_out_mode` still unwired (no Settings UI; the hardcoded `DEFAULT_IGNORED` covers the real use).
+- Markdown auto-reload re-runs mermaid/KaTeX from scratch — a large doc may flash briefly on reload.
+- DMG bundling still fails in `bundle_dmg.sh` (Finder permission); `.app` bundles fine, `cp -R` to `/Applications/`.
 
-## The incident
+## History
 
-Earlier development used a multi-agent /forge protocol across 3 cycles. Mid-Cycle-3 the orchestrator ran `rsync -a --delete worker-2/files/ /Users/alilloig/workspace/vlerv-code/` to swap candidates — the `--delete` flag wiped everything in the destination tree (node_modules, all tests, all .forge artifacts, the other worker candidates). 18 source files survived in the staged candidate. This repo is the consolidated recovery.
-
-Git was initialized after the incident; future destructive ops won't escape `git`.
+Earlier development lost most of the repo to an `rsync --delete` incident (see git history); this codebase is the consolidated recovery, since rebuilt: rebrand to Vlervtifacts + tabs/history/live-reload architecture + visual identity (July 2026).
