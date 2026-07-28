@@ -2,6 +2,7 @@
 // load-bearing gate every filesystem read in the IPC layer flows through.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 /// Error returned by `canonicalize_and_check_root`. Reader code pattern-matches
 /// on these variants — keep the shape stable.
@@ -18,10 +19,13 @@ pub enum OutOfRootError {
     EmptyRoots,
 }
 
-/// The set of canonical absolute paths every read must be anchored within.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// The set of canonical absolute paths deep links are classified against.
+/// Interior-shared (`Arc<RwLock>`): every `Clone` sees later `add_root`
+/// calls, so the boot-time clone captured by the deep-link callback stays in
+/// sync with the workspace the user actually picks in the UI.
+#[derive(Debug, Clone, Default)]
 pub struct RootSet {
-    roots: Vec<PathBuf>,
+    roots: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 impl RootSet {
@@ -30,19 +34,47 @@ impl RootSet {
             .into_iter()
             .filter_map(|p| p.canonicalize().ok())
             .collect();
-        Self { roots: canonical_roots }
+        Self {
+            roots: Arc::new(RwLock::new(canonical_roots)),
+        }
     }
 
     pub fn empty() -> Self {
-        Self { roots: Vec::new() }
+        Self::default()
     }
 
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
+    /// Canonicalize and append a root, deduped. Non-resolvable paths are
+    /// silently ignored (same policy as `new`).
+    pub fn add_root(&self, root: &Path) {
+        if let Ok(canonical) = root.canonicalize() {
+            let mut roots = self.roots.write().unwrap_or_else(|p| p.into_inner());
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        }
+    }
+
+    /// Snapshot of the current roots.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
     }
 
     pub fn contains(&self, path: &Path) -> bool {
-        self.roots.iter().any(|r| path.starts_with(r))
+        self.roots
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|r| path.starts_with(r))
     }
 }
 
@@ -52,7 +84,7 @@ pub fn canonicalize_and_check_root(
     path: &Path,
     roots: &RootSet,
 ) -> Result<PathBuf, OutOfRootError> {
-    if roots.roots().is_empty() {
+    if roots.is_empty() {
         return Err(OutOfRootError::EmptyRoots);
     }
 
@@ -65,4 +97,31 @@ pub fn canonicalize_and_check_root(
         return Err(OutOfRootError::OutOfRoot(canonical));
     }
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn add_root_visible_through_clone() {
+        let dir = TempDir::new().unwrap();
+        let set = RootSet::empty();
+        let clone = set.clone(); // e.g. the deep-link callback's copy
+
+        assert!(clone.is_empty());
+        set.add_root(dir.path());
+        assert!(!clone.is_empty());
+        assert!(clone.contains(&dir.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn add_root_dedupes() {
+        let dir = TempDir::new().unwrap();
+        let set = RootSet::empty();
+        set.add_root(dir.path());
+        set.add_root(dir.path());
+        assert_eq!(set.roots().len(), 1);
+    }
 }

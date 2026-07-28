@@ -53,6 +53,9 @@ pub struct OpenFileEvent {
     pub path: std::path::PathBuf,
     pub intent: DeepLinkIntentKind,
     pub out_of_root: bool,
+    /// Optional line number from `vlerv://open?path=…&line=N`.
+    #[serde(default)]
+    pub line: Option<u32>,
 }
 
 /// Typed payload emitted on `vlerv://deep-link-error` when the URL is
@@ -200,19 +203,26 @@ pub fn dispatch_deep_link(
 
     let intent = deeplink::parse(url).map_err(|e| make_err(e.to_string()))?;
 
-    let (path, kind) = match intent {
-        deeplink::DeepLinkIntent::Open { path, .. } => (path, DeepLinkIntentKind::Open),
-        deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal),
+    let (path, kind, line) = match intent {
+        deeplink::DeepLinkIntent::Open { path, line } => (path, DeepLinkIntentKind::Open, line),
+        deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal, None),
     };
 
     // Branch on the security gate: an `OutOfRoot(canonical)` error means the
     // path *does* exist and was canonicalized, but lies outside every
-    // configured root. Those become ad-hoc external opens with
-    // `out_of_root: true`. Any other variant (CanonicalizeFailed, EmptyRoots)
-    // is still a hard error — we never open a path the OS can't resolve.
+    // configured root — those become ad-hoc external opens with
+    // `out_of_root: true`. `EmptyRoots` (fresh install, no workspace picked
+    // yet) falls through the same way as long as the path itself resolves —
+    // rejecting every deep link on a rootless install was a bug.
+    // `CanonicalizeFailed` stays a hard error: we never open a path the OS
+    // can't resolve.
     let (canonical, out_of_root) = match security::canonicalize_and_check_root(&path, roots) {
         Ok(canonical) => (canonical, false),
         Err(security::OutOfRootError::OutOfRoot(canonical)) => (canonical, true),
+        Err(security::OutOfRootError::EmptyRoots) => match path.canonicalize() {
+            Ok(canonical) => (canonical, true),
+            Err(e) => return Err(make_err(format!("canonicalize failed: {e}"))),
+        },
         Err(e) => return Err(make_err(e.to_string())),
     };
 
@@ -226,6 +236,7 @@ pub fn dispatch_deep_link(
         path: canonical,
         intent: kind,
         out_of_root,
+        line,
     })
 }
 
@@ -367,5 +378,51 @@ mod dispatch_deep_link_tests {
         let err = dispatch_deep_link("notaurl://garbage", &roots).expect_err("err");
         assert_eq!(err.url, "notaurl://garbage");
         assert!(!err.reason.is_empty());
+    }
+
+    #[test]
+    fn empty_roots_existing_path_falls_through_out_of_root() {
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let file_path = dir.path().join("adhoc.html");
+        fs::write(&file_path, "x").expect("write");
+        let roots = security::RootSet::empty();
+        let url = format!("vlerv://open?path={}", file_path.display());
+
+        let event = dispatch_deep_link(&url, &roots).expect("ok");
+
+        assert_eq!(event.path, file_path.canonicalize().unwrap());
+        assert!(event.out_of_root);
+    }
+
+    #[test]
+    fn empty_roots_missing_path_still_errors() {
+        ensure_isolated_state_dir();
+        let roots = security::RootSet::empty();
+        let url = "vlerv://open?path=/no/such/path/anywhere.html";
+
+        let err = dispatch_deep_link(url, &roots).expect_err("err");
+        assert!(!err.reason.is_empty());
+    }
+
+    #[test]
+    fn open_line_param_survives_dispatch() {
+        let (_dir, file_path, roots) = setup_root_with_file("lined.md");
+        let url = format!("vlerv://open?path={}&line=42", file_path.display());
+
+        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        assert_eq!(event.line, Some(42));
+    }
+
+    #[test]
+    fn reveal_rejects_relative_path() {
+        let err = deeplink::parse("vlerv://reveal?path=relative/path.md").expect_err("err");
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn reveal_rejects_nul_bytes() {
+        let err = deeplink::parse("vlerv://reveal?path=/tmp/a%00b").expect_err("err");
+        assert!(err.to_string().contains("NUL"));
     }
 }

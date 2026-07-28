@@ -119,9 +119,17 @@ fn set_workspace_root(
     roots: tauri::State<src_tauri::security::RootSet>,
     path: String,
 ) -> Result<(), String> {
+    // The picked workspace must be *addable* to the root set, not gated by
+    // the boot-time set — gating here would reject any workspace outside
+    // ~/workspace and defeat the folder picker. RootSet is Arc-shared, so
+    // the deep-link callback's clone sees the addition immediately and deep
+    // links into the picked workspace classify as in-root.
     let root = std::path::PathBuf::from(&path);
-    let canonical = src_tauri::security::canonicalize_and_check_root(&root, &roots)
-        .map_err(|e| e.to_string())?;
+    let canonical = root.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical.is_dir() {
+        return Err(format!("not a directory: {canonical:?}"));
+    }
+    roots.add_root(&canonical);
 
     let ignore_globs: Vec<String> = src_tauri::workspace::DEFAULT_IGNORED
         .iter()
