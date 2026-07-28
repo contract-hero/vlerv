@@ -272,6 +272,13 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building Tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Flush any debounced state_store write so a quit within the
+                // 250 ms window doesn't lose bookmarks/recents/pane sizes.
+                src_tauri::state_store::flush();
+            }
+        });
 }
