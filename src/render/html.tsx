@@ -31,7 +31,7 @@ export interface HtmlRendererProps {
 // most pages set their own background and the injected rule loses to author
 // CSS by specificity (we keep it scoped to `html` with no !important).
 function themeStyle(theme: "dark" | "light"): string {
-  const bg = theme === "dark" ? "#1e1e1e" : "#ffffff";
+  const bg = theme === "dark" ? "#1c1a17" : "#ffffff";
   return `<style>html { background: ${bg}; }</style>`;
 }
 
