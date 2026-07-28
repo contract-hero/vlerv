@@ -10,6 +10,8 @@ pub struct AppState {
     pub scanner: Mutex<src_tauri::workspace::Scanner>,
     pub roots: src_tauri::security::RootSet,
     pub watcher: Mutex<Option<src_tauri::watcher::WatcherHandle>>,
+    /// Watcher covering individual out-of-root files open in tabs.
+    pub external_watcher: Mutex<Option<src_tauri::watcher::WatcherHandle>>,
 }
 
 #[tauri::command]
@@ -144,6 +146,49 @@ fn set_workspace_root(
     Ok(())
 }
 
+/// Replace the set of individually watched out-of-root files. The frontend
+/// calls this with the full set of open external-tab files whenever a tab
+/// opens or closes; an empty set clears the watcher. Changes are emitted as
+/// `vlerv://file-changed` with a `{ kind, path }` payload — a dedicated
+/// event so tab auto-reload stays decoupled from tree refresh.
+#[tauri::command]
+fn watch_external_paths(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    // Drop the previous watcher first — its pipeline shuts down via the
+    // handle's Drop cascade.
+    {
+        let mut guard = state.external_watcher.lock().map_err(|e| e.to_string())?;
+        *guard = None;
+
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_bufs = paths.iter().map(std::path::PathBuf::from).collect();
+        let handle = src_tauri::watcher::watch_files(path_bufs, tx)
+            .map_err(|e| format!("{e:?}"))?;
+        *guard = Some(handle);
+
+        std::thread::spawn(move || {
+            for change in rx {
+                let _ = app.emit(
+                    "vlerv://file-changed",
+                    src_tauri::watcher::FileChange {
+                        kind: change.kind,
+                        path: change.path,
+                    },
+                );
+            }
+        });
+    }
+
+    Ok(())
+}
+
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/"));
     let default_root = std::path::PathBuf::from(format!("{home}/workspace"));
@@ -165,6 +210,7 @@ fn main() {
             scanner: Mutex::new(src_tauri::workspace::Scanner::new()),
             roots: roots.clone(),
             watcher: Mutex::new(None),
+            external_watcher: Mutex::new(None),
         })
         .manage(roots)
         .invoke_handler(tauri::generate_handler![
@@ -173,6 +219,7 @@ fn main() {
             read_file,
             list_files_recursive,
             set_workspace_root,
+            watch_external_paths,
             get_state,
             set_state_field,
             list_recents,

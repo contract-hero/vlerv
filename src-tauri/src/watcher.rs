@@ -25,6 +25,31 @@ pub struct TreeChange {
     pub path: PathBuf,
 }
 
+/// Payload for the `vlerv://file-changed` event covering individually
+/// watched out-of-root files, where a project root is meaningless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub kind: TreeChangeKind,
+    pub path: PathBuf,
+}
+
+/// How the raw-event thread decides which paths produce TreeChange emissions.
+enum EventFilter {
+    /// Drop paths with any component matching one of these globs.
+    IgnoreGlobs(Vec<String>),
+    /// Keep only paths in this exact set (individually watched files).
+    ExactPaths(std::collections::HashSet<PathBuf>),
+}
+
+impl EventFilter {
+    fn keeps(&self, path: &PathBuf) -> bool {
+        match self {
+            EventFilter::IgnoreGlobs(globs) => !is_ignored(path, globs),
+            EventFilter::ExactPaths(set) => set.contains(path),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {
     #[error("notify error: {0}")]
@@ -63,7 +88,7 @@ impl WatcherHandle {
 
 const DEBOUNCE_MS: u64 = 250;
 
-/// Start watching the given roots.
+/// Start watching the given roots recursively.
 /// `ignore_globs` filters emitted events (glob patterns like "*.log").
 /// `tx` receives `TreeChange` payloads after the debounce window.
 pub fn start_watching(
@@ -82,15 +107,66 @@ pub fn start_watching(
         }
     }
 
-    // Debounce: track last-seen event per (path, kind) and a deadline.
-    // We store: path -> (kind, Instant of last event).
+    let targets: Vec<(PathBuf, RecursiveMode)> = roots
+        .iter()
+        .map(|r| (r.clone(), RecursiveMode::Recursive))
+        .collect();
+
+    spawn_pipeline(targets, EventFilter::IgnoreGlobs(ignore_globs), roots, tx)
+}
+
+/// Watch a set of individual files (typically out-of-root files open in
+/// tabs). Watches each file's PARENT directory non-recursively and filters
+/// events to the exact registered set — watching parents, not files, is
+/// load-bearing: atomic saves (write-temp-then-rename, what editors and
+/// Claude's Write tool do) detach per-file watches, while parent-dir watches
+/// survive them.
+///
+/// Inputs are canonicalized and deduped; nonexistent paths are silently
+/// skipped (a tab may reference a since-deleted file). An empty effective
+/// set yields a valid no-op handle.
+pub fn watch_files(
+    paths: Vec<PathBuf>,
+    tx: Sender<TreeChange>,
+) -> Result<WatcherHandle, WatcherError> {
+    let mut file_set = std::collections::HashSet::new();
+    let mut parent_dirs = Vec::new();
+
+    for path in paths {
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        let Some(parent) = canonical.parent().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        if file_set.insert(canonical) && !parent_dirs.contains(&parent) {
+            parent_dirs.push(parent);
+        }
+    }
+
+    let targets: Vec<(PathBuf, RecursiveMode)> = parent_dirs
+        .iter()
+        .map(|d| (d.clone(), RecursiveMode::NonRecursive))
+        .collect();
+
+    spawn_pipeline(targets, EventFilter::ExactPaths(file_set), parent_dirs, tx)
+}
+
+/// Shared watcher pipeline: notify watcher → raw-event thread (filter +
+/// debounce map) → flush thread (250 ms quiet window → `tx`).
+fn spawn_pipeline(
+    targets: Vec<(PathBuf, RecursiveMode)>,
+    filter: EventFilter,
+    payload_roots: Vec<PathBuf>,
+    tx: Sender<TreeChange>,
+) -> Result<WatcherHandle, WatcherError> {
+    // Debounce: track last-seen event per path. path -> (kind, last Instant).
     let pending: Arc<Mutex<HashMap<PathBuf, (TreeChangeKind, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let pending_for_handler = Arc::clone(&pending);
-    let ignore_globs_clone = ignore_globs.clone();
     let tx_clone = tx.clone();
 
     // Debounce flush thread: polls the pending map and emits when quiet.
@@ -98,7 +174,6 @@ pub fn start_watching(
     // end of this function, so the flush thread's exit releases the last
     // Sender and disconnects the caller's receiver.
     let pending_for_flush = Arc::clone(&pending);
-    let roots_for_flush = roots.clone();
     let shutdown_for_flush = Arc::clone(&shutdown);
     std::thread::spawn(move || {
         loop {
@@ -115,7 +190,7 @@ pub fn start_watching(
                 .collect();
             for (path, kind) in ready {
                 map.remove(&path);
-                let project_root = find_root(&path, &roots_for_flush);
+                let project_root = find_root(&path, &payload_roots);
                 let _ = tx_clone.send(TreeChange { project_root, kind, path });
             }
         }
@@ -129,14 +204,14 @@ pub fn start_watching(
     })
     .map_err(|e| WatcherError::Notify(e.to_string()))?;
 
-    for root in &roots {
+    for (target, mode) in &targets {
         watcher
-            .watch(root.as_path(), RecursiveMode::Recursive)
+            .watch(target.as_path(), *mode)
             .map_err(|e| WatcherError::Notify(e.to_string()))?;
     }
 
-    // Event processing thread: reads from raw_rx, applies ignore filter,
-    // and updates the debounce map. Exits when the watcher (and with it the
+    // Event processing thread: reads from raw_rx, applies the filter, and
+    // updates the debounce map. Exits when the watcher (and with it the
     // handler closure owning `raw_tx`) is dropped.
     std::thread::spawn(move || {
         for event in raw_rx {
@@ -148,8 +223,7 @@ pub fn start_watching(
             };
 
             for path in &event.paths {
-                // Apply ignore_globs filter.
-                if is_ignored(path, &ignore_globs_clone) {
+                if !filter.keeps(path) {
                     continue;
                 }
                 // Update debounce map: last event wins.
@@ -229,6 +303,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn watch_files_emits_for_registered_file_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("watched.html");
+        let sibling = dir.path().join("sibling.html");
+        std::fs::write(&target, "a").unwrap();
+        std::fs::write(&sibling, "a").unwrap();
+
+        let (tx, rx) = channel();
+        let _handle = watch_files(vec![target.clone()], tx).expect("watch");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Sibling change in the same (watched) parent dir must be filtered out.
+        std::fs::write(&sibling, "changed").unwrap();
+        std::fs::write(&target, "changed").unwrap();
+
+        let canonical_target = target.canonicalize().unwrap();
+        let change = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a change for the watched file");
+        assert_eq!(change.path, canonical_target);
+        // And nothing further (the sibling event was dropped).
+        match rx.recv_timeout(Duration::from_millis(600)) {
+            Err(_) => {}
+            Ok(extra) => assert_eq!(extra.path, canonical_target, "unexpected sibling event"),
+        }
+    }
+
+    #[test]
+    fn watch_files_survives_atomic_replace() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("artifact.html");
+        std::fs::write(&target, "v1").unwrap();
+
+        let (tx, rx) = channel();
+        let _handle = watch_files(vec![target.clone()], tx).expect("watch");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Atomic save: write temp file, rename over the target — the pattern
+        // used by editors and by Claude's Write tool.
+        let tmp = dir.path().join("artifact.html.tmp");
+        std::fs::write(&tmp, "v2").unwrap();
+        std::fs::rename(&tmp, &target).unwrap();
+
+        let canonical_target = target.canonicalize().unwrap();
+        let change = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a change after atomic replace");
+        assert_eq!(change.path, canonical_target);
     }
 
     #[test]
