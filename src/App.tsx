@@ -19,6 +19,7 @@ import { BookmarksProvider } from "./state/bookmarks-context";
 import { RecentsProvider } from "./state/recents-context";
 import { ScrollMemoryProvider } from "./state/scroll-memory";
 import { ExplorerUiProvider, useExplorerUi } from "./state/explorer-ui";
+import { ContextMenuProvider } from "./components/ContextMenu";
 import { isUnderRoot } from "./utils/path";
 import {
   TabsProvider,
@@ -63,7 +64,9 @@ function ProviderShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
           <TabsProvider ipc={ipc}>
             <ScrollMemoryProvider>
               <ExplorerUiProvider>
-                <AppShell ipc={ipc} />
+                <ContextMenuProvider>
+                  <AppShell ipc={ipc} />
+                </ContextMenuProvider>
               </ExplorerUiProvider>
             </ScrollMemoryProvider>
           </TabsProvider>
@@ -276,7 +279,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
         onCommit={handleSidebarResizeCommit}
       />
       <main className="pane pane-preview" role="main">
-        <TabStrip />
+        <TabStrip onOpenFile={openFile} />
         <Toolbar addressBarRef={addressBarRef} onSubmitPath={(p) => openFile(p)} />
         {notice ? (
           <div className="app-notice" role="alert">

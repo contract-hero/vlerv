@@ -6,6 +6,9 @@ import { useTabs, useTabsDispatch } from "../state/TabsProvider";
 import { currentEntry, isLoading } from "../state/tabs";
 import type { Tab } from "../state/tabs";
 import { FileGlyph } from "./FileIcon";
+import { useContextMenu } from "./ContextMenu";
+import { useFileMenu } from "../hooks/useFileMenu";
+import type { OpenFileOptions } from "../state/TabsProvider";
 
 function tabTitle(tab: Tab): string {
   const entry = currentEntry(tab);
@@ -13,15 +16,48 @@ function tabTitle(tab: Tab): string {
   return entry.path.replace(/^.*\//, "") || entry.path;
 }
 
-export default function TabStrip(): React.ReactElement {
+export interface TabStripProps {
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
+}
+
+export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.ReactElement {
   const { tabs, activeTabId } = useTabs();
   const dispatch = useTabsDispatch();
   const [dragId, setDragId] = React.useState<string | null>(null);
   const [overIndex, setOverIndex] = React.useState<number | null>(null);
+  const { open: openMenu } = useContextMenu();
+  const fileMenu = useFileMenu(onOpenFile);
 
   const endDrag = () => {
     setDragId(null);
     setOverIndex(null);
+  };
+
+  const tabMenu = (tab: Tab, index: number) => {
+    const entry = currentEntry(tab);
+    const tabSection = [
+      {
+        label: "Close Tab",
+        onSelect: () => dispatch({ type: "CLOSE_TAB", tabId: tab.id }),
+      },
+      {
+        label: "Close Other Tabs",
+        onSelect: () => {
+          for (const other of tabs) {
+            if (other.id !== tab.id) dispatch({ type: "CLOSE_TAB", tabId: other.id });
+          }
+        },
+      },
+      {
+        label: "Close Tabs to the Right",
+        onSelect: () => {
+          for (const other of tabs.slice(index + 1)) {
+            dispatch({ type: "CLOSE_TAB", tabId: other.id });
+          }
+        },
+      },
+    ];
+    return entry ? [tabSection, ...fileMenu(entry.path)] : [tabSection];
   };
 
   return (
@@ -74,6 +110,7 @@ export default function TabStrip(): React.ReactElement {
             }}
             onDragEnd={endDrag}
             onClick={() => dispatch({ type: "ACTIVATE_TAB", tabId: tab.id })}
+            onContextMenu={(e) => openMenu(e, tabMenu(tab, index))}
             onAuxClick={(e) => {
               if (e.button === 1) {
                 e.preventDefault();

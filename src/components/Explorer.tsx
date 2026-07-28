@@ -10,6 +10,8 @@ import { useBookmarksContext } from "../state/bookmarks-context";
 import { useExplorerUi } from "../state/explorer-ui";
 import { openOptsFromClick } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
+import { useContextMenu } from "./ContextMenu";
+import { useFileMenu } from "../hooks/useFileMenu";
 
 // Path-keyed cache-version map. FolderNode reads its own path's version from
 // context; bumping it re-fires that node's listDir effect without touching
@@ -164,6 +166,8 @@ function FileRow({ entry, depth, onOpenFile, selected, bookmarked, onToggleBookm
   const indentPx = 12 + depth * 16;
   const { revealTarget, focusedPath } = useExplorerUi();
   const rowRef = React.useRef<HTMLDivElement | null>(null);
+  const { open: openMenu } = useContextMenu();
+  const fileMenu = useFileMenu(onOpenFile);
 
   // Reveal: scroll into view when this row is the armed target. Runs on
   // mount and on nonce bumps, so it fires exactly when the async ancestor
@@ -188,6 +192,7 @@ function FileRow({ entry, depth, onOpenFile, selected, bookmarked, onToggleBookm
       onAuxClick={(e) => {
         if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
       }}
+      onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
       draggable
       onDragStart={(e) => {
         e.preventDefault();

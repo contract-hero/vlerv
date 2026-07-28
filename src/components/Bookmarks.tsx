@@ -3,10 +3,12 @@
 // Recents.tsx for layout but with a chevron-driven expand/collapse header
 // (state persisted to localStorage so the choice survives reloads).
 import * as React from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, X } from "lucide-react";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { openOptsFromClick } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
+import { useContextMenu } from "./ContextMenu";
+import { useFileMenu } from "../hooks/useFileMenu";
 
 const COLLAPSED_KEY = "vlerv.bookmarks.collapsed";
 
@@ -32,6 +34,8 @@ export interface BookmarksProps {
 
 export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactElement {
   const { bookmarks, remove, reorder } = useBookmarksContext();
+  const { open: openMenu } = useContextMenu();
+  const fileMenu = useFileMenu(onOpenFile);
   const [collapsed, setCollapsed] = React.useState<boolean>(readSavedCollapsed);
   // Drag-to-reorder state: the path being dragged and the path currently
   // hovered as a drop target (used to draw the insertion indicator).
@@ -64,16 +68,18 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
   };
 
   if (bookmarks.length === 0) {
-    return <div data-section="bookmarks" data-testid="bookmarks-group" />;
+    return (
+      <div data-section="bookmarks" data-testid="bookmarks-group">
+        <h4 className="bookmarks-header bookmarks-header-empty">
+          <span>Bookmarks</span>
+        </h4>
+        <p className="bookmarks-empty-hint">Hover a file and click ☆ to pin it here.</p>
+      </div>
+    );
   }
 
   const handleClick = (e: React.MouseEvent, path: string) => {
     onOpenFile?.(path, openOptsFromClick(e));
-  };
-
-  const handleContextMenu = (e: React.MouseEvent, path: string) => {
-    e.preventDefault();
-    void remove(path);
   };
 
   return (
@@ -138,11 +144,23 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
               onAuxClick={(e) => {
                 if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
               }}
-              onContextMenu={(e) => handleContextMenu(e, entry.path)}
+              onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
               style={{ cursor: "pointer" }}
-              title={`${entry.path}\n(drag to reorder · right-click to remove)`}
+              title={`${entry.path}\n(drag to reorder)`}
             >
-              {entry.path.replace(/^.*\//, "")}
+              <span className="bookmark-label">{entry.path.replace(/^.*\//, "")}</span>
+              <button
+                type="button"
+                className="bookmark-remove"
+                title="Remove bookmark"
+                aria-label={`Remove bookmark ${entry.path.replace(/^.*\//, "")}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void remove(entry.path);
+                }}
+              >
+                <X size={11} strokeWidth={2} />
+              </button>
             </li>
           ))}
         </ul>

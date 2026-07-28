@@ -2,8 +2,15 @@
 // Renders the user's own trusted markdown from their workspace. The parsed
 // HTML is injected via DOMParser → importNode (no innerHTML assignment).
 import * as React from "react";
-import { marked } from "marked";
+import { Marked } from "marked";
+import markedKatex from "marked-katex-extension";
+import "katex/dist/katex.min.css";
 import { useTheme } from "../hooks/useTheme";
+
+// Module-level Marked instance with the KaTeX extension registered once.
+// $inline$ and $$block$$ math both render; throwOnError off so a bad
+// expression degrades to red TeX source instead of breaking the document.
+const md = new Marked(markedKatex({ throwOnError: false, nonStandard: true }));
 
 export interface MdRendererProps {
   source: string;
@@ -79,7 +86,7 @@ export default function MdRenderer({ source, path, onRendered }: MdRendererProps
     if (!el) return;
     let cancelled = false;
 
-    const html = marked.parse(source, { gfm: true, breaks: false }) as string;
+    const html = md.parse(source, { gfm: true, breaks: false, async: false }) as string;
 
     while (el.firstChild) el.removeChild(el.firstChild);
     const doc = new DOMParser().parseFromString(`<div>${html}</div>`, "text/html");
