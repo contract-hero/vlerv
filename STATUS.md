@@ -18,7 +18,8 @@
 ### Explorer
 - Hoisted expansion state (`ExplorerUiProvider`); `reveal(path)` expands ancestor chains in one update — the deep-link `reveal` intent works, and the active tab's file auto-reveals.
 - Tree keyboard navigation (arrows/Enter/Home/End), `role=tree/treeitem`, `aria-expanded/level`, roving tabindex.
-- Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Copy Path, Bookmark toggle. ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
+- Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Copy Path, Bookmark toggle.
+- **Share** (merged from #22): native macOS share sheet + Open-in-Slack live in the Toolbar next to the star/copy buttons (they were in the removed Preview header). ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
 
 ### Rendering
 - HTML: sandboxed iframe, scripts on, `<base href>` injection, host-bridge script (link intercept with modifiers, scroll report/restore, zoom, chord forwarding).
@@ -49,7 +50,7 @@
 
 - Deep-link `line=N` reaches the frontend but no renderer scrolls to a line yet.
 - Recents list is push-only from opens; no backend broadcast event (StartPage refreshes on mount).
-- `preferences.ignore_globs` / `drag_out_mode` still unwired (no Settings UI; the hardcoded `DEFAULT_IGNORED` covers the real use).
+- `preferences.ignore_globs` / `drag_out_mode` still unwired (the hardcoded `DEFAULT_IGNORED` covers the real use). `Settings.tsx` exists and holds the Slack-target field but is still not mounted anywhere — set `preferences.slack_target` via state.json until it is (product decision deferred in #22).
 - Markdown auto-reload re-runs mermaid/KaTeX from scratch — a large doc may flash briefly on reload.
 - DMG bundling still fails in `bundle_dmg.sh` (Finder permission); `.app` bundles fine, `cp -R` to `/Applications/`.
 

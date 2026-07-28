@@ -37,6 +37,7 @@ Files open in tabs **auto-reload when they change on disk** — edit an artifact
 - **Open any file**: `⌘O` → file picker. Out-of-workspace files render with an "external" badge.
 - **Drag files out**: drag any file row into Finder, Slack, Mail, upload zones — a real macOS `kUTTypeFileURL` drop.
 - **Zoom**: `⌘+` / `⌘−` / `⌘0`, per tab.
+- **Share**: the toolbar Share button opens the native macOS share sheet (AirDrop, Messages, Mail…). With a Slack target configured, an Open-in-Slack button foregrounds that channel — drag the file in from the tree to send it.
 
 ### Rendering
 

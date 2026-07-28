@@ -6,6 +6,7 @@ pub mod reader;
 pub mod deeplink;
 pub mod drag_spike;
 pub mod security;
+pub mod share;
 pub mod state_store;
 pub mod recents;
 pub mod bookmarks;
@@ -70,23 +71,13 @@ pub fn dispatch_deep_link(
         deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal, None),
     };
 
-    // Branch on the security gate: an `OutOfRoot(canonical)` error means the
-    // path *does* exist and was canonicalized, but lies outside every
-    // configured root — those become ad-hoc external opens with
-    // `out_of_root: true`. `EmptyRoots` (fresh install, no workspace picked
-    // yet) falls through the same way as long as the path itself resolves —
-    // rejecting every deep link on a rootless install was a bug.
-    // `CanonicalizeFailed` stays a hard error: we never open a path the OS
-    // can't resolve.
-    let (canonical, out_of_root) = match security::canonicalize_and_check_root(&path, roots) {
-        Ok(canonical) => (canonical, false),
-        Err(security::OutOfRootError::OutOfRoot(canonical)) => (canonical, true),
-        Err(security::OutOfRootError::EmptyRoots) => match path.canonicalize() {
-            Ok(canonical) => (canonical, true),
-            Err(e) => return Err(make_err(format!("canonicalize failed: {e}"))),
-        },
-        Err(e) => return Err(make_err(e.to_string())),
-    };
+    // Ad-hoc external-open policy: paths that exist but lie outside every
+    // configured root — or any path at all when no workspace has been picked
+    // yet — are allowed with `out_of_root: true`; anything the OS can't
+    // resolve is a hard error. Opening only displays the file locally, so the
+    // rootless variant is safe here (share_file stays conservative).
+    let (canonical, out_of_root) =
+        security::canonicalize_allow_rootless(&path, roots).map_err(|e| make_err(e.to_string()))?;
 
     if matches!(kind, DeepLinkIntentKind::Open) && !out_of_root {
         // Recents is scoped to in-root files; ad-hoc external opens stay

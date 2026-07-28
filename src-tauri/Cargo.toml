@@ -26,6 +26,13 @@ tauri-plugin-opener = "2"
 base64 = "0.22"
 tauri-plugin-window-state = "2.4.1"
 
+# Share sheet (NSSharingServicePicker) bindings. Pinned to the same lines wry
+# uses (objc2 0.6 / objc2-* 0.3) so there's only one NSView type universe.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSSharingService", "NSView", "NSResponder"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

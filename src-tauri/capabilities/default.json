@@ -16,7 +16,8 @@
       "allow": [
         { "url": "https://*" },
         { "url": "http://*" },
-        { "url": "mailto:*" }
+        { "url": "mailto:*" },
+        { "url": "slack://*" }
       ]
     },
     {

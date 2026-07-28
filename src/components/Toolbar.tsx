@@ -8,16 +8,76 @@ import {
   Check,
   Copy,
   RotateCw,
+  Share,
+  Slack,
   Star,
 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
 import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { normalizePathBarInput } from "../utils/path";
+import { slackUrlFromTarget } from "../utils/slack";
+import { useSettings } from "../hooks/useSettings";
+import { tauriIpc } from "../ipc";
 
 export interface ToolbarProps {
   addressBarRef: React.MutableRefObject<HTMLInputElement | null>;
   onSubmitPath: (path: string) => void;
+}
+
+function ShareButton({ path }: { path: string }): React.ReactElement {
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Capture the rect synchronously — it's viewport-relative and goes stale
+    // if the pane scrolls between click and native display.
+    const r = e.currentTarget.getBoundingClientRect();
+    void tauriIpc
+      .shareFile?.([path], { x: r.x, y: r.y, width: r.width, height: r.height })
+      .catch(() => {
+        // Share errors (path vanished, non-macOS) fail silently, matching
+        // CopyPathButton's clipboard fallback.
+      });
+  };
+  return (
+    <button
+      type="button"
+      className="toolbar-button"
+      data-testid="preview-share"
+      title="Share…"
+      aria-label="Share file"
+      onClick={handleClick}
+    >
+      <Share size={13} strokeWidth={2} />
+    </button>
+  );
+}
+
+/**
+ * Slack ships no macOS share extension, so the share sheet can't reach it.
+ * When a Slack target is configured this button foregrounds Slack on that
+ * channel/DM; the file itself travels by drag-out from the tree.
+ */
+function OpenInSlackButton({ url }: { url: string }): React.ReactElement {
+  return (
+    <button
+      type="button"
+      className="toolbar-button"
+      data-testid="preview-open-in-slack"
+      title="Open Slack channel (drag the file in to share)"
+      aria-label="Open Slack channel"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void openUrl(url).catch(() => {
+          // Opener scope or missing Slack app — fail silently.
+        });
+      }}
+    >
+      <Slack size={13} strokeWidth={2} />
+    </button>
+  );
 }
 
 function IconButton({
@@ -82,6 +142,11 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
   const tab = useActiveTab();
   const dispatch = useTabsDispatch();
   const { isBookmarked, toggle } = useBookmarksContext();
+  // One settings subscription for the toolbar; the Slack affordance stays
+  // hidden until a target is configured.
+  const { state: settings } = useSettings(tauriIpc);
+  const slackTarget = settings?.preferences?.slack_target;
+  const slackUrl = slackTarget ? slackUrlFromTarget(slackTarget) : null;
 
   const entry = currentEntry(tab);
   const currentPath = entry?.path ?? "";
@@ -196,6 +261,8 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
             <Star size={13.5} strokeWidth={2} fill={bookmarked ? "currentColor" : "none"} />
           </button>
           <CopyPathButton path={entry.path} />
+          <ShareButton path={entry.path} />
+          {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
       ) : null}
 

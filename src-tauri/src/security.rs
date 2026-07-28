@@ -99,6 +99,48 @@ pub fn canonicalize_and_check_root(
     Ok(canonical)
 }
 
+/// The "ad-hoc external file" policy: resolve `path`, allowing paths that
+/// exist but lie outside every root (Preview legitimately displays those —
+/// user-picked files and out-of-root deep links). Returns the canonical path
+/// plus `out_of_root`. Unresolvable paths and an empty root set stay hard
+/// errors. Shared by the deep-link dispatcher and the share command so the
+/// external-file policy lives in exactly one place.
+///
+/// Note the deliberate asymmetry with `canonicalize_allow_rootless` below:
+/// outbound actions (share) stay conservative when no workspace has been
+/// picked; merely displaying a file does not.
+pub fn canonicalize_allow_external(
+    path: &Path,
+    roots: &RootSet,
+) -> Result<(PathBuf, bool), OutOfRootError> {
+    match canonicalize_and_check_root(path, roots) {
+        Ok(canonical) => Ok((canonical, false)),
+        Err(OutOfRootError::OutOfRoot(canonical)) => Ok((canonical, true)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Like `canonicalize_allow_external`, but an EMPTY root set (fresh install,
+/// no workspace picked yet) also resolves as out-of-root instead of erroring.
+/// Used by the deep-link dispatcher: rejecting every deep link on a rootless
+/// install was a bug, and opening a file only displays it locally. Do NOT use
+/// this for actions that send data off the machine.
+pub fn canonicalize_allow_rootless(
+    path: &Path,
+    roots: &RootSet,
+) -> Result<(PathBuf, bool), OutOfRootError> {
+    match canonicalize_allow_external(path, roots) {
+        Err(OutOfRootError::EmptyRoots) => match path.canonicalize() {
+            Ok(canonical) => Ok((canonical, true)),
+            Err(e) => Err(OutOfRootError::CanonicalizeFailed {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            }),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +165,28 @@ mod tests {
         set.add_root(dir.path());
         set.add_root(dir.path());
         assert_eq!(set.roots().len(), 1);
+    }
+
+    #[test]
+    fn allow_rootless_falls_through_on_empty_roots() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("adhoc.html");
+        std::fs::write(&file, "x").unwrap();
+        let (canonical, out_of_root) =
+            canonicalize_allow_rootless(&file, &RootSet::empty()).expect("resolvable path");
+        assert!(out_of_root);
+        assert_eq!(canonical, file.canonicalize().unwrap());
+
+        // Outbound actions stay conservative on a rootless install.
+        assert!(canonicalize_allow_external(&file, &RootSet::empty()).is_err());
+    }
+
+    #[test]
+    fn allow_rootless_still_rejects_unresolvable_paths() {
+        assert!(canonicalize_allow_rootless(
+            Path::new("/no/such/file/anywhere.html"),
+            &RootSet::empty()
+        )
+        .is_err());
     }
 }
