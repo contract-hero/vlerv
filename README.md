@@ -1,6 +1,6 @@
-# Vlervcode
+# Vlervtifacts
 
-A macOS companion app for Claude Code: read-only workspace browser, full-fidelity HTML/Markdown viewer, native file drag-out, and `vlerv://` URL scheme for deep-linking from Claude Code or any other tool.
+A distraction-free macOS viewer for local HTML artifacts: read-only workspace browser, full-fidelity HTML/Markdown viewer, native file drag-out, and `vlerv://` URL scheme for deep-linking from Claude Code or any other tool.
 
 Built with Tauri 2 + React + TypeScript. Ships as an **11 MB** native `.app` (no Node runtime needed once built).
 
@@ -8,7 +8,7 @@ Built with Tauri 2 + React + TypeScript. Ships as an **11 MB** native `.app` (no
 
 ```bash
 ./scripts/build-app.sh
-cp -R target/release/bundle/macos/Vlervcode.app /Applications/
+cp -R target/release/bundle/macos/Vlervtifacts.app /Applications/
 ```
 
 First launch: right-click → Open (Gatekeeper prompt — the app isn't notarized).

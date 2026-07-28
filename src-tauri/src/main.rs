@@ -182,7 +182,7 @@ fn main() {
             let roots = roots_for_setup;
             app.deep_link().on_open_url(move |event| {
                 // Bring the window to the foreground before dispatching, so a
-                // deep-link click from another app raises Vlervcode instead of
+                // deep-link click from another app raises Vlervtifacts instead of
                 // silently delivering the file to a backgrounded / minimized /
                 // hidden window. On macOS, `set_focus` activates the app via
                 // NSApp.activate(ignoringOtherApps:) — `macosPrivateApi` is

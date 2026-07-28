@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build a production-ready Vlervcode.app bundle for macOS.
+# Build a production-ready Vlervtifacts.app bundle for macOS.
 #
-# Output: target/release/bundle/macos/Vlervcode.app
-# Install: cp -R target/release/bundle/macos/Vlervcode.app /Applications/
+# Output: target/release/bundle/macos/Vlervtifacts.app
+# Install: cp -R target/release/bundle/macos/Vlervtifacts.app /Applications/
 
 set -euo pipefail
 
@@ -21,10 +21,10 @@ fi
 echo "==> Installing JS deps"
 pnpm install
 
-echo "==> Building Vlervcode.app (this takes a few minutes on first run)"
+echo "==> Building Vlervtifacts.app (this takes a few minutes on first run)"
 pnpm tauri build
 
-APP_PATH="target/release/bundle/macos/Vlervcode.app"
+APP_PATH="target/release/bundle/macos/Vlervtifacts.app"
 if [ ! -d "$APP_PATH" ]; then
   echo "Build finished but $APP_PATH not found." >&2
   exit 1

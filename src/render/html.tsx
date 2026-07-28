@@ -24,7 +24,7 @@ function themeStyle(theme: "dark" | "light"): string {
 // Intercepts in-iframe link clicks. The sandboxed iframe can navigate to
 // neither `file://` (blocked) nor external `http(s)://` (no top-level nav),
 // so both are forwarded to the host webview via postMessage:
-//   - `file:`        → { type: 'vlerv:navigate', path }    open inside Vlervcode
+//   - `file:`        → { type: 'vlerv:navigate', path }    open inside Vlervtifacts
 //   - `http:`/`https:` → { type: 'vlerv:openExternal', url } open in the OS
 //     default browser (which on this machine routes through Finicky).
 // `mailto:`/`tel:`/`javascript:`/`#` are left to the iframe's own handling.
