@@ -1,7 +1,12 @@
-// File reader — returns raw text content for small text files, metadata-only
-// for binary or oversized files. C1 implementation; C2 amendments below.
+// File reader — returns raw text content for small text files, base64 for
+// raster images, metadata-only for other binary or oversized files.
+//
+// Reads are deliberately NOT root-gated: this is a single-user local viewer
+// whose deep-link contract intentionally opens out-of-root files (the
+// "external file" badge flow), and ⌘O / the address bar / external tabs all
+// depend on ungated reads. RootSet's job is workspace anchoring for
+// deep-link classification, not read control.
 
-use crate::security::{canonicalize_and_check_root, RootSet};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,8 +15,23 @@ use std::time::UNIX_EPOCH;
 /// 10 MiB cap. Files strictly larger than this return metadata-only.
 pub const MAX_TEXT_BYTES: u64 = 10 * 1024 * 1024;
 
+/// 20 MiB cap for raster images (base64 inflates 4/3 → ~27 MB IPC payload
+/// max). Larger than MAX_TEXT_BYTES because viewing images is a primary use
+/// case and camera JPEGs routinely exceed 10 MiB; 20 MiB still keeps the
+/// webview responsive.
+pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Size of the binary-detection window (first 8 KiB).
 const BINARY_PROBE_SIZE: usize = 8 * 1024;
+
+/// How `FilePayload.content` is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoding {
+    #[default]
+    Text,
+    Base64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePayload {
@@ -20,37 +40,39 @@ pub struct FilePayload {
     pub size: u64,
     /// mtime in seconds since Unix epoch.
     pub mtime: i64,
-    /// True iff the first 8 KiB contains a NUL byte.
+    /// True iff the first 8 KiB contains a NUL byte (or the file is a
+    /// recognized raster image, which is binary by definition).
     pub is_binary: bool,
     /// True iff the file exceeded the size cap.
     pub oversized: bool,
-    /// Raw bytes as a UTF-8 string when text and within size cap. None for
-    /// binary or oversized.
+    /// How `content` is encoded: UTF-8 text, or base64 for raster images.
+    #[serde(default)]
+    pub encoding: Encoding,
+    /// File content when within the size cap: UTF-8 text for text files,
+    /// base64 bytes for raster images. None for other binary or oversized
+    /// files.
     pub content: Option<String>,
+}
+
+/// Raster image extensions served as base64 (rendered via data: URI in the
+/// frontend). SVG is deliberately absent — it's text and renders inline.
+const RASTER_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif",
+];
+
+fn is_raster(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RASTER_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ReadError {
-    /// Legacy C1 variant — kept so C1 reader tests continue to compile.
     #[error("not found: {0:?}")]
     NotFound(PathBuf),
-    /// C2: missing file at the canonical path.
-    #[error("missing: {0:?}")]
-    Missing(PathBuf),
-    /// C2: EACCES on the target.
-    #[error("permission denied: {0:?}")]
-    PermissionDenied(PathBuf),
-    /// C2: file exceeds the 10 MB cap.
-    #[error("oversize: {size} bytes")]
-    Oversize { size: u64 },
-    /// C2: NUL-byte detected in the first 8 KB.
-    #[error("binary content")]
-    Binary,
-    /// C2: out-of-root rejection by the security gate.
-    #[error("out of root")]
-    OutOfRoot,
-    /// Generic IO failure. C2: carries a String so the variant is Serialize
-    /// (CF6) — io::Error is not Serialize.
+    /// Generic IO failure. Carries a String so the variant is Serialize —
+    /// io::Error is not Serialize.
     #[error("io error at {path:?}: {reason}")]
     Io {
         path: PathBuf,
@@ -58,121 +80,20 @@ pub enum ReadError {
     },
 }
 
-/// C2: file payload returned by `read_file_with_roots`. Distinct from the
-/// legacy `FilePayload` so C1 callers keep their shape. The frontend can
-/// short-circuit on `kind: Binary | OversizeMetadata` without a second read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecuredFilePayload {
-    pub path: PathBuf,
-    pub bytes: Vec<u8>,
-    pub kind: PayloadKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PayloadKind {
-    Text,
-    Binary,
-    OversizeMetadata { size: u64, mtime: i64 },
-}
-
-/// Serialize a `ReadError` to a JSON string for logging or IPC transport.
-/// This is the primary reason `serde_json` is declared as a dependency.
-pub fn read_error_to_json(e: &ReadError) -> String {
-    serde_json::to_string(e).unwrap_or_else(|_| format!("\"unknown error\""))
-}
-
-/// C2: gated read. Every call passes through `canonicalize_and_check_root`
-/// before any file I/O on the target path.
-pub fn read_file_with_roots(
-    path: &Path,
-    roots: &RootSet,
-) -> Result<SecuredFilePayload, ReadError> {
-    // Security gate: resolve symlinks and check root membership FIRST.
-    // If canonicalize fails (missing path), return appropriate error.
-    let canonical = match canonicalize_and_check_root(path, roots) {
-        Ok(c) => c,
-        Err(crate::security::OutOfRootError::OutOfRoot(_)) => {
-            return Err(ReadError::OutOfRoot);
-        }
-        Err(crate::security::OutOfRootError::CanonicalizeFailed { path: p, .. }) => {
-            // Missing file inside root (canonicalize fails because path doesn't exist)
-            return Err(ReadError::Missing(p));
-        }
-        Err(crate::security::OutOfRootError::EmptyRoots) => {
-            return Err(ReadError::OutOfRoot);
-        }
-    };
-
-    // Check metadata.
-    let metadata = std::fs::metadata(&canonical).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ReadError::Missing(canonical.clone())
-        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-            ReadError::PermissionDenied(canonical.clone())
-        } else {
-            ReadError::Io { path: canonical.clone(), reason: e.to_string() }
-        }
-    })?;
-
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    // Oversize: return metadata-only without reading body.
-    if size > MAX_TEXT_BYTES {
-        return Ok(SecuredFilePayload {
-            path: canonical,
-            bytes: Vec::new(),
-            kind: PayloadKind::OversizeMetadata { size, mtime },
-        });
-    }
-
-    // Open file for binary detection.
-    let mut file = std::fs::File::open(&canonical).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            ReadError::PermissionDenied(canonical.clone())
-        } else {
-            ReadError::Io { path: canonical.clone(), reason: e.to_string() }
-        }
-    })?;
-
-    let probe_size = (size as usize).min(BINARY_PROBE_SIZE);
-    let mut probe = vec![0u8; probe_size];
-    if probe_size > 0 {
-        file.read_exact(&mut probe).map_err(|e| ReadError::Io { path: canonical.clone(), reason: e.to_string() })?;
-    }
-
-    let is_binary = probe.contains(&0u8);
-
-    if is_binary {
-        return Ok(SecuredFilePayload {
-            path: canonical,
-            bytes: Vec::new(),
-            kind: PayloadKind::Binary,
-        });
-    }
-
-    // Read remaining bytes.
-    let mut rest = Vec::new();
-    file.read_to_end(&mut rest).map_err(|e| ReadError::Io { path: canonical.clone(), reason: e.to_string() })?;
-
-    let mut all = probe;
-    all.extend_from_slice(&rest);
-
-    Ok(SecuredFilePayload {
-        path: canonical,
-        bytes: all,
-        kind: PayloadKind::Text,
-    })
-}
-
-/// Read a file and return its payload. Returns metadata-only for binary or
-/// oversized files. Returns a typed error for missing paths.
+/// Read a file and return its payload. Raster images within the image cap
+/// return base64 content; text files within the text cap return UTF-8
+/// content; everything else returns metadata-only. Returns a typed error
+/// for missing paths.
 pub fn read_file(path: &Path) -> Result<FilePayload, ReadError> {
+    read_file_with_caps(path, MAX_TEXT_BYTES, MAX_IMAGE_BYTES)
+}
+
+/// Implementation with injectable caps so tests don't need multi-MiB files.
+fn read_file_with_caps(
+    path: &Path,
+    max_text_bytes: u64,
+    max_image_bytes: u64,
+) -> Result<FilePayload, ReadError> {
     // Check existence and gather metadata.
     let metadata = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -191,14 +112,45 @@ pub fn read_file(path: &Path) -> Result<FilePayload, ReadError> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    // Raster images bypass the NUL probe entirely: read whole file, base64.
+    if is_raster(path) {
+        if size > max_image_bytes {
+            return Ok(FilePayload {
+                path: path.to_path_buf(),
+                size,
+                mtime,
+                is_binary: true,
+                oversized: true,
+                encoding: Encoding::Base64,
+                content: None,
+            });
+        }
+        let bytes = std::fs::read(path).map_err(|e| ReadError::Io {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(FilePayload {
+            path: path.to_path_buf(),
+            size,
+            mtime,
+            is_binary: true,
+            oversized: false,
+            encoding: Encoding::Base64,
+            content: Some(b64),
+        });
+    }
+
     // Oversized check — return metadata only, no content.
-    if size > MAX_TEXT_BYTES {
+    if size > max_text_bytes {
         return Ok(FilePayload {
             path: path.to_path_buf(),
             size,
             mtime,
             is_binary: false,
             oversized: true,
+            encoding: Encoding::Text,
             content: None,
         });
     }
@@ -227,6 +179,7 @@ pub fn read_file(path: &Path) -> Result<FilePayload, ReadError> {
             mtime,
             is_binary: true,
             oversized: false,
+            encoding: Encoding::Text,
             content: None,
         });
     }
@@ -252,6 +205,106 @@ pub fn read_file(path: &Path) -> Result<FilePayload, ReadError> {
         mtime,
         is_binary: false,
         oversized: false,
+        encoding: Encoding::Text,
         content: Some(full_content),
     })
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use base64::Engine as _;
+    use tempfile::TempDir;
+
+    // Minimal valid PNG header bytes — includes NULs so it would previously
+    // have tripped the binary probe into a metadata-only payload.
+    const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+
+    #[test]
+    fn png_returns_base64_content() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("shot.png");
+        std::fs::write(&p, PNG_MAGIC).unwrap();
+
+        let payload = read_file(&p).expect("read");
+        assert!(payload.is_binary);
+        assert!(!payload.oversized);
+        assert_eq!(payload.encoding, Encoding::Base64);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload.content.expect("content"))
+            .expect("valid base64");
+        assert_eq!(decoded, PNG_MAGIC);
+    }
+
+    #[test]
+    fn uppercase_extension_recognized() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("SHOT.PNG");
+        std::fs::write(&p, PNG_MAGIC).unwrap();
+
+        let payload = read_file(&p).expect("read");
+        assert_eq!(payload.encoding, Encoding::Base64);
+        assert!(payload.content.is_some());
+    }
+
+    #[test]
+    fn image_over_cap_is_metadata_only() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("big.png");
+        std::fs::write(&p, PNG_MAGIC).unwrap();
+
+        let payload = read_file_with_caps(&p, MAX_TEXT_BYTES, 4).expect("read");
+        assert!(payload.is_binary);
+        assert!(payload.oversized);
+        assert_eq!(payload.content, None);
+    }
+
+    #[test]
+    fn text_file_has_text_encoding() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("notes.md");
+        std::fs::write(&p, "# hello").unwrap();
+
+        let payload = read_file(&p).expect("read");
+        assert_eq!(payload.encoding, Encoding::Text);
+        assert_eq!(payload.content.as_deref(), Some("# hello"));
+    }
+
+    #[test]
+    fn encoding_serializes_to_the_lowercase_wire_shape() {
+        // The TypeScript side (src/ipc.ts) declares `encoding?: "text" |
+        // "base64"` and the router branches on those literal strings — pin
+        // the serde representation, not just the Rust enum.
+        let dir = TempDir::new().unwrap();
+        let png = dir.path().join("wire.png");
+        std::fs::write(&png, PNG_MAGIC).unwrap();
+        let v = serde_json::to_value(read_file(&png).unwrap()).unwrap();
+        assert_eq!(v["encoding"], "base64");
+
+        let txt = dir.path().join("wire.txt");
+        std::fs::write(&txt, "hi").unwrap();
+        let v = serde_json::to_value(read_file(&txt).unwrap()).unwrap();
+        assert_eq!(v["encoding"], "text");
+    }
+
+    #[test]
+    fn missing_encoding_field_deserializes_to_text() {
+        // Payloads serialized by older builds have no `encoding` key; the
+        // #[serde(default)] must keep them deserializable as Text.
+        let json = r#"{"path":"/tmp/a.md","size":1,"mtime":0,"is_binary":false,"oversized":false,"content":"x"}"#;
+        let payload: FilePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.encoding, Encoding::Text);
+    }
+
+    #[test]
+    fn svg_stays_on_text_path() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("icon.svg");
+        std::fs::write(&p, "<svg></svg>").unwrap();
+
+        let payload = read_file(&p).expect("read");
+        assert_eq!(payload.encoding, Encoding::Text);
+        assert!(!payload.is_binary);
+        assert_eq!(payload.content.as_deref(), Some("<svg></svg>"));
+    }
 }

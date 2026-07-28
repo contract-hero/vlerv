@@ -185,6 +185,21 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
                 });
             }
 
+            // Same validation as the `open` arm (previously asymmetric).
+            if !path_val.starts_with('/') {
+                return Err(DeepLinkError::Malformed {
+                    input: input.clone(),
+                    reason: "path must be absolute (start with '/')".to_string(),
+                });
+            }
+
+            if path_val.contains('\0') {
+                return Err(DeepLinkError::Malformed {
+                    input: input.clone(),
+                    reason: "path must not contain NUL bytes".to_string(),
+                });
+            }
+
             Ok(DeepLinkIntent::Reveal {
                 path: PathBuf::from(path_val),
             })

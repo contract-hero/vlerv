@@ -91,6 +91,20 @@ impl Default for State {
     }
 }
 
+/// Test support: ONE shared tempdir for `VLERV_STATE_DIR` across every test
+/// module in the crate. Previously bookmarks.rs and lib.rs each pointed the
+/// process-global env var at their *own* OnceLock<TempDir>, racing each
+/// other mid-run (benign-by-luck, and UB territory for concurrent set_var).
+#[cfg(test)]
+pub(crate) fn ensure_shared_test_state_dir() {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static SET: OnceLock<()> = OnceLock::new();
+    let dir = DIR.get_or_init(|| tempfile::TempDir::new().expect("state tempdir"));
+    // set_var exactly once per process; later callers only read.
+    SET.get_or_init(|| std::env::set_var("VLERV_STATE_DIR", dir.path()));
+}
+
 /// Resolve the directory that holds `state.json`. Honors the
 /// `VLERV_STATE_DIR` env var when set (tests use this to point at tempdirs).
 pub fn state_dir() -> PathBuf {

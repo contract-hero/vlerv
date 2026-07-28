@@ -5,9 +5,14 @@ import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { resolveResource } from "@tauri-apps/api/path";
 import type { IpcSurface, TreeEntry } from "../ipc";
 import { FileGlyph, FolderGlyph } from "./FileIcon";
-import { useWatcher } from "../hooks/useWatcher";
-import type { TreeChangedPayload } from "../hooks/useWatcher";
-import { useBookmarks } from "../hooks/useBookmarks";
+import { useWatcherBus } from "../state/watcher-bus";
+import { useBookmarksContext } from "../state/bookmarks-context";
+import { useExplorerUi } from "../state/explorer-ui";
+import { openOptsFromClick } from "../state/TabsProvider";
+import { dirname } from "../utils/path";
+import type { OpenFileOptions } from "../state/TabsProvider";
+import { useContextMenu } from "./ContextMenu";
+import { useFileMenu } from "../hooks/useFileMenu";
 
 // Path-keyed cache-version map. FolderNode reads its own path's version from
 // context; bumping it re-fires that node's listDir effect without touching
@@ -18,12 +23,6 @@ const FolderCacheContext = React.createContext<ReadonlyMap<string, number>>(new 
 // on it, so bumping it (via the sidebar Refresh button) re-fetches every
 // expanded folder at once while preserving each node's expansion state.
 const RefreshContext = React.createContext<number>(0);
-
-// POSIX dirname. macOS-only app, so `/` separator is safe.
-function parentDir(absPath: string): string {
-  const idx = absPath.lastIndexOf("/");
-  return idx <= 0 ? "/" : absPath.slice(0, idx);
-}
 
 // Drag-preview icon: resolved from the bundled `resources` declaration in
 // tauri.conf.json. Cached on first call so subsequent drags don't hit IPC.
@@ -45,7 +44,7 @@ const DEFAULT_IGNORED = new Set([
 export interface ExplorerProps {
   ipc: IpcSurface;
   root: string;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selectedFile?: string | null;
   /** Bumped by the sidebar Refresh button to force a full tree re-fetch. */
   refreshNonce?: number;
@@ -62,18 +61,21 @@ interface NodeProps {
   ipc: IpcSurface;
   entry: TreeEntry;
   depth: number;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selectedFile?: string | null;
 }
 
-function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps): React.ReactElement {
-  const [expanded, setExpanded] = React.useState(false);
+function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps): React.ReactElement {
+  // Expansion is hoisted into ExplorerUiContext so reveal() can expand whole
+  // ancestor chains and expansion survives node remounts.
+  const { expandedPaths, toggle, focusedPath } = useExplorerUi();
+  const expanded = expandedPaths.has(entry.path);
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const versions = React.useContext(FolderCacheContext);
   const version = versions.get(entry.path) ?? 0;
   const refreshNonce = React.useContext(RefreshContext);
-  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarksContext();
 
   React.useEffect(() => {
     if (!expanded) return;
@@ -99,9 +101,13 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
       <div
         className={`row folder ${isSelected ? "selected" : ""}`}
         style={{ paddingLeft: `${indentPx}px` }}
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => toggle(entry.path)}
         data-path={entry.path}
         data-kind="dir"
+        role="treeitem"
+        aria-expanded={expanded}
+        aria-level={depth + 1}
+        tabIndex={focusedPath === entry.path ? 0 : -1}
       >
         <span className={`chevron ${expanded ? "open" : ""}`}>
           <ChevronRight size={14} strokeWidth={2} />
@@ -123,7 +129,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
             ipc={ipc}
             entry={child}
             depth={depth + 1}
-            onSelectFile={onSelectFile}
+            onOpenFile={onOpenFile}
             selectedFile={selectedFile}
           />
         ) : (
@@ -131,7 +137,7 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
             key={child.path}
             entry={child}
             depth={depth + 1}
-            onSelectFile={onSelectFile}
+            onOpenFile={onOpenFile}
             selected={selectedFile === child.path}
             bookmarked={isBookmarked(child.path)}
             onToggleBookmark={(p) => void toggleBookmark(p)}
@@ -145,19 +151,43 @@ function FolderNode({ ipc, entry, depth, onSelectFile, selectedFile }: NodeProps
 interface FileRowProps {
   entry: TreeEntry;
   depth: number;
-  onSelectFile?: (path: string) => void;
+  onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
   selected: boolean;
   bookmarked: boolean;
   onToggleBookmark: (path: string) => void;
 }
 
-function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
+function FileRow({ entry, depth, onOpenFile, selected, bookmarked, onToggleBookmark }: FileRowProps): React.ReactElement {
   const indentPx = 12 + depth * 16;
+  const { revealTarget, focusedPath } = useExplorerUi();
+  const rowRef = React.useRef<HTMLDivElement | null>(null);
+  const { open: openMenu } = useContextMenu();
+  const fileMenu = useFileMenu(onOpenFile);
+
+  // Reveal: scroll into view when this row is the armed target. Runs on
+  // mount and on nonce bumps, so it fires exactly when the async ancestor
+  // expand-cascade finally renders the row.
+  const isRevealTarget = revealTarget?.path === entry.path;
+  React.useEffect(() => {
+    if (isRevealTarget) {
+      rowRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [isRevealTarget, revealTarget?.nonce]);
+
   return (
     <div
+      ref={rowRef}
       className={`row file ${selected ? "selected" : ""}`}
       style={{ paddingLeft: `${indentPx}px` }}
-      onClick={() => onSelectFile?.(entry.path)}
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-selected={selected}
+      tabIndex={focusedPath === entry.path ? 0 : -1}
+      onClick={(e) => onOpenFile?.(entry.path, openOptsFromClick(e))}
+      onAuxClick={(e) => {
+        if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
+      }}
+      onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
       draggable
       onDragStart={(e) => {
         e.preventDefault();
@@ -194,11 +224,87 @@ function FileRow({ entry, depth, onSelectFile, selected, bookmarked, onToggleBoo
   );
 }
 
-export default function Explorer({ ipc, root, onSelectFile, selectedFile, refreshNonce = 0 }: ExplorerProps): React.ReactElement {
+export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshNonce = 0 }: ExplorerProps): React.ReactElement {
   const [entries, setEntries] = React.useState<TreeEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [versions, setVersions] = React.useState<ReadonlyMap<string, number>>(() => new Map());
-  const { isBookmarked, toggle: toggleBookmark } = useBookmarks(ipc);
+  const { isBookmarked, toggle: toggleBookmark } = useBookmarksContext();
+  const { expandedPaths, expand, collapse, focusedPath, setFocusedPath } = useExplorerUi();
+  const bus = useWatcherBus();
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Tree keyboard navigation: roving tabindex over the rendered rows (the
+  // recursive render produces flat DOM order, so querySelectorAll walks the
+  // visible tree top-to-bottom).
+  const onTreeKeyDown = React.useCallback(
+    (e: React.KeyboardEvent) => {
+      const container = containerRef.current;
+      if (!container) return;
+      const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-path]"));
+      if (rows.length === 0) return;
+      const currentIdx = rows.findIndex((r) => r.dataset.path === focusedPath);
+
+      const focusRow = (idx: number) => {
+        const row = rows[Math.max(0, Math.min(rows.length - 1, idx))];
+        if (!row) return;
+        setFocusedPath(row.dataset.path ?? null);
+        row.focus();
+        row.scrollIntoView({ block: "nearest" });
+      };
+
+      const current = currentIdx >= 0 ? rows[currentIdx] : null;
+      const currentPath = current?.dataset.path ?? null;
+      const isDir = current?.dataset.kind === "dir";
+
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          focusRow(currentIdx < 0 ? 0 : currentIdx + 1);
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          focusRow(currentIdx < 0 ? 0 : currentIdx - 1);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (isDir && currentPath) {
+            if (!expandedPaths.has(currentPath)) expand(currentPath);
+            else focusRow(currentIdx + 1); // first child is the next row
+          }
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          if (isDir && currentPath && expandedPaths.has(currentPath)) {
+            collapse(currentPath);
+          } else if (currentPath) {
+            // Move to the parent row.
+            const parent = dirname(currentPath);
+            const parentIdx = rows.findIndex((r) => r.dataset.path === parent);
+            if (parentIdx >= 0) focusRow(parentIdx);
+          }
+          break;
+        case "Home":
+          e.preventDefault();
+          focusRow(0);
+          break;
+        case "End":
+          e.preventDefault();
+          focusRow(rows.length - 1);
+          break;
+        case "Enter":
+        case " ":
+          e.preventDefault();
+          if (isDir && currentPath) {
+            if (expandedPaths.has(currentPath)) collapse(currentPath);
+            else expand(currentPath);
+          } else if (currentPath) {
+            onOpenFile?.(currentPath, openOptsFromClick(e));
+          }
+          break;
+      }
+    },
+    [focusedPath, setFocusedPath, expandedPaths, expand, collapse, onOpenFile],
+  );
 
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
@@ -210,21 +316,15 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
 
   const rootVersion = versions.get(root) ?? 0;
 
-  // Start the backend filesystem watcher for the current root. Replaces any
-  // previous watcher on the Rust side (see set_workspace_root in main.rs).
-  React.useEffect(() => {
-    if (!ipc.watchRoot) return;
-    void ipc.watchRoot(root).catch((e: unknown) => {
-      console.warn("vlerv: failed to start backend watcher for", root, e);
-    });
-  }, [ipc, root]);
-
   // Bridge backend events into the cache: invalidate the parent dir of the
-  // changed path so just that folder re-fetches.
-  const handleChange = React.useCallback((payload: TreeChangedPayload) => {
-    invalidate(parentDir(payload.path));
-  }, [invalidate]);
-  useWatcher(handleChange);
+  // changed path so just that folder re-fetches. (The backend watcher itself
+  // is started by WatcherProvider.)
+  React.useEffect(() => {
+    return bus.subscribe((change) => {
+      if (change.source !== "tree") return;
+      invalidate(dirname(change.path));
+    });
+  }, [bus, invalidate]);
 
   // Blank visible state when the user picks a different workspace folder, so
   // we don't briefly render stale entries under a new header.
@@ -261,7 +361,16 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
   return (
     <FolderCacheContext.Provider value={versions}>
       <RefreshContext.Provider value={refreshNonce}>
-      <div className="explorer">
+      <div
+        className="explorer"
+        role="tree"
+        aria-label="Workspace files"
+        ref={containerRef}
+        // Tab-reachable even before any row has been focused; the keydown
+        // handler treats "no focused row" as "start at the first row".
+        tabIndex={focusedPath ? -1 : 0}
+        onKeyDown={onTreeKeyDown}
+      >
         {sortEntries(entries).map((entry) =>
           entry.is_dir ? (
             <FolderNode
@@ -269,7 +378,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
               ipc={ipc}
               entry={entry}
               depth={0}
-              onSelectFile={onSelectFile}
+              onOpenFile={onOpenFile}
               selectedFile={selectedFile}
             />
           ) : (
@@ -277,7 +386,7 @@ export default function Explorer({ ipc, root, onSelectFile, selectedFile, refres
               key={entry.path}
               entry={entry}
               depth={0}
-              onSelectFile={onSelectFile}
+              onOpenFile={onOpenFile}
               selected={selectedFile === entry.path}
               bookmarked={isBookmarked(entry.path)}
               onToggleBookmark={(p) => void toggleBookmark(p)}

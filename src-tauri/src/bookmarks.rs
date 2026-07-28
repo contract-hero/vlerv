@@ -93,15 +93,12 @@ fn list_from_global() -> Vec<BookmarkEntry> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
-    use tempfile::TempDir;
 
     // Bookmarks mutate the process-global state object, so these tests must run
-    // serially and against an isolated state dir (mirrors lib.rs's pattern).
+    // serially and against the crate-shared isolated state dir.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        static STATE_DIR: OnceLock<TempDir> = OnceLock::new();
-        let dir = STATE_DIR.get_or_init(|| TempDir::new().expect("state tempdir"));
-        std::env::set_var("VLERV_STATE_DIR", dir.path());
+        crate::state_store::ensure_shared_test_state_dir();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
     }
 

@@ -13,15 +13,39 @@ const TEXT_EXTS = new Set([
   ".html", ".xml", ".svg",
 ]);
 
-const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"]);
+const IMAGE_EXTS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif",
+]);
 
-function extOf(path: string): string {
+export function extOf(path: string): string {
   const i = path.lastIndexOf(".");
   if (i < 0) return "";
   return path.slice(i).toLowerCase();
 }
 
-export function renderByExtension(payload: FilePayload): React.ReactElement {
+export function isHtmlPath(path: string): boolean {
+  const ext = extOf(path);
+  return ext === ".html" || ext === ".htm";
+}
+
+export interface RenderOptions {
+  /** Fired after async content (markdown) lands in the DOM — used by the
+   *  host to restore scroll position. */
+  onRendered?: () => void;
+}
+
+export function renderByExtension(
+  payload: FilePayload,
+  opts: RenderOptions = {},
+): React.ReactElement {
+  const ext = extOf(payload.path);
+
+  // Raster images arrive base64-encoded with is_binary=true — route them to
+  // the image renderer before the generic binary fallback.
+  if (IMAGE_EXTS.has(ext) && !payload.oversized) {
+    return <ImageRenderer payload={payload} />;
+  }
+
   if (payload.oversized || payload.is_binary) {
     return <MetadataRenderer
         path={payload.path}
@@ -31,18 +55,18 @@ export function renderByExtension(payload: FilePayload): React.ReactElement {
       />;
   }
 
-  const ext = extOf(payload.path);
-
-  if (ext === ".html" || ext === ".htm") {
+  if (isHtmlPath(payload.path)) {
     return <HtmlRenderer source={payload.content ?? ""} path={payload.path} />;
   }
 
   if (ext === ".md" || ext === ".markdown") {
-    return <MdRenderer source={payload.content ?? ""} path={payload.path} />;
-  }
-
-  if (IMAGE_EXTS.has(ext)) {
-    return <ImageRenderer payload={payload} />;
+    return (
+      <MdRenderer
+        source={payload.content ?? ""}
+        path={payload.path}
+        onRendered={opts.onRendered}
+      />
+    );
   }
 
   if (TEXT_EXTS.has(ext) || ext === "") {

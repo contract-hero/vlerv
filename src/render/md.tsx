@@ -1,16 +1,28 @@
 // Markdown renderer — marked + lazy shiki for code highlighting + lazy mermaid.
-// Renders the user's own trusted markdown from their workspace. The parsed
-// HTML is injected via DOMParser → importNode (no innerHTML assignment).
+// Markdown may come from anywhere (address bar, deep links, external tabs),
+// so raw HTML passthrough is sanitized before entering the host DOM. The
+// parsed HTML is injected via DOMParser → importNode (no innerHTML
+// assignment).
 import * as React from "react";
-import { marked } from "marked";
+import { Marked } from "marked";
+import markedKatex from "marked-katex-extension";
+import "katex/dist/katex.min.css";
 import { useTheme } from "../hooks/useTheme";
+
+// Module-level Marked instance with the KaTeX extension registered once.
+// $inline$ and $$block$$ math both render; throwOnError off so a bad
+// expression degrades to red TeX source instead of breaking the document.
+const md = new Marked(markedKatex({ throwOnError: false, nonStandard: true }));
 
 export interface MdRendererProps {
   source: string;
   path?: string;
+  /** Fired after the markdown DOM lands (before async shiki/mermaid passes)
+   *  so the host can restore scroll position. */
+  onRendered?: () => void;
 }
 
-export default function MdRenderer({ source, path }: MdRendererProps): React.ReactElement {
+export default function MdRenderer({ source, path, onRendered }: MdRendererProps): React.ReactElement {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [shikiReady, setShikiReady] = React.useState(false);
   const theme = useTheme();
@@ -42,6 +54,12 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
         return;
       }
 
+      const clickMods = {
+        meta: e.metaKey || e.ctrlKey,
+        shift: e.shiftKey,
+        middle: e.button === 1,
+      };
+
       // Any other scheme would otherwise blow away the host webview — block the
       // default and try to resolve it to a local file we can open in-place.
       e.preventDefault();
@@ -58,7 +76,7 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
         resolved = null;
       }
       if (resolved) {
-        window.postMessage({ type: "vlerv:navigate", path: resolved }, "*");
+        window.postMessage({ type: "vlerv:navigate", path: resolved, ...clickMods }, "*");
       }
     },
     [path],
@@ -70,16 +88,38 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
     if (!el) return;
     let cancelled = false;
 
-    const html = marked.parse(source, { gfm: true, breaks: false }) as string;
+    const html = md.parse(source, { gfm: true, breaks: false, async: false }) as string;
 
     while (el.firstChild) el.removeChild(el.firstChild);
     const doc = new DOMParser().parseFromString(`<div>${html}</div>`, "text/html");
+    // Markdown lands in the PRIVILEGED host DOM (Tauri IPC is in scope here),
+    // and marked passes raw HTML through unsanitized. DOMParser neuters
+    // <script>, but inline `onerror=` handlers and `javascript:` URLs still
+    // fire once nodes go live — strip them before importNode below.
+    for (const node of Array.from(doc.body.querySelectorAll("*"))) {
+      if (/^(SCRIPT|IFRAME|OBJECT|EMBED|BASE)$/.test(node.tagName)) {
+        node.remove();
+        continue;
+      }
+      for (const attr of Array.from(node.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value.replace(/[\s\u0000-\u001f]/g, "").toLowerCase();
+        const isUrlAttr =
+          name === "href" || name === "src" || name === "xlink:href" || name === "srcset";
+        if (name.startsWith("on") || (isUrlAttr && value.startsWith("javascript:"))) {
+          node.removeAttribute(attr.name);
+        }
+      }
+    }
     const wrapper = doc.body.firstChild;
     if (wrapper) {
       for (const child of Array.from(wrapper.childNodes)) {
         el.appendChild(document.importNode(child, true));
       }
     }
+
+    // Content is in the DOM — let the host restore scroll position.
+    onRendered?.();
 
     (async () => {
       // Shiki async pass for code blocks.
@@ -142,7 +182,7 @@ export default function MdRenderer({ source, path }: MdRendererProps): React.Rea
   return (
     <div
       data-testid="md-outer"
-      style={{ width: "100%", height: "100%", overflow: "auto" }}
+      style={{ width: "100%" }}
       onClickCapture={onClickCapture}
     >
       <div

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Vlervcode",
+  "productName": "Vlervtifacts",
   "version": "0.1.0",
   "identifier": "dev.vlerv.Vlervcode",
   "build": {
@@ -12,11 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "Vlervcode",
+        "title": "Vlervtifacts",
         "width": 1280,
         "height": 800,
         "minWidth": 640,
-        "minHeight": 400
+        "minHeight": 400,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

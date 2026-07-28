@@ -16,7 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 percent-encoding = "2"
-url = "2"
 dirs = "5"
 notify = "6"
 tauri = { version = "2", features = ["macos-private-api"] }
@@ -24,6 +23,8 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-drag = "2"
 tauri-plugin-opener = "2"
+base64 = "0.22"
+tauri-plugin-window-state = "2.4.1"
 
 # Share sheet (NSSharingServicePicker) bindings. Pinned to the same lines wry
 # uses (objc2 0.6 / objc2-* 0.3) so there's only one NSView type universe.

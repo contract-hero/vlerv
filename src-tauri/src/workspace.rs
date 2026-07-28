@@ -1,11 +1,11 @@
-// Workspace scanner — enumerates directory entries with lazy expansion and an
-// in-session cache.
+// Workspace scanner — enumerates directory entries with lazy expansion.
 //
 // Public API has two enumeration functions:
 //   - `list_workspace_roots`: dirs-only (sidebar's project list view).
 //   - `list_dir`: directories and files (project-tree view).
-// Both share the same ordering / hidden-grouping / default-ignore semantics
-// and the same in-session readdir cache.
+// Both share the same ordering / hidden-grouping / default-ignore semantics.
+// (The Scanner keeps per-directory readdir/skip COUNTERS for tests — it does
+// not cache directory contents.)
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -194,3 +194,183 @@ pub const DEFAULT_IGNORED: &[&str] = &[
     ".next",
     ".venv",
 ];
+
+/// Cap on entries returned by `list_files_recursive`. BFS order means the
+/// shallowest paths survive truncation — better quick-open hits.
+pub const MAX_INDEX_ENTRIES: usize = 20_000;
+
+/// Flat recursive file index for the quick-open (⌘P) palette.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIndex {
+    /// Canonical root the entries are relative to.
+    pub root: PathBuf,
+    /// '/'-separated paths relative to `root`, in BFS (shallow-first) order.
+    pub files: Vec<String>,
+    /// True iff the walk stopped at the entry cap.
+    pub truncated: bool,
+}
+
+/// Walk `root` breadth-first and return every file as a root-relative path.
+/// Skips `DEFAULT_IGNORED` names, hidden *directories* (dot-dirs are
+/// machinery), and symlinks (loop safety); keeps hidden *files* (dotfiles
+/// are often artifacts). Per-entry I/O errors are logged and skipped.
+pub fn list_files_recursive(root: &Path) -> Result<FileIndex, ScanError> {
+    walk_files(root, MAX_INDEX_ENTRIES)
+}
+
+fn walk_files(root: &Path, cap: usize) -> Result<FileIndex, ScanError> {
+    use std::collections::VecDeque;
+
+    let canonical = canonicalize(root)?;
+    let mut files = Vec::new();
+    let mut truncated = false;
+    let mut queue: VecDeque<PathBuf> = VecDeque::from([canonical.clone()]);
+
+    'walk: while let Some(dir) = queue.pop_front() {
+        let read_iter = match std::fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(e) => {
+                eprintln!("vlerv: walk skip dir {dir:?}: {e}");
+                continue;
+            }
+        };
+        for raw in read_iter {
+            let raw = match raw {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("vlerv: walk skip entry in {dir:?}: {e}");
+                    continue;
+                }
+            };
+            let name = raw.file_name().to_string_lossy().into_owned();
+            if DEFAULT_IGNORED.contains(&name.as_str()) {
+                continue;
+            }
+            // file_type() does NOT follow symlinks — skip them entirely for
+            // loop safety (a symlinked artifact can still be opened via ⌘O).
+            let file_type = match raw.file_type() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("vlerv: walk skip entry {:?}: {e}", raw.path());
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !name.starts_with('.') {
+                    queue.push_back(raw.path());
+                }
+                continue;
+            }
+            if files.len() >= cap {
+                truncated = true;
+                break 'walk;
+            }
+            let rel = raw
+                .path()
+                .strip_prefix(&canonical)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| raw.path().to_string_lossy().into_owned());
+            files.push(rel);
+        }
+    }
+
+    Ok(FileIndex {
+        root: canonical,
+        files,
+        truncated,
+    })
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x").unwrap();
+    }
+
+    #[test]
+    fn returns_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("a.html"));
+        touch(&dir.path().join("sub/b.md"));
+
+        let idx = list_files_recursive(dir.path()).unwrap();
+        let mut files = idx.files.clone();
+        files.sort();
+        assert_eq!(files, vec!["a.html", "sub/b.md"]);
+        assert!(!idx.truncated);
+    }
+
+    #[test]
+    fn ignored_dirs_are_excluded() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("keep.ts"));
+        touch(&dir.path().join("node_modules/dep/index.js"));
+        touch(&dir.path().join(".git/HEAD"));
+
+        let idx = list_files_recursive(dir.path()).unwrap();
+        assert_eq!(idx.files, vec!["keep.ts"]);
+    }
+
+    #[test]
+    fn truncates_at_cap() {
+        let dir = TempDir::new().unwrap();
+        for i in 0..5 {
+            touch(&dir.path().join(format!("f{i}.txt")));
+        }
+
+        let idx = walk_files(dir.path(), 3).unwrap();
+        assert_eq!(idx.files.len(), 3);
+        assert!(idx.truncated);
+    }
+
+    #[test]
+    fn truncation_keeps_shallow_paths_bfs() {
+        // The BFS order is the design goal: shallow paths must survive
+        // truncation (better quick-open hits). A depth-first walk would pass
+        // the flat truncates_at_cap test above but fail this one.
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("a.txt"));
+        touch(&dir.path().join("b.txt"));
+        touch(&dir.path().join("deep/d1.txt"));
+        touch(&dir.path().join("deep/deeper/d2.txt"));
+
+        let idx = walk_files(dir.path(), 3).unwrap();
+        assert!(idx.truncated);
+        assert!(idx.files.contains(&"a.txt".to_string()));
+        assert!(idx.files.contains(&"b.txt".to_string()));
+        assert!(
+            !idx.files.iter().any(|f| f.starts_with("deep/deeper/")),
+            "deepest path must be the one truncated away"
+        );
+    }
+
+    #[test]
+    fn hidden_dirs_skipped_hidden_files_kept() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join(".claude/settings.json"));
+        touch(&dir.path().join(".env"));
+        touch(&dir.path().join("visible.md"));
+
+        let idx = list_files_recursive(dir.path()).unwrap();
+        let mut files = idx.files.clone();
+        files.sort();
+        assert_eq!(files, vec![".env", "visible.md"]);
+    }
+
+    #[test]
+    fn symlinked_dirs_not_followed() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("real/file.txt"));
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("loop")).unwrap();
+
+        let idx = list_files_recursive(dir.path()).unwrap();
+        assert_eq!(idx.files, vec!["real/file.txt"]);
+    }
+}
