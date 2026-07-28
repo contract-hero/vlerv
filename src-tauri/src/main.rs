@@ -42,6 +42,14 @@ fn read_file(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn list_files_recursive(
+    path: String,
+) -> Result<src_tauri::workspace::FileIndex, String> {
+    src_tauri::workspace::list_files_recursive(std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
+}
+
 // ─── state_store + recents + bookmarks IPC ───────────────────────────────────
 // These wrap the existing module functions as Tauri commands. The frontend
 // (src/ipc.ts, src/hooks/useSettings.ts, src/hooks/useRecents.ts,
@@ -163,6 +171,7 @@ fn main() {
             list_dir,
             list_workspace_roots,
             read_file,
+            list_files_recursive,
             set_workspace_root,
             get_state,
             set_state_field,
