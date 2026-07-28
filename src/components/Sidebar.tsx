@@ -7,6 +7,7 @@ import type { IpcSurface } from "../ipc";
 import Explorer from "./Explorer";
 import Bookmarks from "./Bookmarks";
 import { useWorkspace } from "../state/workspace";
+import { basename } from "../utils/path";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
 export interface SidebarProps {
@@ -58,7 +59,7 @@ export default function Sidebar({
     );
   }
 
-  const folderName = workspaceRoot.replace(/^.*\//, "") || workspaceRoot;
+  const folderName = basename(workspaceRoot);
 
   return (
     <div className="sidebar">

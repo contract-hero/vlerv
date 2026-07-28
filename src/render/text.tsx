@@ -27,7 +27,7 @@ export default function TextRenderer({ source, path }: TextRendererProps): React
     return <ShikiBlock code={source} lang={lang} />;
   }
   return (
-    <pre data-fallback="monospace" style={{ fontFamily: '"SF Mono", ui-monospace, monospace' }}>
+    <pre data-fallback="monospace" style={{ fontFamily: "var(--font-mono)" }}>
       <code>{source}</code>
     </pre>
   );

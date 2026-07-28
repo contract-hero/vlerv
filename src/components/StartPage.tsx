@@ -6,21 +6,13 @@ import { useBookmarksContext } from "../state/bookmarks-context";
 import { FileGlyph } from "./FileIcon";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { openOptsFromClick } from "../state/TabsProvider";
+import { basename, dirname } from "../utils/path";
 
 export interface StartPageProps {
   onOpenFile: (path: string, opts?: OpenFileOptions) => void;
   onPickFile: () => void;
   onPickWorkspace: () => void;
   workspaceRoot: string | null;
-}
-
-function basename(path: string): string {
-  return path.replace(/^.*\//, "") || path;
-}
-
-function dirname(path: string): string {
-  const idx = path.lastIndexOf("/");
-  return idx <= 0 ? "/" : path.slice(0, idx);
 }
 
 function FileList({

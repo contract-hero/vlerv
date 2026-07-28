@@ -4,8 +4,10 @@ import { Search } from "lucide-react";
 import type { IpcSurface } from "../ipc";
 import { fuzzyFilter } from "../utils/fuzzy";
 import { useWatcherBus } from "../state/watcher-bus";
+import { openOptsFromClick } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { FileGlyph } from "./FileIcon";
+import { basename } from "../utils/path";
 
 const RESULT_LIMIT = 50;
 
@@ -96,7 +98,7 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
       e.preventDefault();
       const hit = results[selectedIndex];
       if (hit) {
-        open(hit.value, e.metaKey || e.ctrlKey ? { newTab: true, background: !e.shiftKey } : undefined);
+        open(hit.value, openOptsFromClick(e));
       }
     }
   };
@@ -131,18 +133,13 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
               aria-selected={i === selectedIndex}
               className={i === selectedIndex ? "selected" : undefined}
               onMouseEnter={() => setSelectedIndex(i)}
-              onClick={(e) =>
-                open(
-                  r.value,
-                  e.metaKey || e.ctrlKey ? { newTab: true, background: !e.shiftKey } : undefined,
-                )
-              }
+              onClick={(e) => open(r.value, openOptsFromClick(e))}
               title={`${root}/${r.value}`}
             >
               <span className="quick-open-icon" aria-hidden>
-                <FileGlyph name={r.value.replace(/^.*\//, "")} size={14} />
+                <FileGlyph name={basename(r.value)} size={14} />
               </span>
-              <span className="quick-open-name">{r.value.replace(/^.*\//, "")}</span>
+              <span className="quick-open-name">{basename(r.value)}</span>
               <span className="quick-open-dir">{r.value.includes("/") ? r.value.slice(0, r.value.lastIndexOf("/")) : ""}</span>
             </li>
           ))}

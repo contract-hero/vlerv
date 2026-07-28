@@ -9,11 +9,12 @@ import { FileGlyph } from "./FileIcon";
 import { useContextMenu } from "./ContextMenu";
 import { useFileMenu } from "../hooks/useFileMenu";
 import type { OpenFileOptions } from "../state/TabsProvider";
+import { basename } from "../utils/path";
 
 function tabTitle(tab: Tab): string {
   const entry = currentEntry(tab);
   if (!entry) return "New Tab";
-  return entry.path.replace(/^.*\//, "") || entry.path;
+  return basename(entry.path);
 }
 
 export interface TabStripProps {

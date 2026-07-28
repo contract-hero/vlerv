@@ -8,6 +8,7 @@ import { useBookmarksContext } from "../state/bookmarks-context";
 import { openOptsFromClick } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { useContextMenu } from "./ContextMenu";
+import { basename } from "../utils/path";
 import { useFileMenu } from "../hooks/useFileMenu";
 
 const COLLAPSED_KEY = "vlerv.bookmarks.collapsed";
@@ -148,12 +149,12 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
               style={{ cursor: "pointer" }}
               title={`${entry.path}\n(drag to reorder)`}
             >
-              <span className="bookmark-label">{entry.path.replace(/^.*\//, "")}</span>
+              <span className="bookmark-label">{basename(entry.path)}</span>
               <button
                 type="button"
                 className="bookmark-remove"
                 title="Remove bookmark"
-                aria-label={`Remove bookmark ${entry.path.replace(/^.*\//, "")}`}
+                aria-label={`Remove bookmark ${basename(entry.path)}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   void remove(entry.path);

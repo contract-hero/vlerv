@@ -9,6 +9,7 @@ import { useWatcherBus } from "../state/watcher-bus";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { useExplorerUi } from "../state/explorer-ui";
 import { openOptsFromClick } from "../state/TabsProvider";
+import { dirname } from "../utils/path";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { useContextMenu } from "./ContextMenu";
 import { useFileMenu } from "../hooks/useFileMenu";
@@ -22,12 +23,6 @@ const FolderCacheContext = React.createContext<ReadonlyMap<string, number>>(new 
 // on it, so bumping it (via the sidebar Refresh button) re-fetches every
 // expanded folder at once while preserving each node's expansion state.
 const RefreshContext = React.createContext<number>(0);
-
-// POSIX dirname. macOS-only app, so `/` separator is safe.
-function parentDir(absPath: string): string {
-  const idx = absPath.lastIndexOf("/");
-  return idx <= 0 ? "/" : absPath.slice(0, idx);
-}
 
 // Drag-preview icon: resolved from the bundled `resources` declaration in
 // tauri.conf.json. Cached on first call so subsequent drags don't hit IPC.
@@ -283,7 +278,7 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
             collapse(currentPath);
           } else if (currentPath) {
             // Move to the parent row.
-            const parent = parentDir(currentPath);
+            const parent = dirname(currentPath);
             const parentIdx = rows.findIndex((r) => r.dataset.path === parent);
             if (parentIdx >= 0) focusRow(parentIdx);
           }
@@ -303,10 +298,7 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
             if (expandedPaths.has(currentPath)) collapse(currentPath);
             else expand(currentPath);
           } else if (currentPath) {
-            onOpenFile?.(
-              currentPath,
-              e.metaKey || e.ctrlKey ? { newTab: true, background: !e.shiftKey } : undefined,
-            );
+            onOpenFile?.(currentPath, openOptsFromClick(e));
           }
           break;
       }
@@ -330,7 +322,7 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
   React.useEffect(() => {
     return bus.subscribe((change) => {
       if (change.source !== "tree") return;
-      invalidate(parentDir(change.path));
+      invalidate(dirname(change.path));
     });
   }, [bus, invalidate]);
 

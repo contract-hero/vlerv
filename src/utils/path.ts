@@ -8,6 +8,17 @@
  * are known edge cases. The Rust security gate (`canonicalize_and_check_root`)
  * is the authoritative check for any code path that actually reads the file.
  */
+/** Final path component (POSIX — macOS-only app). */
+export function basename(path: string): string {
+  return path.replace(/^.*\//, "") || path;
+}
+
+/** Containing directory (POSIX). Root-level paths return "/". */
+export function dirname(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx <= 0 ? "/" : path.slice(0, idx);
+}
+
 export function isUnderRoot(path: string, root: string | null | undefined): boolean {
   if (!root) return false;
   const normalized = root.endsWith("/") ? root : `${root}/`;
