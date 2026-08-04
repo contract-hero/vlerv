@@ -1,27 +1,51 @@
 /*
- * Vlervtifacts design system — "a reading room for artifacts".
+ * Vlervtifacts design system — Linear.
  *
- * Identity: warm ink & paper neutrals (not editor blue-grey), one signature
- * "lamplight" amber accent used sparingly (active-tab underline, focus rings,
- * bookmark stars, resizer), native New York serif for the wordmark. The
- * chrome recedes; the artifact is the hero.
+ * Identity: a near-black canvas (#010102) with a four-step surface ladder,
+ * 1px hairline borders instead of shadows, one lavender-blue accent
+ * (#5e6ad2) spent only on brand, focus, links and the "current object"
+ * marker, and SF Pro display type at weight 500-600 with negative tracking.
+ * The chrome is a dark frame; the artifact is the protagonist.
+ *
+ * Plane order, deepest first: the reading field (--bg) sits at canvas depth
+ * and the chrome (--bg-chrome) lifts one step above it. This inverts the
+ * previous system on purpose — it puts the artifact on the deepest surface,
+ * so a self-contained HTML page reads as a lifted panel inside a dark frame.
  *
  * Theme tokens — useTheme() sets `<html data-theme="dark|light">`. The dark
  * block doubles as the pre-hydration fallback so there is no flash of
- * unstyled values.
+ * unstyled values. Linear ships no light marketing surface; the light theme
+ * here is derived from its documented inverse tokens (inverse-canvas,
+ * inverse-surface-1/2, inverse-ink) because macOS system appearance is a
+ * design surface for this app (PRODUCT.md, Operating Context).
  */
 :root,
 :root[data-theme="dark"] {
-  /* type */
-  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
-  --font-display: "New York", ui-serif, Georgia, serif;
-  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 15px;
+  /* type — Linear Display / Linear Text are proprietary; on macOS the
+     documented substitute is SF Pro, which -apple-system resolves to
+     exactly. Inter is the cross-platform fallback the source names. */
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, system-ui, sans-serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+
+  /* Linear's scale is a marketing scale; the chrome of a dense desktop app
+     lives one step below its body size. --text-ui (13px) is the chrome
+     default, --text-body-sm (14px) is Linear body-sm for rows and buttons,
+     --text-body (16px) is Linear body and belongs to the reading field. */
+  --text-caption: 12px;
+  --text-ui: 13px;
+  --text-body-sm: 14px;
+  --text-body: 16px;
+
+  /* Display tracking pulls negative as size grows; the eyebrow pulls
+     positive, which is what marks it as taxonomy rather than voice. */
+  --track-display: -0.03em;
+  --track-headline: -0.02em;
+  --track-body: -0.003em;
+  --track-eyebrow: 0.4px;
+
   font-family: var(--font-ui);
-  font-size: var(--text-base);
+  font-size: var(--text-ui);
 
   /* space & shape */
   --space-1: 4px;
@@ -30,104 +54,139 @@
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
-  --r-sm: 4px;
-  --r-md: 6px;
-  --r-lg: 10px;
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 9999px;
 
   /* motion */
   --dur-fast: 80ms;
   --dur: 160ms;
   --ease: cubic-bezier(0.2, 0, 0.2, 1);
 
-  /* elevation */
-  --shadow-menu: 0 8px 28px rgba(12, 9, 5, 0.45);
-  --shadow-overlay: 0 16px 48px rgba(12, 9, 5, 0.55);
+  /* elevation — Linear carries depth with the surface ladder and hairlines,
+     and resists drop shadows on dark almost entirely. Shadows survive here
+     only on true floating overlays (menu, quick open, toast), which have no
+     surface below them to lift against. The signature detail is the edge
+     highlight: a 1px white line on the top edge of a lifted panel. */
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.6);
+  --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.7);
+  --edge-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
-  /* ink palette
-     Plane order, darkest to lightest: chrome (--bg-sidebar) sits BEHIND the
-     reading field (--bg), and detached surfaces (--bg-elevated) sit above it.
-     The steps are deliberately wide enough to read as separate planes without
-     a shadow — see DESIGN.md, "Elevation & Depth". */
   color-scheme: dark;
-  --bg: #1c1a17;
-  --bg-sidebar: #100e0c;
-  --bg-elevated: #292520;
-  --bg-row-hover: #26221d;
-  --bg-row-selected: #322b21;
-  --fg: #d8d2c6;
-  --fg-muted: #968e7f;
-  --fg-dim: #6b6458;
-  /* Paths carry the information that tells two same-named artifacts apart, so
-     they get their own token at >=4.5:1 on every surface they land on rather
-     than borrowing --fg-dim (2.6:1 on --bg-elevated). */
-  --fg-path: #a49b8a;
-  --heading-fg: #ece6da;
-  --border: #413a31;
-  --accent: #dda355;
-  --accent-strong: #e8b56d;
-  --code-bg: #262219;
-  --code-fg: #e3c893;
-  --pre-bg: #141210;
-  --button-hover-bg: #3a342b;
-  --error-fg: #e08a7a;
-  --label-active-fg: #f4efe6;
-  --scrollbar-thumb: #363028;
-  --scrollbar-thumb-hover: #453d32;
+  /* surface ladder: canvas -> 1 -> 2 -> 3 -> 4 */
+  --bg: #010102;
+  --bg-chrome: #0f1011;
+  --bg-row-hover: #141516;
+  --bg-elevated: #18191a;
+  --bg-row-selected: #191a1b;
+
+  /* ink ladder */
+  --fg: #f7f8f8;
+  --heading-fg: #f7f8f8;
+  --fg-strong: #d0d6e0;
+  --fg-muted: #8a8f98;
+  --fg-dim: #62666d;
+  /* Paths carry the information that tells two same-named artifacts apart.
+     In the previous palette they needed a token of their own to clear
+     4.5:1; --fg-muted clears it on every surface in this ladder (5.36:1 on
+     the lightest, --bg-row-selected), so the token stays as the place that
+     constraint is checked rather than as a separate value. Aliased, not
+     copied, so the two cannot drift apart in one theme only. */
+  --fg-path: var(--fg-muted);
+  --empty-fg: var(--fg-muted);
+  --label-active-fg: #ffffff;
+
+  /* hairlines carry every boundary in the system */
+  --border: #23252a;
+  --border-strong: #34343a;
+  --border-tertiary: #3e3e44;
+
+  /* the one chromatic accent */
+  --accent: #5e6ad2;
+  --accent-strong: #828fff;
+  --accent-focus: #5e69d1;
+  --on-accent: #ffffff;
+
+  /* semantic — the source has no error color (Known Gaps); #eb5757 is
+     Linear's in-product red and clears 5.9:1 on canvas. Linear's one
+     documented semantic, success green, has no role in this product yet and
+     so is recorded in DESIGN.md rather than declared here. */
+  --error-fg: #eb5757;
+
+  --code-bg: #141516;
+  /* Code and badge text are the reading-field ink step in both themes —
+     aliased so a change to the ink ladder carries into both. */
+  --code-fg: var(--fg-strong);
+  --pre-bg: #0f1011;
+  --button-hover-bg: #23252a;
+  --scrollbar-thumb: #2c2e33;
+  --scrollbar-thumb-hover: #3e3e44;
   /* The artifact iframe paints AFTER its srcdoc loads. A white value here
      flashes on every open and on every live reload; matching the reading
-     field makes the swap invisible. */
+     field makes the swap invisible. Must track render/html.tsx themeStyle(). */
   --iframe-bg: var(--bg);
-  --badge-bg: #322b21;
-  --badge-fg: #dda355;
-  --empty-fg: #968e7f;
-  --input-bg: #0c0a08;
-  --input-border: #3b352c;
-  --input-border-focus: #dda355;
-  --resizer-hover: #dda355;
-  --star-active: #dda355;
-  --star-idle: #4d463c;
+  --badge-bg: #18191a;
+  --badge-fg: var(--fg-strong);
+  --input-bg: #0f1011;
+  --input-border: #23252a;
+  --input-border-focus: var(--accent-focus);
+  /* Both mark an object the user singled out, so both ARE the accent
+     rather than a copy of its value (DESIGN.md, The One Lavender Rule). */
+  --resizer-hover: var(--accent);
+  --star-active: var(--accent);
+  --star-idle: var(--border-tertiary);
+  --overlay-scrim: rgba(0, 0, 0, 0.6);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --shadow-menu: 0 8px 28px rgba(60, 48, 30, 0.18);
-  --shadow-overlay: 0 16px 48px rgba(60, 48, 30, 0.25);
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.18);
+  --edge-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.9);
 
-  /* paper palette */
-  --bg: #faf8f4;
-  --bg-sidebar: #f1ede5;
+  /* Derived from the inverse ladder. The plane relationship is preserved:
+     the reading field is the extreme (white), the chrome one step in.
+     The source's inverse-surface-1 (#f5f6f6) sits only 2% off white, which
+     on a full window reads as one flat field rather than as two planes, so
+     the chrome and the hairlines each take one extra step here. */
+  --bg: #ffffff;
+  --bg-chrome: #f0f1f3;
+  --bg-row-hover: #e5e7eb;
   --bg-elevated: #ffffff;
-  --bg-row-hover: #e9e3d7;
-  --bg-row-selected: #eeddbe;
-  --fg: #33302a;
-  --fg-muted: #7c7568;
-  --fg-dim: #a39a8a;
-  --fg-path: #655e50;
-  --heading-fg: #211e19;
-  --border: #cdc3b2;
-  --accent: #9a6a1e;
-  --accent-strong: #7d5517;
-  --code-bg: #efe9dc;
-  --code-fg: #7a5218;
-  --pre-bg: #f4f1ea;
-  --button-hover-bg: #ded6c6;
-  --error-fg: #b5493a;
-  --label-active-fg: #14120e;
-  --scrollbar-thumb: #cfc7b8;
-  --scrollbar-thumb-hover: #b8ae9c;
-  /* Must match the background themeStyle() injects into the artifact
-     document (render/html.tsx) — that value is #ffffff in light, so pointing
-     this at --bg (#faf8f4) would trade one visible step for another. */
+  --bg-row-selected: #dcdfe6;
+
+  --fg: #08090a;
+  --heading-fg: #000000;
+  --fg-strong: #34343a;
+  --fg-muted: #5f636b;
+  --fg-dim: #8a8f98;
+  --label-active-fg: #000000;
+
+  --border: #dcdee3;
+  --border-strong: #c5c8d0;
+  --border-tertiary: #b4b7c0;
+
+  /* #5e6ad2 holds 4.7:1 on white, so the accent does not change hue across
+     themes; only the emphasis step darkens. */
+  --accent: #5e6ad2;
+  --accent-strong: #4a55b8;
+  --accent-focus: #5e69d1;
+
+  --error-fg: #c02a2a;
+
+  --code-bg: #eceef1;
+  --pre-bg: #f6f7f9;
+  --button-hover-bg: #dcdfe6;
+  --scrollbar-thumb: #c5c8d0;
+  --scrollbar-thumb-hover: #a8abb3;
   --iframe-bg: #ffffff;
-  --badge-bg: #efe4cd;
-  --badge-fg: #8a5f1b;
-  --empty-fg: #8a8274;
+  --badge-bg: #e5e7eb;
   --input-bg: #ffffff;
-  --input-border: #d5cdbe;
-  --input-border-focus: #9a6a1e;
-  --resizer-hover: #9a6a1e;
-  --star-active: #b07c25;
-  --star-idle: #c9c0af;
+  --input-border: #c5c8d0;
+  --input-border-focus: var(--accent-focus);
+  --overlay-scrim: rgba(0, 0, 0, 0.25);
 }
 
 * { box-sizing: border-box; }
@@ -139,15 +198,19 @@ html, body, #root {
   overflow: hidden;
   background: var(--bg);
   color: var(--fg);
+  letter-spacing: var(--track-body);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Visible keyboard focus everywhere, in the accent. */
+/* Linear specifies a 2px primary-focus ring at 50% opacity. At 50% over a
+   #010102 canvas that lands near 1.9:1 against the surface it marks, below
+   the 3:1 a focus indicator has to hold, so the ring ships solid in the
+   focus tint. The size, color and role are the source's; the alpha is not. */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-focus);
   outline-offset: -2px;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -158,26 +221,25 @@ html, body, #root {
   }
 }
 
+/* The window is a column: one full-width tab strip, then the pane row. */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+}
+
 .app {
   display: flex;
   flex-direction: row;
-  width: 100vw;
-  height: 100vh;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
 }
 
 .pane {
   height: 100%;
   overflow: auto;
-}
-
-/* ── Overlay title bar ─────────────────────────────────────────────────── */
-/* Draggable strip at the top of the sidebar, under the macOS traffic
-   lights (titleBarStyle: Overlay). Same height as the tab strip so the two
-   top borders align across the window. */
-.titlebar-drag {
-  flex: 0 0 38px;
-  height: 38px;
-  border-bottom: 1px solid var(--border);
 }
 
 .pane-sidebar {
@@ -186,21 +248,37 @@ html, body, #root {
   min-width: 200px;
   max-width: 480px;
   flex-shrink: 0;
-  background: var(--bg-sidebar);
+  background: var(--bg-chrome);
   border-right: 1px solid var(--border);
   position: relative;
 }
 
+/* The handle is an OVERLAY, not a column. As a 6px flex item it opened a
+   transparent gap between the sidebar and the preview pane that ran the full
+   height of the pane row — including straight through the 40px chrome band,
+   where it broke the single unbroken rule that height exists to produce. It now takes no width in the layout and carries its 6px
+   pointer target in a pseudo-element straddling the seam. */
 .sidebar-resizer {
-  flex: 0 0 6px;
-  width: 6px;
+  flex: 0 0 0;
+  width: 0;
   height: 100%;
+  position: relative;
+  z-index: 5;
+  cursor: col-resize;
+}
+.sidebar-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
   cursor: col-resize;
   background: transparent;
   transition: background var(--dur) var(--ease);
 }
-.sidebar-resizer:hover,
-.sidebar-resizer.dragging {
+.sidebar-resizer:hover::before,
+.sidebar-resizer.dragging::before {
   background: var(--resizer-hover);
   opacity: 0.6;
 }
@@ -217,18 +295,35 @@ html, body, #root {
 }
 
 /* ── Tab strip ─────────────────────────────────────────────────────────── */
+/* Spans the whole window above both panes. It is also the overlay title bar
+   (titleBarStyle: Overlay), so it drags the window and reserves a gutter for
+   the macOS traffic lights before the first tab. */
 .tab-strip {
   display: flex;
   align-items: stretch;
   flex: 0 0 38px;
   min-height: 38px;
-  background: var(--bg-sidebar);
+  width: 100%;
+  background: var(--bg-chrome);
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
   overflow-y: hidden;
   user-select: none;
 }
 .tab-strip::-webkit-scrollbar { height: 0; }
+/* Width of the macOS traffic lights plus their inset. */
+.titlebar-gutter {
+  /* Sticky, not in-flow: the strip scrolls horizontally, and a scrolled-away
+     gutter would slide tabs under the traffic lights and cost the window its
+     only drag surface. Opaque so tabs pass behind it. */
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--bg-chrome);
+  flex: 0 0 78px;
+  width: 78px;
+  height: 100%;
+}
 .tab {
   display: flex;
   align-items: center;
@@ -236,7 +331,7 @@ html, body, #root {
   padding: 0 var(--space-2) 0 var(--space-3);
   max-width: 220px;
   min-width: 110px;
-  font-size: var(--text-sm);
+  font-size: var(--text-ui);
   color: var(--fg-muted);
   border-right: 1px solid var(--border);
   cursor: default;
@@ -245,11 +340,15 @@ html, body, #root {
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tab:hover { background: var(--bg-row-hover); }
+/* The active tab drops to canvas depth. The strip now spans the window, so
+   the tab no longer joins the reading field below it — a 40px band sits
+   between them. The canvas fill and the lavender rule carry the state. */
 .tab.active {
   background: var(--bg);
   color: var(--fg);
 }
-/* Signature: the lamplight underline on the active tab. */
+/* Signature: the lavender rule on the active tab. Along with the selected
+   explorer row, this is the system's "current object" marker. */
 .tab.active::after {
   content: "";
   position: absolute;
@@ -276,7 +375,7 @@ html, body, #root {
   flex: 0 0 auto;
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: var(--r-pill);
   background: var(--accent);
   animation: tab-pulse 1s var(--ease) infinite;
 }
@@ -292,7 +391,7 @@ html, body, #root {
   width: 18px;
   height: 18px;
   border: 0;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
   background: transparent;
   color: var(--fg-dim);
   cursor: pointer;
@@ -327,7 +426,7 @@ html, body, #root {
   flex: 0 0 40px;
   min-height: 40px;
   padding: 0 var(--space-2);
-  background: var(--bg-sidebar);
+  background: var(--bg-chrome);
   border-bottom: 1px solid var(--border);
 }
 .toolbar-button {
@@ -337,13 +436,13 @@ html, body, #root {
   width: 28px;
   height: 28px;
   border: 0;
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--fg-muted);
   cursor: pointer;
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-.toolbar-button:hover:not(:disabled) { background: var(--bg-row-hover); color: var(--fg); }
+.toolbar-button:hover:not(:disabled) { background: var(--button-hover-bg); color: var(--fg); }
 .toolbar-button:disabled { color: var(--fg-dim); opacity: 0.5; cursor: default; }
 .toolbar-button.star-active { color: var(--star-active); }
 /* Navigation and file actions are different jobs. Without a separator the
@@ -372,9 +471,9 @@ html, body, #root {
   color: var(--fg);
   border: 1px solid var(--input-border);
   border-radius: var(--r-md);
-  padding: 5px 10px;
+  padding: 5px 12px;
   font: inherit;
-  font-size: var(--text-sm);
+  font-size: var(--text-ui);
   font-family: var(--font-mono);
   outline: none;
   transition: border-color var(--dur-fast) var(--ease);
@@ -390,18 +489,20 @@ html, body, #root {
   border-radius: var(--r-sm);
   padding: 3px 8px;
   color: var(--error-fg);
-  font-size: var(--text-xs);
+  font-size: var(--text-caption);
 }
+/* status-badge: pill, surface-2 fill, caption type. */
 .toolbar-zoom {
   flex: 0 0 auto;
   border: 0;
-  border-radius: var(--r-md);
+  border-radius: var(--r-pill);
   background: var(--badge-bg);
-  color: var(--fg-muted);
+  color: var(--badge-fg);
   font: inherit;
-  font-size: var(--text-xs);
-  padding: 3px 8px;
+  font-size: var(--text-caption);
+  padding: 2px 8px;
   cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
 }
 .toolbar-zoom:hover { color: var(--fg); }
 
@@ -420,11 +521,11 @@ html, body, #root {
   max-width: min(520px, calc(100% - var(--space-6)));
   padding: 8px 8px 8px 12px;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
-  box-shadow: var(--shadow-menu);
+  box-shadow: var(--shadow-menu), var(--edge-highlight);
   color: var(--error-fg);
-  font-size: var(--text-sm);
+  font-size: var(--text-ui);
   animation: notice-rise 160ms var(--ease);
 }
 @keyframes notice-rise {
@@ -440,7 +541,7 @@ html, body, #root {
   width: 20px;
   height: 20px;
   border: 0;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
   background: transparent;
   color: var(--fg-muted);
   cursor: pointer;
@@ -470,9 +571,9 @@ html, body, #root {
 
 .preview-badge-external {
   display: inline-block;
-  padding: 2px 6px;
-  font-size: 0.75em;
-  border-radius: var(--r-sm);
+  padding: 2px 8px;
+  font-size: var(--text-caption);
+  border-radius: var(--r-pill);
   background: var(--badge-bg);
   color: var(--badge-fg);
   vertical-align: middle;
@@ -493,9 +594,16 @@ html, body, #root {
   text-align: center;
   padding: var(--space-5);
 }
-.file-notice-title { font-size: var(--text-md); font-weight: 600; color: var(--fg); margin: 0; }
+.file-notice-title {
+  font-family: var(--font-display);
+  font-size: var(--text-body);
+  font-weight: 600;
+  letter-spacing: var(--track-headline);
+  color: var(--heading-fg);
+  margin: 0;
+}
 .file-notice-path,
-.file-notice-hint { max-width: 60ch; font-size: var(--text-sm); }
+.file-notice-hint { max-width: 60ch; font-size: var(--text-body-sm); }
 .file-notice-path {
   font-family: var(--font-mono);
   color: var(--fg-path);
@@ -531,33 +639,53 @@ html, body, #root {
 :root[data-theme="light"] [data-testid="html-renderer"] > iframe { color-scheme: light; }
 
 /* ── Markdown rendering ───────────────────────────────────────────────── */
+/* The reading field runs Linear body: 16px / 1.5 / -0.05px. Headings step
+   up to the display cut at weight 600 with tracking pulling negative as
+   size grows. */
 [data-testid="md-content"] {
-  color: var(--fg);
-  font-size: 15.5px;
-  line-height: 1.65;
+  color: var(--fg-strong);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  letter-spacing: var(--track-body);
 }
 [data-testid="md-content"] h1,
 [data-testid="md-content"] h2,
 [data-testid="md-content"] h3,
 [data-testid="md-content"] h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
   color: var(--heading-fg);
   margin-top: 1.6em;
   margin-bottom: 0.6em;
-  line-height: 1.25;
+  line-height: 1.2;
 }
-[data-testid="md-content"] h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
-[data-testid="md-content"] h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
-[data-testid="md-content"] h3 { font-size: 1.25em; }
+[data-testid="md-content"] h1 {
+  font-size: 2em;
+  letter-spacing: var(--track-display);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+[data-testid="md-content"] h2 {
+  font-size: 1.5em;
+  letter-spacing: var(--track-headline);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+[data-testid="md-content"] h3 { font-size: 1.25em; letter-spacing: var(--track-headline); }
+[data-testid="md-content"] h4 { font-size: 1em; letter-spacing: 0; }
 [data-testid="md-content"] p { margin: 0.6em 0; }
-[data-testid="md-content"] a { color: var(--accent); text-decoration: none; }
-[data-testid="md-content"] a:hover { text-decoration: underline; color: var(--accent-strong); }
+/* Link emphasis is one of the four jobs the accent is allowed to do. The
+   lighter step carries it: #5e6ad2 lands at 4.4:1 on canvas, just under the
+   4.5:1 body text has to hold; #828fff clears 7.2:1. */
+[data-testid="md-content"] a { color: var(--accent-strong); text-decoration: none; }
+[data-testid="md-content"] a:hover { text-decoration: underline; }
 [data-testid="md-content"] code {
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: 0.85em;
   background: var(--code-bg);
   color: var(--code-fg);
   padding: 0.15em 0.4em;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
 }
 [data-testid="md-content"] pre {
   background: var(--pre-bg);
@@ -570,14 +698,14 @@ html, body, #root {
 [data-testid="md-content"] pre code {
   background: transparent;
   padding: 0;
-  font-size: 13.5px;
-  color: var(--fg);
+  font-size: var(--text-ui);
+  color: var(--fg-strong);
 }
-/* 2px, not 3px: the system marks an edge with a 2px ember bar everywhere
-   else (active tab, selected row, drop targets), and a quotation rule is the
-   same gesture. */
+/* A quotation rule is structure, not brand. The accent is reserved for the
+   brand mark, focus, link emphasis and the current-object marker, so this
+   edge takes the strong hairline instead. */
 [data-testid="md-content"] blockquote {
-  border-left: 2px solid var(--accent);
+  border-left: 2px solid var(--border-strong);
   margin: 1em 0;
   padding: 0 14px;
   color: var(--fg-muted);
@@ -585,7 +713,7 @@ html, body, #root {
 [data-testid="md-content"] table {
   border-collapse: collapse;
   margin: 1em 0;
-  font-size: var(--text-base);
+  font-size: var(--text-body-sm);
 }
 [data-testid="md-content"] th,
 [data-testid="md-content"] td {
@@ -593,8 +721,9 @@ html, body, #root {
   padding: 6px 10px;
 }
 [data-testid="md-content"] th {
-  background: var(--bg-sidebar);
-  font-weight: 600;
+  background: var(--bg-chrome);
+  color: var(--fg);
+  font-weight: 500;
 }
 [data-testid="md-content"] img,
 [data-testid="md-content"] svg {
@@ -653,50 +782,50 @@ html, body, #root {
   padding: var(--space-5);
   text-align: center;
 }
-.sidebar-empty > .titlebar-drag {
-  margin: calc(-1 * var(--space-5)) calc(-1 * var(--space-5)) var(--space-4);
-  border-bottom: 0;
-}
 .sidebar-empty-text {
   color: var(--fg-muted);
   margin: 0 0 14px;
-  font-size: var(--text-sm);
+  font-size: var(--text-body-sm);
 }
-/* The one filled button in the product. It serves the first-run workspace
-   picker and the actions on a file notice, so it is named for what it is
-   rather than for the first pane that used it. */
+/* button-primary: the lavender CTA, 8px corners, 8px/14px padding, label at
+   14px weight 500. It is the one filled button in the product — the
+   first-run workspace picker and the actions on a file notice. */
 .button {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  background: var(--bg-row-selected);
-  color: var(--fg);
-  border: 1px solid var(--border);
+  background: var(--accent);
+  color: var(--on-accent);
+  border: 1px solid transparent;
   border-radius: var(--r-md);
   padding: 8px 14px;
   font: inherit;
+  font-size: var(--text-body-sm);
   font-weight: 500;
+  letter-spacing: 0;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+  transition: background var(--dur-fast) var(--ease);
   margin: var(--space-1);
 }
-.button:hover { background: var(--button-hover-bg); border-color: var(--fg-dim); }
+.button:hover { background: var(--accent-strong); }
+.button:active { background: var(--accent-focus); }
+/* button-secondary: charcoal fill on surface-1 with a hairline border. */
 .button-secondary {
-  background: transparent;
-  color: var(--fg-muted);
-  font-weight: 400;
+  background: var(--bg-chrome);
+  color: var(--fg);
+  border-color: var(--border);
+  font-weight: 500;
 }
-.button-secondary:hover { background: var(--bg-row-hover); color: var(--fg); }
+.button-secondary:hover { background: var(--bg-row-hover); border-color: var(--border-strong); }
 
 .sidebar {
   display: flex;
   flex-direction: column;
   height: 100%;
 }
-/* Height matches the Toolbar band exactly (40px). Both sit under the 38px
-   titlebar/tab-strip band, so their bottom borders form ONE unbroken rule
-   across the window instead of a 1px step at the sidebar seam (the old
-   auto height came out at 39px: 8 + 22 + 8 + 1). */
+/* Height matches the Toolbar band exactly (40px). Both sit directly under
+   the full-width tab strip, so their bottom borders form ONE unbroken rule
+   across the window instead of a 1px step at the sidebar seam. */
 .sidebar-header {
   display: flex;
   align-items: center;
@@ -704,13 +833,12 @@ html, body, #root {
   flex: 0 0 40px;
   height: 40px;
   padding: 0 var(--space-3);
-  font-size: var(--text-xs);
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--fg);
   border-bottom: 1px solid var(--border);
-  background: var(--bg-sidebar);
+  background: var(--bg-chrome);
 }
 .sidebar-header-title {
   flex: 1 1 auto;
@@ -726,23 +854,33 @@ html, body, #root {
   height: 22px;
   background: transparent;
   border: 0;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
   color: var(--fg-muted);
   cursor: pointer;
   padding: 0;
   transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
 }
-.sidebar-header-change:hover { color: var(--fg); background: var(--bg-row-hover); }
+.sidebar-header-change:hover { color: var(--fg); background: var(--button-hover-bg); }
+
+/* ── Eyebrow ──────────────────────────────────────────────────────────── */
+/* Linear's section label: 12-13px, weight 500, POSITIVE tracking. The
+   positive tracking against the negatively-tracked display is what marks a
+   label as taxonomy. It replaces the uppercase 10-11px/700 micro-caps the
+   previous system used. */
+[data-section="bookmarks"] h4,
+.start-section h2 {
+  font-family: var(--font-ui);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  letter-spacing: var(--track-eyebrow);
+  text-transform: none;
+  color: var(--fg-muted);
+}
 
 /* ── Bookmarks ────────────────────────────────────────────────────────── */
 [data-section="bookmarks"] { flex: 0 0 auto; }
 [data-section="bookmarks"] h4 {
-  margin: var(--space-2) var(--space-3) var(--space-1);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--fg-dim);
-  font-weight: 700;
+  margin: var(--space-3) var(--space-3) var(--space-1);
 }
 [data-section="bookmarks"] .bookmarks-header {
   display: flex;
@@ -764,7 +902,7 @@ html, body, #root {
   text-transform: inherit;
   cursor: pointer;
 }
-[data-section="bookmarks"] .bookmarks-header-toggle:hover { color: var(--fg-muted); }
+[data-section="bookmarks"] .bookmarks-header-toggle:hover { color: var(--fg); }
 [data-section="bookmarks"] .bookmarks-chevron {
   display: inline-flex;
   align-items: center;
@@ -777,8 +915,8 @@ html, body, #root {
 [data-section="bookmarks"] .bookmarks-count {
   margin-left: auto;
   margin-right: var(--space-1);
-  color: var(--fg-dim);
-  font-weight: 600;
+  color: var(--fg-muted);
+  font-weight: 500;
 }
 [data-section="bookmarks"] ul {
   list-style: none;
@@ -790,7 +928,7 @@ html, body, #root {
   align-items: center;
   gap: var(--space-1);
   padding: 4px var(--space-3);
-  font-size: var(--text-sm);
+  font-size: var(--text-body-sm);
   color: var(--fg-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -811,8 +949,8 @@ html, body, #root {
 }
 .bookmarks-empty-hint {
   margin: 2px var(--space-3) var(--space-2);
-  font-size: var(--text-xs);
-  color: var(--fg-dim);
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
 }
 .bookmarks-header-empty { cursor: default; }
 .bookmark-remove {
@@ -823,7 +961,7 @@ html, body, #root {
   width: 16px;
   height: 16px;
   border: 0;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
   background: transparent;
   color: var(--fg-dim);
   cursor: pointer;
@@ -846,7 +984,7 @@ html, body, #root {
 .explorer-error {
   padding: 14px var(--space-4);
   color: var(--fg-muted);
-  font-size: var(--text-sm);
+  font-size: var(--text-body-sm);
 }
 .explorer-error { color: var(--error-fg); }
 
@@ -854,15 +992,18 @@ html, body, #root {
   display: flex;
   align-items: center;
   height: 30px;
-  font-size: 14px;
-  color: var(--fg);
+  font-size: var(--text-body-sm);
+  color: var(--fg-strong);
   cursor: pointer;
   padding-right: var(--space-3);
   white-space: nowrap;
 }
 .row:hover { background: var(--bg-row-hover); }
-.row.selected { background: var(--bg-row-selected); }
+/* Selection = surface lift PLUS the current-object marker, the same 2px
+   lavender gesture the active tab uses. On this ladder the lift alone is a
+   single step and cannot carry the state by itself. */
 .row.selected {
+  background: var(--bg-row-selected);
   box-shadow: inset 2px 0 0 0 var(--accent);
 }
 
@@ -899,14 +1040,13 @@ html, body, #root {
 }
 
 .row.folder .label { color: var(--fg); font-weight: 500; }
-.row.file .label { color: var(--fg); }
+.row.file .label { color: var(--fg-strong); }
 .row.file:hover .label { color: var(--label-active-fg); }
 .row.selected .label { color: var(--label-active-fg); }
 
 .row.error-row {
   color: var(--error-fg);
-  font-size: var(--text-xs);
-  font-style: italic;
+  font-size: var(--text-caption);
   cursor: default;
 }
 
@@ -949,19 +1089,44 @@ html, body, #root {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
-/* The wordmark — New York serif, the one display-type moment in the app. */
+/* The wordmark. The display cut at weight 600 with tracking pulled hard
+   negative is the whole gesture — there is no serif and no second family. */
+.start-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-2);
+}
+/* The brand mark is one of the four jobs the accent is allowed to do. */
+.start-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-display);
+  font-size: var(--text-body);
+  font-weight: 600;
+  letter-spacing: var(--track-headline);
+  user-select: none;
+}
 .start-title {
   font-family: var(--font-display);
-  font-size: 34px;
+  font-size: 40px;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
   color: var(--heading-fg);
-  margin: 0 0 var(--space-1);
+  margin: 0;
 }
 .start-subtitle {
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--fg-dim);
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
   margin: 0 0 var(--space-5);
   word-break: break-all;
 }
@@ -975,25 +1140,26 @@ html, body, #root {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  background: var(--bg-sidebar);
+  background: var(--bg-chrome);
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
-  padding: 7px 12px;
+  padding: 8px 14px;
   font: inherit;
-  font-size: 12.5px;
+  font-size: var(--text-body-sm);
+  font-weight: 500;
   cursor: pointer;
   transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
-.start-action:hover { background: var(--bg-row-hover); border-color: var(--fg-dim); }
+.start-action:hover { background: var(--bg-row-hover); border-color: var(--border-strong); }
 .start-action kbd,
 .start-empty kbd {
-  font-family: inherit;
-  font-size: 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
   background: var(--badge-bg);
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  padding: 1px 4px;
+  border-radius: var(--r-xs);
+  padding: 1px 5px;
   color: var(--fg-muted);
 }
 .start-section { margin-bottom: var(--space-5); }
@@ -1001,12 +1167,7 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--text-xs);
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--fg-dim);
-  margin: 0 0 6px;
+  margin: 0 0 var(--space-2);
 }
 .start-list {
   list-style: none;
@@ -1020,16 +1181,16 @@ html, body, #root {
   width: 100%;
   border: 0;
   background: transparent;
-  color: var(--fg);
+  color: var(--fg-strong);
   font: inherit;
-  font-size: var(--text-base);
+  font-size: var(--text-body-sm);
   text-align: left;
   padding: 6px var(--space-2);
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
   cursor: pointer;
   transition: background var(--dur-fast) var(--ease);
 }
-.start-row:hover { background: var(--bg-row-hover); }
+.start-row:hover { background: var(--bg-row-hover); color: var(--fg); }
 .start-row-icon { display: inline-flex; flex: 0 0 auto; }
 .start-row-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* `direction: rtl` moves the ellipsis to the HEAD, so the DEEPEST segments
@@ -1044,14 +1205,14 @@ html, body, #root {
   white-space: nowrap;
   direction: rtl;
   color: var(--fg-path);
-  font-size: var(--text-xs);
+  font-size: var(--text-caption);
   font-family: var(--font-mono);
   text-align: right;
 }
 .start-empty {
   color: var(--fg-muted);
-  font-size: var(--text-base);
-  line-height: 1.6;
+  font-size: var(--text-body-sm);
+  line-height: 1.5;
 }
 
 /* ── Quick open (⌘P) ──────────────────────────────────────────────────── */
@@ -1059,7 +1220,7 @@ html, body, #root {
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: rgba(10, 8, 5, 0.4);
+  background: var(--overlay-scrim);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1068,9 +1229,9 @@ html, body, #root {
 .quick-open {
   width: min(560px, 86vw);
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
-  box-shadow: var(--shadow-overlay);
+  box-shadow: var(--shadow-overlay), var(--edge-highlight);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -1080,7 +1241,7 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 10px var(--space-3);
+  padding: 12px var(--space-4);
   border-bottom: 1px solid var(--border);
   color: var(--fg-muted);
 }
@@ -1091,7 +1252,8 @@ html, body, #root {
   background: transparent;
   color: var(--fg);
   font: inherit;
-  font-size: var(--text-md);
+  font-size: var(--text-body);
+  letter-spacing: var(--track-body);
 }
 .quick-open-list {
   list-style: none;
@@ -1104,12 +1266,16 @@ html, body, #root {
   align-items: center;
   gap: var(--space-2);
   padding: 6px 10px;
-  border-radius: var(--r-md);
-  font-size: var(--text-base);
+  border-radius: var(--r-sm);
+  font-size: var(--text-body-sm);
   cursor: pointer;
-  color: var(--fg);
+  color: var(--fg-strong);
 }
-.quick-open-list li.selected { background: var(--bg-row-selected); }
+.quick-open-list li.selected {
+  background: var(--bg-row-selected);
+  color: var(--fg);
+  box-shadow: inset 2px 0 0 0 var(--accent);
+}
 .quick-open-icon { display: inline-flex; flex: 0 0 auto; }
 .quick-open-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* TAIL-truncated, unlike .start-row-dir. These paths are always relative to
@@ -1123,14 +1289,14 @@ html, body, #root {
   white-space: nowrap;
   text-align: right;
   color: var(--fg-path);
-  font-size: var(--text-xs);
+  font-size: var(--text-caption);
   font-family: var(--font-mono);
 }
-.quick-open-empty { color: var(--fg-dim); cursor: default; }
+.quick-open-empty { color: var(--fg-muted); cursor: default; }
 .quick-open-footer {
-  padding: 5px var(--space-3);
-  font-size: 10px;
-  color: var(--fg-dim);
+  padding: 6px var(--space-4);
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
   border-top: 1px solid var(--border);
 }
 
@@ -1140,9 +1306,9 @@ html, body, #root {
   z-index: 200;
   min-width: 180px;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
-  box-shadow: var(--shadow-menu);
+  box-shadow: var(--shadow-menu), var(--edge-highlight);
   padding: var(--space-1);
   display: flex;
   flex-direction: column;
@@ -1153,15 +1319,15 @@ html, body, #root {
   gap: var(--space-2);
   border: 0;
   background: transparent;
-  color: var(--fg);
+  color: var(--fg-strong);
   font: inherit;
-  font-size: 12.5px;
+  font-size: var(--text-body-sm);
   text-align: left;
   padding: 6px 10px;
-  border-radius: 5px;
+  border-radius: var(--r-sm);
   cursor: pointer;
 }
-.context-menu-item:hover { background: var(--bg-row-selected); }
+.context-menu-item:hover { background: var(--bg-row-selected); color: var(--fg); }
 .context-menu-item.danger { color: var(--error-fg); }
 .context-menu-icon { display: inline-flex; color: var(--fg-muted); }
 .context-menu-sep {
@@ -1171,8 +1337,6 @@ html, body, #root {
 }
 
 /* ── Image & metadata renderers ───────────────────────────────────────── */
-/* The least-visited renderers were the only two outside the token system;
-   they now use the same spacing and mono stack as everything else. */
 .image-renderer { padding: var(--space-4); }
 .image-renderer img,
 .image-renderer svg { max-width: 100%; height: auto; }
@@ -1180,8 +1344,8 @@ html, body, #root {
 .metadata-renderer {
   padding: var(--space-4);
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: 1.7;
+  font-size: var(--text-ui);
+  line-height: 1.5;
   color: var(--fg-muted);
 }
 .metadata-path {
@@ -1199,14 +1363,21 @@ html, body, #root {
 .shiki-block pre.shiki {
   background: transparent !important;
 }
+/* Shiki writes an inline `background-color` on the <pre> it emits, and in
+   rendered Markdown that <pre> is NOT inside a .shiki-block — md.tsx replaces
+   `code.parentElement` in place. An inline style beats any selector, so the
+   block would paint GitHub's #24292e on our canvas without !important. */
+[data-testid="md-content"] pre.shiki {
+  background: var(--pre-bg) !important;
+}
 
 pre {
   margin: 0;
   padding: var(--space-4);
   font-family: var(--font-mono);
-  font-size: 13.5px;
-  line-height: 1.55;
-  color: var(--fg);
+  font-size: var(--text-ui);
+  line-height: 1.5;
+  color: var(--fg-strong);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -1218,7 +1389,7 @@ pre {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
-  border-radius: 5px;
+  border-radius: var(--r-pill);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }
