@@ -76,7 +76,7 @@
         "displayName": "Held Ink",
         "canonical": "#322b21",
         "lightValue": "#eeddbe",
-        "purpose": "Selected row, quick-open selection, badge ground, primary sidebar button surface."
+        "purpose": "Selected row, quick-open selection, badge ground, filled button surface."
       },
       "border": {
         "role": "neutral",
@@ -309,7 +309,7 @@
       "css": ".ds-actions { display: flex; gap: 8px; flex-wrap: wrap; background: #1c1a17; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-action { display: inline-flex; align-items: center; gap: 7px; background: #100e0c; color: #d8d2c6; border: 1px solid #413a31; border-radius: 6px; padding: 7px 12px; font-size: 12.5px; font-family: inherit; cursor: pointer; transition: background 80ms cubic-bezier(0.2,0,0.2,1), border-color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-action:hover { background: #26221d; border-color: #6b6458; } .ds-action:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; } .ds-kbd { font-family: inherit; font-size: 10px; background: #322b21; border: 1px solid #413a31; border-radius: 4px; padding: 1px 4px; color: #968e7f; }"
     },
     {
-      "name": "Primary Sidebar Button",
+      "name": "Primary Button",
       "kind": "button",
       "refersTo": "sidebar-button",
       "description": "The filled action, used for the first-run workspace picker. The only button in the product with a filled resting surface.",

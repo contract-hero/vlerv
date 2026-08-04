@@ -48,11 +48,11 @@ export default function Sidebar({
         {/* One primary on first run. The second action used to carry the same
             filled treatment, so two buttons competed for the same first
             click. */}
-        <button className="sidebar-button" onClick={onPickWorkspace}>
+        <button className="button" onClick={onPickWorkspace}>
           Choose workspace folder…
         </button>
         <button
-          className="sidebar-button secondary"
+          className="button button-secondary"
           onClick={onPickFile}
           title="Open a single file (⌘O)"
         >

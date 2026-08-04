@@ -37,10 +37,11 @@ interface AppProps {
 }
 
 const DEFAULT_SIDEBAR_PX = 280;
-/** How long a transient notice stays up before it dismisses itself. */
-const NOTICE_MS = 10000;
 const MIN_SIDEBAR_PX = 200;
 const MAX_SIDEBAR_PX = 480;
+
+/** How long a transient notice stays up before it dismisses itself. */
+const NOTICE_MS = 10000;
 
 // Chords honored when forwarded from a preview iframe (tab/nav/zoom only —
 // nothing that opens native dialogs or steals focus). Must stay in sync with

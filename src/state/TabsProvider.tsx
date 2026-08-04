@@ -109,22 +109,25 @@ export function TabsProvider({ ipc, children }: TabsProviderProps): React.ReactE
     };
   }, [ipc]);
 
-  // Serialize eagerly so the effect below only fires on a REAL session change;
-  // payload loads and reload nonces churn the state constantly and must not
-  // schedule a write.
-  const sessionJson = React.useMemo(
-    () => JSON.stringify(serializeTabs(state)),
+  // Serialize eagerly and carry the JSON alongside the value: `key` is what
+  // the effect depends on, so a write is scheduled only when the session
+  // genuinely changed. Payload loads and reload nonces churn `state` on every
+  // read and must not each schedule a state.json write.
+  const session = React.useMemo(() => {
+    const value = serializeTabs(state);
+    return { value, key: JSON.stringify(value) };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.tabs, state.activeTabId],
-  );
+  }, [state.tabs, state.activeTabId]);
 
   React.useEffect(() => {
     if (!hydratedRef.current || !ipc.setStateField) return;
     const timer = window.setTimeout(() => {
-      void ipc.setStateField?.("panes.tabs", JSON.parse(sessionJson)).catch(() => {});
+      void ipc.setStateField?.("panes.tabs", session.value).catch(() => {});
     }, SESSION_PERSIST_MS);
     return () => window.clearTimeout(timer);
-  }, [ipc, sessionJson]);
+    // `session.key` is the stable identity of `session.value`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ipc, session.key]);
 
   // ── Watcher-driven auto-reload ───────────────────────────────────────────
   const openPathsRef = React.useRef<Set<string>>(new Set());

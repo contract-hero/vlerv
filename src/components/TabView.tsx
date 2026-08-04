@@ -72,7 +72,7 @@ export default function TabView({
         <div className="file-notice-actions">
           <button
             type="button"
-            className="notice-button"
+            className="button"
             onClick={() => dispatch({ type: "CLOSE_TAB", tabId: tab.id })}
           >
             Close tab
@@ -96,7 +96,7 @@ export default function TabView({
         <div className="file-notice-actions">
           <button
             type="button"
-            className="notice-button"
+            className="button"
             data-testid="preview-error-retry"
             onClick={() => dispatch({ type: "RELOAD" })}
           >
@@ -104,7 +104,7 @@ export default function TabView({
           </button>
           <button
             type="button"
-            className="notice-button"
+            className="button"
             onClick={() => {
               void revealItemInDir(path).catch(() => {
                 // Parent directory may be gone too — nothing useful to add.

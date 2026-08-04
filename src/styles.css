@@ -492,37 +492,21 @@ html, body, #root {
   padding: var(--space-5);
 }
 .file-notice-title { font-size: var(--text-md); font-weight: 600; color: var(--fg); margin: 0; }
+.file-notice-path,
+.file-notice-hint { max-width: 60ch; font-size: var(--text-sm); }
 .file-notice-path {
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
   color: var(--fg-path);
   margin: 0;
-  max-width: 60ch;
   word-break: break-all;
 }
-.file-notice-hint { font-size: var(--text-sm); margin: 0 0 var(--space-2); max-width: 60ch; }
+.file-notice-hint { margin: 0 0 var(--space-2); }
 .file-notice-actions {
   display: flex;
   gap: var(--space-2);
   flex-wrap: wrap;
   justify-content: center;
 }
-.notice-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  background: var(--bg-row-selected);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 7px 12px;
-  font: inherit;
-  font-size: var(--text-sm);
-  font-weight: 500;
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
-}
-.notice-button:hover { background: var(--button-hover-bg); border-color: var(--fg-dim); }
 
 [data-testid="html-renderer"] {
   display: flex !important;
@@ -639,17 +623,21 @@ html, body, #root {
 .file-glyph.is-subject,
 .folder-glyph { color: var(--fg-muted); }
 
-.row:hover .file-glyph,
-.row.selected .file-glyph,
-.start-row:hover .file-glyph,
-.quick-open-list li.selected .file-glyph,
-[data-section="bookmarks"] li:hover .file-glyph { color: var(--fg-muted); }
+:is(
+  .row:hover,
+  .row.selected,
+  .start-row:hover,
+  .quick-open-list li.selected,
+  [data-section="bookmarks"] li:hover
+) .file-glyph { color: var(--fg-muted); }
 
-.row:hover .file-glyph.is-subject,
-.row.selected .file-glyph.is-subject,
-.start-row:hover .file-glyph.is-subject,
-.quick-open-list li.selected .file-glyph.is-subject,
-[data-section="bookmarks"] li:hover .file-glyph.is-subject { color: var(--fg); }
+:is(
+  .row:hover,
+  .row.selected,
+  .start-row:hover,
+  .quick-open-list li.selected,
+  [data-section="bookmarks"] li:hover
+) .file-glyph.is-subject { color: var(--fg); }
 
 .row:hover .folder-glyph,
 .row.selected .folder-glyph { color: var(--fg); }
@@ -672,7 +660,13 @@ html, body, #root {
   margin: 0 0 14px;
   font-size: var(--text-sm);
 }
-.sidebar-button {
+/* The one filled button in the product. It serves the first-run workspace
+   picker and the actions on a file notice, so it is named for what it is
+   rather than for the first pane that used it. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   background: var(--bg-row-selected);
   color: var(--fg);
   border: 1px solid var(--border);
@@ -681,16 +675,16 @@ html, body, #root {
   font: inherit;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease);
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
   margin: var(--space-1);
 }
-.sidebar-button:hover { background: var(--button-hover-bg); }
-.sidebar-button.secondary {
+.button:hover { background: var(--button-hover-bg); border-color: var(--fg-dim); }
+.button-secondary {
   background: transparent;
   color: var(--fg-muted);
   font-weight: 400;
 }
-.sidebar-button.secondary:hover { background: var(--bg-row-hover); color: var(--fg); }
+.button-secondary:hover { background: var(--bg-row-hover); color: var(--fg); }
 
 .sidebar {
   display: flex;

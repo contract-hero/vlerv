@@ -208,7 +208,7 @@ frame renders with unstyled values.
 - **Raised Ink** (`#292520`): detached surfaces — context menus, quick open,
   the notice toast.
 - **Hover Ink** (`#26221d`) and **Held Ink** (`#322b21`): the two row states.
-  Held Ink also backs badges and the primary sidebar button.
+  Held Ink also backs badges and the one filled button.
 - **Rule Ink** (`#413a31`): every 1px divider, border and table cell edge.
 - **Parchment** (`#d8d2c6`): body text.
 - **Faded Parchment** (`#968e7f`): secondary text, inactive tab labels, icon
@@ -400,7 +400,7 @@ reveal themselves on row hover rather than sitting permanently lit.
 
 - **Shape:** softly squared (6px), or small-squared (4px) for 16–18px icon
   buttons.
-- **Primary (sidebar action):** Held Ink surface, 1px Rule Ink border, 500
+- **Primary (`.button`):** Held Ink surface, 1px Rule Ink border, 500
   weight, 8px/14px padding; hovers to Button Hover Ink (`#3a342b`).
 - **Icon (toolbar):** 28×28px, transparent at rest, Faded Parchment glyph;
   hovers to Hover Ink with a Parchment glyph. Disabled drops to Ghost

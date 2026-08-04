@@ -43,6 +43,15 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
   const [dragPath, setDragPath] = React.useState<string | null>(null);
   const [overPath, setOverPath] = React.useState<string | null>(null);
 
+  /** Move one row to a new index and persist the order. */
+  const moveTo = (fromIdx: number, toIdx: number) => {
+    const order = bookmarks.map((b) => b.path);
+    if (fromIdx < 0 || toIdx < 0 || toIdx >= order.length || fromIdx === toIdx) return;
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, moved);
+    void reorder(order);
+  };
+
   const handleDrop = (targetPath: string) => {
     const from = dragPath;
     setDragPath(null);
@@ -51,24 +60,17 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
     const order = bookmarks.map((b) => b.path);
     const fromIdx = order.indexOf(from);
     const toIdx = order.indexOf(targetPath);
-    if (fromIdx < 0 || toIdx < 0) return;
+    if (toIdx < 0) return;
     // Drop the dragged row *above* the target (matching the insertion-line
     // indicator). Removing the source first shifts every later index left by
     // one, so a downward drag inserts at toIdx-1 to land before the target.
-    const [moved] = order.splice(fromIdx, 1);
-    order.splice(fromIdx < toIdx ? toIdx - 1 : toIdx, 0, moved);
-    void reorder(order);
+    moveTo(fromIdx, fromIdx < toIdx ? toIdx - 1 : toIdx);
   };
 
   /** Keyboard equivalent of drag-to-reorder: ⌥↑ / ⌥↓ on a focused row. */
   const moveBy = (path: string, delta: 1 | -1) => {
-    const order = bookmarks.map((b) => b.path);
-    const from = order.indexOf(path);
-    const to = from + delta;
-    if (from < 0 || to < 0 || to >= order.length) return;
-    const [moved] = order.splice(from, 1);
-    order.splice(to, 0, moved);
-    void reorder(order);
+    const from = bookmarks.findIndex((b) => b.path === path);
+    moveTo(from, from + delta);
   };
 
   const toggleCollapsed = () => {
