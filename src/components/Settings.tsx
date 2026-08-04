@@ -142,7 +142,7 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
       <section>
         <h3>Slack Share Target</h3>
         <p>
-          Slack has no macOS share-sheet extension, so Vlervcode opens your
+          Slack has no macOS share-sheet extension, so Vlervtifacts opens your
           channel via a deep link instead — drag the file in from there.
           Accepts <code>TEAMID/CHANNELID</code> (e.g.{" "}
           <code>T0123ABCD/C0456EFGH</code>) or a full <code>slack://</code> URL.

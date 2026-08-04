@@ -43,18 +43,26 @@
   --shadow-menu: 0 8px 28px rgba(12, 9, 5, 0.45);
   --shadow-overlay: 0 16px 48px rgba(12, 9, 5, 0.55);
 
-  /* ink palette */
+  /* ink palette
+     Plane order, darkest to lightest: chrome (--bg-sidebar) sits BEHIND the
+     reading field (--bg), and detached surfaces (--bg-elevated) sit above it.
+     The steps are deliberately wide enough to read as separate planes without
+     a shadow — see DESIGN.md, "Elevation & Depth". */
   color-scheme: dark;
   --bg: #1c1a17;
-  --bg-sidebar: #151311;
-  --bg-elevated: #23201b;
+  --bg-sidebar: #100e0c;
+  --bg-elevated: #292520;
   --bg-row-hover: #26221d;
   --bg-row-selected: #322b21;
   --fg: #d8d2c6;
   --fg-muted: #968e7f;
   --fg-dim: #6b6458;
+  /* Paths carry the information that tells two same-named artifacts apart, so
+     they get their own token at >=4.5:1 on every surface they land on rather
+     than borrowing --fg-dim (2.8:1 on --bg-elevated). */
+  --fg-path: #a49b8a;
   --heading-fg: #ece6da;
-  --border: #2b2721;
+  --border: #413a31;
   --accent: #dda355;
   --accent-strong: #e8b56d;
   --code-bg: #262219;
@@ -65,12 +73,15 @@
   --label-active-fg: #f4efe6;
   --scrollbar-thumb: #363028;
   --scrollbar-thumb-hover: #453d32;
-  --iframe-bg: #ffffff;
+  /* The artifact iframe paints AFTER its srcdoc loads. A white value here
+     flashes on every open and on every live reload; matching the reading
+     field makes the swap invisible. */
+  --iframe-bg: var(--bg);
   --badge-bg: #322b21;
   --badge-fg: #dda355;
   --empty-fg: #968e7f;
-  --input-bg: #14120f;
-  --input-border: #332e26;
+  --input-bg: #0c0a08;
+  --input-border: #3b352c;
   --input-border-focus: #dda355;
   --resizer-hover: #dda355;
   --star-active: #dda355;
@@ -91,8 +102,9 @@
   --fg: #33302a;
   --fg-muted: #7c7568;
   --fg-dim: #a39a8a;
+  --fg-path: #655e50;
   --heading-fg: #211e19;
-  --border: #e0d9cc;
+  --border: #cdc3b2;
   --accent: #9a6a1e;
   --accent-strong: #7d5517;
   --code-bg: #efe9dc;
@@ -103,7 +115,9 @@
   --label-active-fg: #14120e;
   --scrollbar-thumb: #cfc7b8;
   --scrollbar-thumb-hover: #b8ae9c;
-  --iframe-bg: #ffffff;
+  /* Same reason as the ink block: the pre-paint frame must match the reading
+     field, not a hard white that flashes on every load. */
+  --iframe-bg: var(--bg);
   --badge-bg: #efe4cd;
   --badge-fg: #8a5f1b;
   --empty-fg: #8a8274;
@@ -197,6 +211,8 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Anchor for the floating .app-notice toast. */
+  position: relative;
 }
 
 /* ── Tab strip ─────────────────────────────────────────────────────────── */
@@ -282,8 +298,12 @@ html, body, #root {
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
+/* A control that is focusable must be VISIBLE when it holds focus — an
+   `opacity: 0` button in the tab order is a target the keyboard can reach and
+   the eye cannot find. */
 .tab:hover .tab-close,
-.tab.active .tab-close { opacity: 1; }
+.tab.active .tab-close,
+.tab-close:focus-visible { opacity: 1; }
 .tab-close:hover { background: var(--button-hover-bg); color: var(--fg); }
 .tab-new {
   display: inline-flex;
@@ -325,6 +345,16 @@ html, body, #root {
 .toolbar-button:hover:not(:disabled) { background: var(--bg-row-hover); color: var(--fg); }
 .toolbar-button:disabled { color: var(--fg-dim); opacity: 0.5; cursor: default; }
 .toolbar-button.star-active { color: var(--star-active); }
+/* Navigation and file actions are different jobs. Without a separator the
+   toolbar reads as one undifferentiated run of nine identical 28px squares. */
+.toolbar-sep {
+  flex: 0 0 1px;
+  align-self: center;
+  width: 1px;
+  height: 18px;
+  margin: 0 var(--space-1);
+  background: var(--border);
+}
 .address-bar {
   flex: 1 1 auto;
   min-width: 0;
@@ -373,14 +403,48 @@ html, body, #root {
 }
 .toolbar-zoom:hover { color: var(--fg); }
 
+/* Transient message about something that happened OUTSIDE the reading flow
+   (a rejected deep link). It floats over the preview instead of sitting in
+   the column: an in-flow strip pushed the artifact down on arrival and back
+   up on expiry, moving the text under the reader's eyes. */
 .app-notice {
-  flex: 0 0 auto;
-  padding: 6px 14px;
-  background: var(--badge-bg);
+  position: absolute;
+  left: var(--space-3);
+  bottom: var(--space-3);
+  z-index: 50;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  max-width: min(520px, calc(100% - var(--space-6)));
+  padding: 8px 8px 8px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-menu);
   color: var(--error-fg);
   font-size: var(--text-sm);
-  border-bottom: 1px solid var(--border);
+  animation: notice-rise 160ms var(--ease);
 }
+@keyframes notice-rise {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.app-notice-text { flex: 1 1 auto; word-break: break-word; }
+.app-notice-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.app-notice-dismiss:hover { background: var(--button-hover-bg); color: var(--fg); }
 
 /* ── Tab view / preview scroll container ──────────────────────────────── */
 .tab-view {
@@ -401,16 +465,6 @@ html, body, #root {
   padding: var(--space-4);
   color: var(--empty-fg);
 }
-.preview-error { padding: var(--space-5); }
-.preview-error-kind { color: var(--error-fg); font-weight: 600; margin: 0 0 6px; }
-.preview-error-path {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--fg-muted);
-  margin: 0 0 10px;
-  word-break: break-all;
-}
-.preview-error-reason { color: var(--fg); margin: 0; }
 
 .preview-badge-external {
   display: inline-block;
@@ -423,7 +477,10 @@ html, body, #root {
   flex: 0 0 auto;
 }
 
-.deleted-notice {
+/* One shape for every "this file is not readable right now" state: deleted,
+   unreadable, permission-denied. Naming the problem and offering the two
+   useful actions is the same job in each case. */
+.file-notice {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -434,9 +491,38 @@ html, body, #root {
   text-align: center;
   padding: var(--space-5);
 }
-.deleted-notice-title { font-size: var(--text-md); font-weight: 600; color: var(--fg); margin: 0; }
-.deleted-notice-path { font-family: var(--font-mono); font-size: var(--text-sm); margin: 0; word-break: break-all; }
-.deleted-notice-hint { font-size: var(--text-sm); margin: 0 0 var(--space-2); }
+.file-notice-title { font-size: var(--text-md); font-weight: 600; color: var(--fg); margin: 0; }
+.file-notice-path {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--fg-path);
+  margin: 0;
+  max-width: 60ch;
+  word-break: break-all;
+}
+.file-notice-hint { font-size: var(--text-sm); margin: 0 0 var(--space-2); max-width: 60ch; }
+.file-notice-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.notice-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg-row-selected);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 7px 12px;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.notice-button:hover { background: var(--button-hover-bg); border-color: var(--fg-dim); }
 
 [data-testid="html-renderer"] {
   display: flex !important;
@@ -501,8 +587,11 @@ html, body, #root {
   font-size: 13.5px;
   color: var(--fg);
 }
+/* 2px, not 3px: the system marks an edge with a 2px ember bar everywhere
+   else (active tab, selected row, drop targets), and a quotation rule is the
+   same gesture. */
 [data-testid="md-content"] blockquote {
-  border-left: 3px solid var(--accent);
+  border-left: 2px solid var(--accent);
   margin: 1em 0;
   padding: 0 14px;
   color: var(--fg-muted);
@@ -537,6 +626,38 @@ html, body, #root {
   margin: 1.6em 0;
 }
 
+/* ── File glyphs ──────────────────────────────────────────────────────── */
+/* Glyphs carry SHAPE; hue belongs to the design system (see FileIcon.tsx).
+   Two tones only: `is-subject` marks the artifacts this app exists to read
+   (.html/.md), everything else recedes. Both step up together on hover and
+   selection so the glyph follows its row instead of competing with it. */
+.file-glyph,
+.folder-glyph {
+  color: var(--fg-dim);
+  transition: color var(--dur-fast) var(--ease);
+}
+.file-glyph.is-subject,
+.folder-glyph { color: var(--fg-muted); }
+
+.row:hover .file-glyph,
+.row.selected .file-glyph,
+.start-row:hover .file-glyph,
+.quick-open-list li.selected .file-glyph,
+[data-section="bookmarks"] li:hover .file-glyph { color: var(--fg-muted); }
+
+.row:hover .file-glyph.is-subject,
+.row.selected .file-glyph.is-subject,
+.start-row:hover .file-glyph.is-subject,
+.quick-open-list li.selected .file-glyph.is-subject,
+[data-section="bookmarks"] li:hover .file-glyph.is-subject { color: var(--fg); }
+
+.row:hover .folder-glyph,
+.row.selected .folder-glyph { color: var(--fg); }
+
+.tab .file-glyph { color: var(--fg-dim); }
+.tab.active .file-glyph { color: var(--fg-muted); }
+.tab.active .file-glyph.is-subject { color: var(--fg); }
+
 /* ── Sidebar ──────────────────────────────────────────────────────────── */
 .sidebar-empty {
   padding: var(--space-5);
@@ -564,18 +685,28 @@ html, body, #root {
   margin: var(--space-1);
 }
 .sidebar-button:hover { background: var(--button-hover-bg); }
+.sidebar-button.secondary {
+  background: transparent;
+  color: var(--fg-muted);
+  font-weight: 400;
+}
+.sidebar-button.secondary:hover { background: var(--bg-row-hover); color: var(--fg); }
 
 .sidebar {
   display: flex;
   flex-direction: column;
   height: 100%;
 }
+/* Height matches the Toolbar band exactly (40px). Both sit under the 38px
+   titlebar/tab-strip band, so their bottom borders form ONE unbroken rule
+   across the window instead of stepping by ~10px at the sidebar seam. */
 .sidebar-header {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 0 0 auto;
-  padding: var(--space-2) var(--space-3);
+  flex: 0 0 40px;
+  height: 40px;
+  padding: 0 var(--space-3);
   font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -620,10 +751,23 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  cursor: pointer;
   user-select: none;
 }
-[data-section="bookmarks"] .bookmarks-header:hover { color: var(--fg-muted); }
+[data-section="bookmarks"] .bookmarks-header-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+[data-section="bookmarks"] .bookmarks-header-toggle:hover { color: var(--fg-muted); }
 [data-section="bookmarks"] .bookmarks-chevron {
   display: inline-flex;
   align-items: center;
@@ -682,14 +826,15 @@ html, body, #root {
   width: 16px;
   height: 16px;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--fg-dim);
   cursor: pointer;
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-[data-section="bookmarks"] li:hover .bookmark-remove { opacity: 1; }
+[data-section="bookmarks"] li:hover .bookmark-remove,
+.bookmark-remove:focus-visible { opacity: 1; }
 .bookmark-remove:hover { color: var(--error-fg); }
 
 /* ── Explorer ─────────────────────────────────────────────────────────── */
@@ -781,7 +926,8 @@ html, body, #root {
   opacity: 0.35;
   transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-.row:hover .star-toggle { opacity: 1; }
+.row:hover .star-toggle,
+.row .star-toggle:focus-visible { opacity: 1; }
 .row .star-toggle.bookmarked {
   color: var(--star-active);
   opacity: 1;
@@ -849,7 +995,7 @@ html, body, #root {
   font-size: 10px;
   background: var(--badge-bg);
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--r-sm);
   padding: 1px 4px;
   color: var(--fg-muted);
 }
@@ -889,12 +1035,17 @@ html, body, #root {
 .start-row:hover { background: var(--bg-row-hover); }
 .start-row-icon { display: inline-flex; flex: 0 0 auto; }
 .start-row-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `direction: rtl` moves the ellipsis to the HEAD of the string. A tail
+   ellipsis cuts the only segment that tells `evm-wal/report.html` apart from
+   `clud/report.html`. The path itself is wrapped in <bdi> so it still reads
+   left-to-right inside the right-to-left box. */
 .start-row-dir {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--fg-dim);
+  direction: rtl;
+  color: var(--fg-path);
   font-size: var(--text-xs);
   font-family: var(--font-mono);
   text-align: right;
@@ -942,7 +1093,7 @@ html, body, #root {
   background: transparent;
   color: var(--fg);
   font: inherit;
-  font-size: 14px;
+  font-size: var(--text-md);
 }
 .quick-open-list {
   list-style: none;
@@ -963,13 +1114,15 @@ html, body, #root {
 .quick-open-list li.selected { background: var(--bg-row-selected); }
 .quick-open-icon { display: inline-flex; flex: 0 0 auto; }
 .quick-open-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Head-truncated for the same reason as .start-row-dir. */
 .quick-open-dir {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  direction: rtl;
   text-align: right;
-  color: var(--fg-dim);
+  color: var(--fg-path);
   font-size: var(--text-xs);
   font-family: var(--font-mono);
 }
@@ -1016,6 +1169,27 @@ html, body, #root {
   background: var(--border);
   margin: var(--space-1) 6px;
 }
+
+/* ── Image & metadata renderers ───────────────────────────────────────── */
+/* The least-visited renderers were the only two outside the token system;
+   they now use the same spacing and mono stack as everything else. */
+.image-renderer { padding: var(--space-4); }
+.image-renderer img,
+.image-renderer svg { max-width: 100%; height: auto; }
+
+.metadata-renderer {
+  padding: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  color: var(--fg-muted);
+}
+.metadata-path {
+  color: var(--fg);
+  margin-bottom: var(--space-2);
+  word-break: break-all;
+}
+.metadata-reason { color: var(--fg-path); }
 
 /* ── Code blocks / plain text ─────────────────────────────────────────── */
 .shiki-block pre {

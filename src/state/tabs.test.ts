@@ -3,10 +3,13 @@ import {
   activeTab,
   canGoBack,
   canGoForward,
+  CLOSED_CAP,
   currentEntry,
   HISTORY_CAP,
+  hydrateTabsState,
   initialTabsState,
   isLoading,
+  serializeTabs,
   tabsReducer,
 } from "./tabs";
 import type { TabsState } from "./tabs";
@@ -231,5 +234,103 @@ describe("tabsReducer", () => {
     s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 2 });
     expect(s.tabs.find((t) => t.id === other.id)!.zoom).toBe(1);
     expect(tabsReducer(s, { type: "SET_ZOOM", tabId: "nope", zoom: 2 })).toEqual(s);
+  });
+});
+
+describe("session persistence", () => {
+  it("serializes only tabs that point somewhere, and marks the active one", () => {
+    let s = nav(initialTabsState(), "/a");
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b" });
+    s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 1.5 });
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", background: true }); // empty tab
+
+    const persisted = serializeTabs(s);
+    expect(persisted.tabs.map((t) => t.history[t.historyIndex].path)).toEqual(["/a", "/b"]);
+    expect(persisted.tabs[persisted.activeIndex].zoom).toBe(1.5);
+  });
+
+  it("round-trips history, position and zoom", () => {
+    let s = nav(initialTabsState(), "/a");
+    s = nav(s, "/b");
+    s = tabsReducer(s, { type: "GO_BACK" });
+    s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 1.2 });
+
+    const restored = hydrateTabsState(serializeTabs(s))!;
+    expect(currentEntry(activeTab(restored))?.path).toBe("/a");
+    expect(canGoForward(activeTab(restored))).toBe(true);
+    expect(activeTab(restored).zoom).toBe(1.2);
+    // Payloads are deliberately NOT persisted: a restored tab re-reads disk.
+    expect(activeTab(restored).payload).toBeNull();
+  });
+
+  it("refuses junk and empty sessions so the app falls back to a fresh tab", () => {
+    expect(hydrateTabsState(null)).toBeNull();
+    expect(hydrateTabsState({})).toBeNull();
+    expect(hydrateTabsState({ tabs: [] })).toBeNull();
+    expect(hydrateTabsState({ tabs: [{ history: [], historyIndex: -1, zoom: 1 }] })).toBeNull();
+    expect(hydrateTabsState({ tabs: [{ history: [{ nope: 1 }], historyIndex: 0, zoom: 1 }] })).toBeNull();
+  });
+
+  it("clamps an out-of-range activeIndex and historyIndex", () => {
+    const restored = hydrateTabsState({
+      tabs: [{ history: [{ path: "/a", external: false }], historyIndex: 99, zoom: 99 }],
+      activeIndex: 99,
+    })!;
+    expect(currentEntry(activeTab(restored))?.path).toBe("/a");
+    expect(activeTab(restored).zoom).toBe(3);
+  });
+
+  it("HYDRATE replaces the session and keeps the closed stack", () => {
+    let s = nav(initialTabsState(), "/old");
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/gone" });
+    s = tabsReducer(s, { type: "CLOSE_TAB", tabId: s.activeTabId });
+    const closedBefore = s.closed;
+
+    s = tabsReducer(s, {
+      type: "HYDRATE",
+      persisted: {
+        tabs: [{ history: [{ path: "/restored", external: false }], historyIndex: 0, zoom: 1 }],
+        activeIndex: 0,
+      },
+    });
+    expect(s.tabs).toHaveLength(1);
+    expect(currentEntry(activeTab(s))?.path).toBe("/restored");
+    expect(s.closed).toEqual(closedBefore);
+  });
+});
+
+describe("reopen closed tab", () => {
+  it("restores the last closed tab with its history and zoom", () => {
+    let s = nav(initialTabsState(), "/a");
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b" });
+    s = nav(s, "/c");
+    s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 2 });
+    s = tabsReducer(s, { type: "CLOSE_TAB", tabId: s.activeTabId });
+    expect(s.tabs).toHaveLength(1);
+
+    s = tabsReducer(s, { type: "REOPEN_CLOSED_TAB" });
+    expect(s.tabs).toHaveLength(2);
+    const reopened = activeTab(s);
+    expect(currentEntry(reopened)?.path).toBe("/c");
+    expect(canGoBack(reopened)).toBe(true);
+    expect(reopened.zoom).toBe(2);
+    // The stack is consumed, so a second press does nothing.
+    const after = tabsReducer(s, { type: "REOPEN_CLOSED_TAB" });
+    expect(after.tabs).toHaveLength(2);
+  });
+
+  it("ignores empty tabs and caps the stack", () => {
+    let s = initialTabsState();
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB" }); // empty — nothing to remember
+    s = tabsReducer(s, { type: "CLOSE_TAB", tabId: s.activeTabId });
+    expect(s.closed).toHaveLength(0);
+
+    for (let i = 0; i < CLOSED_CAP + 3; i += 1) {
+      s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: `/f${i}` });
+      s = tabsReducer(s, { type: "CLOSE_TAB", tabId: s.activeTabId });
+    }
+    expect(s.closed).toHaveLength(CLOSED_CAP);
+    // Most-recently-closed first.
+    expect(s.closed[0].history[0].path).toBe(`/f${CLOSED_CAP + 2}`);
   });
 });

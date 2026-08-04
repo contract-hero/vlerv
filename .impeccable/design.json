@@ -1,0 +1,390 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-04T11:32:52Z",
+  "title": "Design System: Vlervtifacts",
+  "extensions": {
+    "themes": {
+      "note": "Two themes follow the macOS system appearance via <html data-theme>. The frontmatter carries the ink (dark) values, which are also the pre-hydration fallback. Each colorMeta entry carries its paper (light) counterpart in `lightValue`.",
+      "default": "ink",
+      "selectors": { "ink": ":root, :root[data-theme=\"dark\"]", "paper": ":root[data-theme=\"light\"]" }
+    },
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Warm Ember",
+        "canonical": "#dda355",
+        "lightValue": "#9a6a1e",
+        "purpose": "Active tab underline, selected row edge, focus rings, bookmark stars, resizer, drop targets, input focus border, Markdown links, loading pulse. Nowhere else.",
+        "tonalRamp": [
+          "oklch(0.18 0.045 70)",
+          "oklch(0.29 0.062 70)",
+          "oklch(0.40 0.079 70)",
+          "oklch(0.51 0.093 70)",
+          "oklch(0.62 0.101 70)",
+          "oklch(0.74 0.098 70)",
+          "oklch(0.85 0.072 70)",
+          "oklch(0.94 0.038 70)"
+        ]
+      },
+      "accent-strong": {
+        "role": "primary",
+        "displayName": "Ember Bright",
+        "canonical": "#e8b56d",
+        "lightValue": "#7d5517",
+        "purpose": "Hover state of an ember element, mainly Markdown links. A state, not a second accent."
+      },
+      "bg": {
+        "role": "neutral",
+        "displayName": "Deep Ink",
+        "canonical": "#1c1a17",
+        "lightValue": "#faf8f4",
+        "purpose": "The reading field: preview pane and window ground. The active tab adopts it so the tab joins the content plane.",
+        "tonalRamp": [
+          "oklch(0.16 0.008 70)",
+          "oklch(0.24 0.010 70)",
+          "oklch(0.33 0.012 70)",
+          "oklch(0.44 0.013 70)",
+          "oklch(0.56 0.013 70)",
+          "oklch(0.70 0.012 70)",
+          "oklch(0.84 0.009 70)",
+          "oklch(0.96 0.006 70)"
+        ]
+      },
+      "bg-sidebar": {
+        "role": "neutral",
+        "displayName": "Shadowed Ink",
+        "canonical": "#100e0c",
+        "lightValue": "#f1ede5",
+        "purpose": "Recessed chrome: sidebar, tab strip, toolbar, table headers. Darker than the reading field so chrome sits behind the artifact."
+      },
+      "bg-elevated": {
+        "role": "neutral",
+        "displayName": "Raised Ink",
+        "canonical": "#292520",
+        "lightValue": "#ffffff",
+        "purpose": "Detached surfaces: context menu, quick-open panel, address-bar error tip."
+      },
+      "bg-row-hover": {
+        "role": "neutral",
+        "displayName": "Hover Ink",
+        "canonical": "#26221d",
+        "lightValue": "#e9e3d7",
+        "purpose": "Pointer-over state for rows, tabs, and icon buttons."
+      },
+      "bg-row-selected": {
+        "role": "neutral",
+        "displayName": "Held Ink",
+        "canonical": "#322b21",
+        "lightValue": "#eeddbe",
+        "purpose": "Selected row, quick-open selection, badge ground, primary sidebar button surface."
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Rule Ink",
+        "canonical": "#413a31",
+        "lightValue": "#cdc3b2",
+        "purpose": "Every 1px divider, panel border, table cell edge, and toolbar group separator. Separation is always a hairline."
+      },
+      "fg": {
+        "role": "neutral",
+        "displayName": "Parchment",
+        "canonical": "#d8d2c6",
+        "lightValue": "#33302a",
+        "purpose": "Body text and active icon glyphs.",
+        "tonalRamp": [
+          "oklch(0.20 0.010 75)",
+          "oklch(0.32 0.012 75)",
+          "oklch(0.44 0.014 75)",
+          "oklch(0.56 0.015 75)",
+          "oklch(0.68 0.016 75)",
+          "oklch(0.79 0.015 75)",
+          "oklch(0.88 0.012 75)",
+          "oklch(0.96 0.008 75)"
+        ]
+      },
+      "fg-muted": {
+        "role": "neutral",
+        "displayName": "Faded Parchment",
+        "canonical": "#968e7f",
+        "lightValue": "#7c7568",
+        "purpose": "Secondary text, inactive tab labels, section headers, icon buttons at rest."
+      },
+      "fg-dim": {
+        "role": "neutral",
+        "displayName": "Ghost Parchment",
+        "canonical": "#6b6458",
+        "lightValue": "#a39a8a",
+        "purpose": "Tertiary text: chevrons, keyboard hints, footer text, resting file glyphs."
+      },
+      "fg-path": {
+        "role": "neutral",
+        "displayName": "Path Parchment",
+        "canonical": "#a49b8a",
+        "lightValue": "#655e50",
+        "purpose": "Filesystem paths in the retrieval surfaces (start page, quick open) and in file notices. Its own token because a path is what tells two same-named artifacts apart: it must clear 4.5:1 on Raised Ink, Held Ink and Shadowed Ink in BOTH themes, which --fg-dim did not (2.77:1)."
+      },
+      "heading-fg": {
+        "role": "neutral",
+        "displayName": "Bleached Parchment",
+        "canonical": "#ece6da",
+        "lightValue": "#211e19",
+        "purpose": "Markdown headings and the start-page wordmark."
+      },
+      "label-active-fg": {
+        "role": "neutral",
+        "displayName": "Bleached Parchment (row)",
+        "canonical": "#f4efe6",
+        "lightValue": "#14120e",
+        "purpose": "Label of a selected or hovered file row: the brightest value in the system."
+      },
+      "code-bg": {
+        "role": "neutral",
+        "displayName": "Code Ground",
+        "canonical": "#262219",
+        "lightValue": "#efe9dc",
+        "purpose": "Inline code chip background in rendered Markdown."
+      },
+      "code-fg": {
+        "role": "tertiary",
+        "displayName": "Ember Code",
+        "canonical": "#e3c893",
+        "lightValue": "#7a5218",
+        "purpose": "Inline code text. Ember-adjacent but weaker, so code does not read as a link."
+      },
+      "pre-bg": {
+        "role": "neutral",
+        "displayName": "Well Ink",
+        "canonical": "#141210",
+        "lightValue": "#f4f1ea",
+        "purpose": "Fenced code block ground: the deepest recess in the reading surface."
+      },
+      "input-bg": {
+        "role": "neutral",
+        "displayName": "Recess Ink",
+        "canonical": "#0c0a08",
+        "lightValue": "#ffffff",
+        "purpose": "Address bar field ground. Darker than surrounding chrome so the field reads as a recess."
+      },
+      "input-border": {
+        "role": "neutral",
+        "displayName": "Field Rule",
+        "canonical": "#3b352c",
+        "lightValue": "#d5cdbe",
+        "purpose": "Resting input border, replaced by the accent on focus."
+      },
+      "button-hover-bg": {
+        "role": "neutral",
+        "displayName": "Pressed Ink",
+        "canonical": "#3a342b",
+        "lightValue": "#ded6c6",
+        "purpose": "Hover surface of a filled button and the tab close target."
+      },
+      "badge-bg": {
+        "role": "neutral",
+        "displayName": "Badge Ground",
+        "canonical": "#322b21",
+        "lightValue": "#efe4cd",
+        "purpose": "External-file badge, zoom indicator, keyboard chips, notice strip."
+      },
+      "badge-fg": {
+        "role": "primary",
+        "displayName": "Badge Ember",
+        "canonical": "#dda355",
+        "lightValue": "#8a5f1b",
+        "purpose": "External-file badge text: the one ember mark that labels rather than marks state."
+      },
+      "error-fg": {
+        "role": "tertiary",
+        "displayName": "Signal Coral",
+        "canonical": "#e08a7a",
+        "lightValue": "#b5493a",
+        "purpose": "Failure only: read errors, deleted-file notice, destructive menu items, remove-bookmark hover.",
+        "tonalRamp": [
+          "oklch(0.20 0.045 28)",
+          "oklch(0.31 0.065 28)",
+          "oklch(0.42 0.085 28)",
+          "oklch(0.53 0.100 28)",
+          "oklch(0.64 0.105 28)",
+          "oklch(0.73 0.092 28)",
+          "oklch(0.85 0.060 28)",
+          "oklch(0.94 0.030 28)"
+        ]
+      },
+      "star-idle": {
+        "role": "neutral",
+        "displayName": "Cold Star",
+        "canonical": "#4d463c",
+        "lightValue": "#c9c0af",
+        "purpose": "Unbookmarked star at 0.35 opacity until its row is hovered."
+      },
+      "scrollbar-thumb": {
+        "role": "neutral",
+        "displayName": "Thumb Ink",
+        "canonical": "#363028",
+        "lightValue": "#cfc7b8",
+        "purpose": "Scrollbar thumb on a transparent track, 10px wide with a 5px radius."
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "The start-page wordmark in New York serif. One instance in the whole product." },
+      "headline": { "displayName": "Headline", "purpose": "Markdown h1 in rendered artifacts, with a 1px bottom rule. h2 follows at 1.5em ruled, h3 at 1.25em unruled." },
+      "title": { "displayName": "Title", "purpose": "In-app notice headings, such as the file-deleted state." },
+      "body": { "displayName": "Body (UI)", "purpose": "The app's own chrome text and the root font size. Tabs and sidebar rows step down to 12px; explorer rows step up to 14px." },
+      "reading": { "displayName": "Reading", "purpose": "Rendered Markdown body in a 900px measure. The only place where comfort outranks density." },
+      "label": { "displayName": "Label", "purpose": "Uppercase section headers at 0.06em tracking. Bookmarks step down to 10px." },
+      "mono": { "displayName": "Mono", "purpose": "The address bar, every filesystem path, the start-page subtitle, code and preformatted text. Code blocks render at 13.5px." }
+    },
+    "shadows": [
+      {
+        "name": "menu-lift",
+        "value": "0 8px 28px rgba(12, 9, 5, 0.45)",
+        "lightValue": "0 8px 28px rgba(60, 48, 30, 0.18)",
+        "purpose": "Context menus: a surface that appeared at the pointer and will vanish."
+      },
+      {
+        "name": "overlay-lift",
+        "value": "0 16px 48px rgba(12, 9, 5, 0.55)",
+        "lightValue": "0 16px 48px rgba(60, 48, 30, 0.25)",
+        "purpose": "Modal overlays such as quick open, over a rgba(10, 8, 5, 0.4) scrim."
+      }
+    ],
+    "motion": [
+      { "name": "dur-fast", "value": "80ms", "purpose": "State feedback: hover, focus, opacity reveal, chevron rotation." },
+      { "name": "dur", "value": "160ms", "purpose": "Larger moves: resizer, sidebar transitions." },
+      { "name": "ease", "value": "cubic-bezier(0.2, 0, 0.2, 1)", "purpose": "The only easing curve in the system." },
+      { "name": "start-rise", "value": "360ms cubic-bezier(0.2, 0, 0.2, 1)", "purpose": "Start page entrance: 6px rise with opacity fade, once per mount." },
+      { "name": "tab-pulse", "value": "1s cubic-bezier(0.2, 0, 0.2, 1) infinite", "purpose": "Loading dot on a tab: opacity 0.25 to 1 and back." },
+      { "name": "reduced-motion", "value": "@media (prefers-reduced-motion: reduce) { transition-duration: 0.01ms; animation-duration: 0.01ms; animation-iteration-count: 1 }", "purpose": "Global override. Every animation in the system must survive it." }
+    ],
+    "layoutConstants": [
+      { "name": "chrome-band", "value": "38px", "purpose": "Sidebar drag strip and tab strip: their bottom borders form one line across the window." },
+      { "name": "toolbar-band", "value": "40px", "purpose": "Toolbar height." },
+      { "name": "row-height", "value": "30px", "purpose": "Explorer tree row." },
+      { "name": "sidebar-clamp", "value": "200px – 480px", "purpose": "Resizable sidebar range, dragged by a 6px hit target." },
+      { "name": "reading-measure", "value": "900px", "purpose": "Rendered Markdown column, 32px/28px padding." },
+      { "name": "overlay-measure", "value": "min(560px, 86vw)", "purpose": "Quick open panel at 12vh, capped at 60vh." },
+      { "name": "start-measure", "value": "560px", "purpose": "Start page column with a 56px top inset that clears the traffic lights." },
+      { "name": "window-min", "value": "640 × 400", "purpose": "Enforced window minimum. There are no responsive breakpoints." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Active Tab",
+      "kind": "nav",
+      "refersTo": "tab-active",
+      "description": "The signature chrome element: the active tab adopts the reading field's background and carries a 2px ember bar across its top.",
+      "html": "<div class=\"ds-tabstrip\"><div class=\"ds-tab ds-tab-active\"><span class=\"ds-tab-icon\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-tab-label\">DESIGN.md</span><button class=\"ds-tab-close\" aria-label=\"Close tab\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"><path d=\"M18 6 6 18M6 6l12 12\"/></svg></button></div><div class=\"ds-tab\"><span class=\"ds-tab-icon\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-tab-label\">report.html</span></div></div>",
+      "css": ".ds-tabstrip { display: flex; background: #100e0c; border-bottom: 1px solid #413a31; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-tab { position: relative; display: flex; align-items: center; gap: 6px; height: 38px; min-width: 110px; max-width: 220px; padding: 0 8px 0 12px; font-size: 12px; color: #968e7f; border-right: 1px solid #413a31; background: transparent; cursor: default; transition: background 80ms cubic-bezier(0.2,0,0.2,1), color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-tab:hover { background: #26221d; } .ds-tab-active { background: #1c1a17; color: #d8d2c6; } .ds-tab-active::after { content: \"\"; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: #dda355; } .ds-tab-icon { display: inline-flex; flex: 0 0 auto; } .ds-tab-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-tab-close { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border: 0; border-radius: 4px; background: transparent; color: #6b6458; cursor: pointer; opacity: 0; transition: opacity 80ms cubic-bezier(0.2,0,0.2,1), background 80ms cubic-bezier(0.2,0,0.2,1); } .ds-tab:hover .ds-tab-close, .ds-tab-active .ds-tab-close { opacity: 1; } .ds-tab-close:hover { background: #3a342b; color: #d8d2c6; } .ds-tab-close:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; }"
+    },
+    {
+      "name": "Toolbar Icon Button",
+      "kind": "button",
+      "refersTo": "toolbar-button",
+      "description": "28×28 icon control, transparent at rest. Used for back/forward/reload/star/share across the toolbar.",
+      "html": "<div class=\"ds-toolbar\"><button class=\"ds-icon-btn\" aria-label=\"Back\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m15 18-6-6 6-6\"/></svg></button><button class=\"ds-icon-btn\" disabled aria-label=\"Forward\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m9 18 6-6-6-6\"/></svg></button><button class=\"ds-icon-btn ds-icon-btn-star\" aria-label=\"Bookmark\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"currentColor\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linejoin=\"round\"><path d=\"m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z\"/></svg></button></div>",
+      "css": ".ds-toolbar { display: flex; align-items: center; gap: 4px; height: 40px; padding: 0 8px; background: #100e0c; border-bottom: 1px solid #413a31; } .ds-icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: #968e7f; cursor: pointer; transition: background 80ms cubic-bezier(0.2,0,0.2,1), color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-icon-btn:hover:not(:disabled) { background: #26221d; color: #d8d2c6; } .ds-icon-btn:disabled { color: #6b6458; opacity: 0.5; cursor: default; } .ds-icon-btn:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; } .ds-icon-btn-star { color: #dda355; }"
+    },
+    {
+      "name": "Address Bar Field",
+      "kind": "input",
+      "refersTo": "address-input",
+      "description": "Monospace path field on a recessed ground. Focus is signalled by the border becoming ember; the native outline is suppressed here.",
+      "html": "<div class=\"ds-address\"><input class=\"ds-address-input\" value=\"/Users/you/workspace/vlerv/DESIGN.md\" spellcheck=\"false\" aria-label=\"Path\"><span class=\"ds-badge\">external</span><button class=\"ds-zoom\">120%</button></div>",
+      "css": ".ds-address { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: #100e0c; } .ds-address-input { flex: 1 1 auto; min-width: 0; background: #0c0a08; color: #d8d2c6; border: 1px solid #3b352c; border-radius: 6px; padding: 5px 10px; font-family: \"SF Mono\", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; outline: none; transition: border-color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-address-input:focus { border-color: #dda355; } .ds-badge { display: inline-block; padding: 2px 6px; font-size: 10px; border-radius: 4px; background: #322b21; color: #dda355; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-zoom { border: 0; border-radius: 6px; background: #322b21; color: #968e7f; font-size: 11px; padding: 3px 8px; cursor: pointer; font-family: inherit; } .ds-zoom:hover { color: #d8d2c6; }"
+    },
+    {
+      "name": "Explorer Row",
+      "kind": "custom",
+      "refersTo": "explorer-row",
+      "description": "The workspace tree row: 30px tall, chevron, file icon, label, and a star that stays at 0.35 opacity until the row is hovered. Selection is a tone step plus a 2px ember inset edge.",
+      "html": "<div class=\"ds-tree\"><div class=\"ds-row\"><span class=\"ds-chevron\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m9 18 6-6-6-6\"/></svg></span><span class=\"ds-row-icon\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg></span><span class=\"ds-row-label ds-row-folder\">reports</span></div><div class=\"ds-row ds-row-selected\"><span class=\"ds-chevron ds-chevron-empty\"></span><span class=\"ds-row-icon\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-row-label\">audit.html</span><button class=\"ds-star ds-star-on\" aria-label=\"Bookmark\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"currentColor\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linejoin=\"round\"><path d=\"m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z\"/></svg></button></div><div class=\"ds-row\"><span class=\"ds-chevron ds-chevron-empty\"></span><span class=\"ds-row-icon\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-row-label\">notes.md</span><button class=\"ds-star\" aria-label=\"Bookmark\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linejoin=\"round\"><path d=\"m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z\"/></svg></button></div></div>",
+      "css": ".ds-tree { background: #100e0c; padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; user-select: none; } .ds-row { display: flex; align-items: center; height: 30px; padding: 0 12px 0 8px; font-size: 14px; color: #d8d2c6; cursor: pointer; white-space: nowrap; } .ds-row:hover { background: #26221d; } .ds-row:hover .ds-row-label { color: #f4efe6; } .ds-row-selected { background: #322b21; box-shadow: inset 2px 0 0 0 #dda355; } .ds-row-selected .ds-row-label { color: #f4efe6; } .ds-chevron { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; color: #6b6458; margin-right: 6px; flex: 0 0 auto; transition: transform 80ms cubic-bezier(0.2,0,0.2,1); } .ds-chevron-empty { color: transparent; } .ds-row-icon { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-right: 8px; color: #968e7f; flex: 0 0 auto; } .ds-row-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; } .ds-row-folder { font-weight: 500; } .ds-star { background: transparent; border: 0; padding: 2px 4px; margin-left: 4px; flex: 0 0 auto; cursor: pointer; color: #4d463c; display: inline-flex; align-items: center; opacity: 0.35; transition: opacity 80ms cubic-bezier(0.2,0,0.2,1), color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-row:hover .ds-star { opacity: 1; } .ds-star:hover { color: #dda355; opacity: 1; } .ds-star-on { color: #dda355; opacity: 1; } .ds-star:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; border-radius: 4px; }"
+    },
+    {
+      "name": "Start Page Ghost Action",
+      "kind": "button",
+      "refersTo": "start-action",
+      "description": "Bordered ghost button with an inline icon and an optional keyboard chip. The start page's only call to action shape.",
+      "html": "<div class=\"ds-actions\"><button class=\"ds-action\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>Open file<kbd class=\"ds-kbd\">⌘O</kbd></button><button class=\"ds-action\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"11\" cy=\"11\" r=\"8\"/><path d=\"m21 21-4.3-4.3\"/></svg>Quick open<kbd class=\"ds-kbd\">⌘P</kbd></button></div>",
+      "css": ".ds-actions { display: flex; gap: 8px; flex-wrap: wrap; background: #1c1a17; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-action { display: inline-flex; align-items: center; gap: 7px; background: #100e0c; color: #d8d2c6; border: 1px solid #413a31; border-radius: 6px; padding: 7px 12px; font-size: 12.5px; font-family: inherit; cursor: pointer; transition: background 80ms cubic-bezier(0.2,0,0.2,1), border-color 80ms cubic-bezier(0.2,0,0.2,1); } .ds-action:hover { background: #26221d; border-color: #6b6458; } .ds-action:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; } .ds-kbd { font-family: inherit; font-size: 10px; background: #322b21; border: 1px solid #413a31; border-radius: 4px; padding: 1px 4px; color: #968e7f; }"
+    },
+    {
+      "name": "Primary Sidebar Button",
+      "kind": "button",
+      "refersTo": "sidebar-button",
+      "description": "The filled action, used for the first-run workspace picker. The only button in the product with a filled resting surface.",
+      "html": "<div class=\"ds-empty\"><p class=\"ds-empty-text\">No workspace selected.</p><button class=\"ds-btn-primary\">Choose workspace folder…</button></div>",
+      "css": ".ds-empty { background: #100e0c; padding: 24px; text-align: center; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-empty-text { color: #968e7f; font-size: 12px; margin: 0 0 14px; } .ds-btn-primary { background: #322b21; color: #d8d2c6; border: 1px solid #413a31; border-radius: 6px; padding: 8px 14px; font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; transition: background 80ms cubic-bezier(0.2,0,0.2,1); } .ds-btn-primary:hover { background: #3a342b; } .ds-btn-primary:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; }"
+    },
+    {
+      "name": "Context Menu",
+      "kind": "custom",
+      "refersTo": "context-menu-item",
+      "description": "Custom menu with no dependency: raised surface, 10px radius, warm menu-lift shadow, 12.5px items with leading icons and a destructive variant.",
+      "html": "<div class=\"ds-menu\"><button class=\"ds-menu-item\"><span class=\"ds-menu-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 3h6v6\"/><path d=\"M10 14 21 3\"/><path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\"/></svg></span>Open in New Tab</button><button class=\"ds-menu-item\"><span class=\"ds-menu-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect width=\"14\" height=\"14\" x=\"8\" y=\"8\" rx=\"2\"/><path d=\"M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2\"/></svg></span>Copy Path</button><div class=\"ds-menu-sep\"></div><button class=\"ds-menu-item ds-menu-danger\"><span class=\"ds-menu-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h18\"/><path d=\"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6\"/><path d=\"M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2\"/></svg></span>Remove Bookmark</button></div>",
+      "css": ".ds-menu { display: inline-flex; flex-direction: column; min-width: 180px; background: #292520; border: 1px solid #413a31; border-radius: 10px; box-shadow: 0 8px 28px rgba(12, 9, 5, 0.45); padding: 4px; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-menu-item { display: flex; align-items: center; gap: 8px; border: 0; background: transparent; color: #d8d2c6; font-family: inherit; font-size: 12.5px; text-align: left; padding: 6px 10px; border-radius: 5px; cursor: pointer; } .ds-menu-item:hover { background: #322b21; } .ds-menu-item:focus-visible { outline: 2px solid #dda355; outline-offset: -2px; } .ds-menu-danger { color: #e08a7a; } .ds-menu-icon { display: inline-flex; color: #968e7f; } .ds-menu-danger .ds-menu-icon { color: #e08a7a; } .ds-menu-sep { height: 1px; background: #413a31; margin: 4px 6px; }"
+    },
+    {
+      "name": "Quick Open Panel",
+      "kind": "card",
+      "refersTo": "overlay-panel",
+      "description": "The signature retrieval surface: borderless search row, result rows of name plus right-aligned dimmed monospace directory, and a footer hint. Selection uses tone only, never the accent.",
+      "html": "<div class=\"ds-qo\"><div class=\"ds-qo-input\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"11\" cy=\"11\" r=\"8\"/><path d=\"m21 21-4.3-4.3\"/></svg><input value=\"desg\" spellcheck=\"false\" aria-label=\"Search files\"></div><ul class=\"ds-qo-list\"><li class=\"ds-qo-selected\"><span class=\"ds-qo-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-qo-name\">DESIGN.md</span><span class=\"ds-qo-dir\">~/workspace/vlerv</span></li><li><span class=\"ds-qo-icon\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><path d=\"M14 2v6h6\"/></svg></span><span class=\"ds-qo-name\">design.json</span><span class=\"ds-qo-dir\">~/workspace/vlerv/.impeccable</span></li></ul><div class=\"ds-qo-footer\">↑↓ navigate · ⏎ open · esc close</div></div>",
+      "css": ".ds-qo { width: min(560px, 86vw); background: #292520; border: 1px solid #413a31; border-radius: 10px; box-shadow: 0 16px 48px rgba(12, 9, 5, 0.55); overflow: hidden; display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-qo-input { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #413a31; color: #968e7f; } .ds-qo-input input { flex: 1; border: 0; outline: none; background: transparent; color: #d8d2c6; font-family: inherit; font-size: 15px; } .ds-qo-list { list-style: none; margin: 0; padding: 4px; } .ds-qo-list li { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; font-size: 13px; color: #d8d2c6; cursor: pointer; } .ds-qo-selected { background: #322b21; } .ds-qo-icon { display: inline-flex; flex: 0 0 auto; color: #968e7f; } .ds-qo-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-qo-dir { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: right; color: #a49b8a; font-size: 11px; font-family: \"SF Mono\", ui-monospace, SFMono-Regular, Menlo, monospace; } .ds-qo-footer { padding: 5px 12px; font-size: 10px; color: #6b6458; border-top: 1px solid #413a31; }"
+    },
+    {
+      "name": "Start Page Wordmark",
+      "kind": "custom",
+      "refersTo": "display",
+      "description": "The one serif moment in the product: New York at 34px over a monospace workspace path, above the uppercase section label used across the sidebar and start page.",
+      "html": "<div class=\"ds-start\"><h1 class=\"ds-wordmark\">Vlervtifacts</h1><p class=\"ds-start-sub\">~/workspace/vlerv</p><h2 class=\"ds-section-label\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"currentColor\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linejoin=\"round\"><path d=\"m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z\"/></svg>Bookmarks</h2></div>",
+      "css": ".ds-start { background: #1c1a17; padding: 32px 28px; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; } .ds-wordmark { font-family: \"New York\", ui-serif, Georgia, serif; font-size: 34px; font-weight: 600; letter-spacing: -0.01em; color: #ece6da; margin: 0 0 4px; } .ds-start-sub { font-family: \"SF Mono\", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #6b6458; margin: 0 0 24px; } .ds-section-label { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #6b6458; margin: 0; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Archivist's Desk",
+    "overview": "This is not a browser and not an editor. It is the desk of someone who keeps things: a workspace tree that holds a collection, bookmarks and recents that record what mattered, a quick-open palette that retrieves on demand, and a reading surface where the held object is finally examined. Custody comes first, reading second. Every surface in the chrome exists to fetch, hold, or hand over an artifact, and then to get out of the way while it is read.\n\nThe material is warm. Neutrals carry a low warm hue in both themes — an ink palette (#1c1a17 upward) after dark, a paper palette (#faf8f4 downward) in daylight — and the two follow the macOS system appearance without a manual switch. A single ember accent is the only chromatic voice in the product. It marks what is active, what is held, and where the keyboard is. Nothing else in the interface is allowed to be colorful.\n\nDensity is deliberate. Base UI type is 13px, rows are 30px, chrome bands are 38–40px tall, and the radius scale stops at 10px. The system reads as crafted, archival and patient: built to be lived in for hours by one person who knows every shortcut, not to impress on first sight. Confirmed rejections: cool editor blue-grey, glassmorphism and backdrop blur, neon or high-saturation accents, and rounded consumer-app playfulness.",
+    "keyCharacteristics": [
+      "Warm neutrals only; no cool grey anywhere in the chrome.",
+      "One accent, used as a marker and never as decoration.",
+      "Dual ink/paper themes driven by the OS, with the same structure in both.",
+      "High density: 13px UI type, 30px rows, 4px spacing grid.",
+      "Native macOS posture: overlay title bar, system fonts, system appearance.",
+      "The artifact viewport is the largest and quietest region on screen."
+    ],
+    "rules": [
+      { "name": "The Single Lamp Rule", "body": "There is one accent hue in the product. If a new element needs to stand out, it earns tone, weight, or position — not a second color. A screen showing more than a few ember marks at once has lost the metaphor.", "section": "colors" },
+      { "name": "The Warm Neutral Rule", "body": "No neutral in this system is hue-neutral or cool. Every grey carries a warm cast. A #2a2a2a or a #8892a0 anywhere in the chrome is a defect, not a variation.", "section": "colors" },
+      { "name": "The Coral-Means-Broken Rule", "body": "Coral is reserved for something that failed or will be destroyed. It never marks emphasis, novelty, or a required field.", "section": "colors" },
+      { "name": "The One Serif Moment Rule", "body": "New York appears on the wordmark and nowhere else. A second serif element dilutes the only moment the product speaks in its own voice.", "section": "typography" },
+      { "name": "The Paths Are Mono Rule", "body": "Anything that is a filesystem path renders in mono, dimmed to Ghost Parchment and right-aligned when it trails a filename. A path in the UI font is a defect.", "section": "typography" },
+      { "name": "The Density Floor Rule", "body": "Chrome type does not go below 10px, and 11px uppercase labels always carry 0.06em tracking. Small type without tracking is unreadable at this density.", "section": "typography" },
+      { "name": "The Aligned Band Rule", "body": "The sidebar's drag strip and the tab strip are both 38px, so their bottom borders form one unbroken line across the window under the traffic lights. Any new top-level chrome band matches that height or explicitly sits below the line.", "section": "layout" },
+      { "name": "The Artifact Gets the Rest Rule", "body": "Chrome takes fixed bands; the artifact takes every remaining pixel. No chrome element grows with the window.", "section": "layout" },
+      { "name": "The Earned Lift Rule", "body": "Lift responds to detachment or state. A surface that sits in the layout is flat and separated by tone and a 1px rule; a surface that floats above the layout casts a warm shadow. Decorative resting shadows are not part of this system.", "section": "elevation" },
+      { "name": "The Warm Shadow Rule", "body": "Shadow color is warm-black, never rgba(0,0,0,x). A neutral shadow over warm ink reads as a cool bruise.", "section": "elevation" },
+      { "name": "The 10px Ceiling Rule", "body": "Nothing exceeds a 10px radius. No pills, no capsule buttons, no circular avatars. The desk is made of rectangles.", "section": "shapes" },
+      { "name": "The 2px Marker Rule", "body": "Selection and activity are marked by a 2px ember bar on an edge. Filling a whole element with the accent is not how this system says \"active\".", "section": "shapes" }
+    ],
+    "dos": [
+      "Do define every new color as a theme token in both the :root ink block and the [data-theme=\"light\"] paper block. A hard-coded hex in a component breaks the OS-driven theme switch.",
+      "Do mark active and selected state with a 2px ember bar on an edge (::after for tabs, box-shadow: inset for rows).",
+      "Do keep the accent to markers: activity, selection, focus, held state, and links.",
+      "Do render every filesystem path in mono, dimmed to Ghost Parchment and right-aligned when it trails a filename.",
+      "Do hold the 4px spacing grid and the 4/6/10px radius scale.",
+      "Do transition on var(--dur-fast) (80ms) for state feedback and var(--dur) (160ms) for larger moves, both on var(--ease).",
+      "Do give every interactive element a :focus-visible ember ring, and keep prefers-reduced-motion support intact.",
+      "Do reveal icon-only affordances (close, star, remove) on hover of their row, and keep them present when the row is active."
+    ],
+    "donts": [
+      "Don't introduce cool grey. No #2a2a2a, no blue-grey editor chrome, no neutral rgba(0,0,0,x) shadows.",
+      "Don't add a second accent hue. Ember is the only chromatic voice; coral is failure, not color.",
+      "Don't use backdrop-filter, frosted panels, or translucent chrome. Surfaces are opaque and warm.",
+      "Don't exceed a 10px radius, and don't build pills, capsules, or circular containers.",
+      "Don't put a resting shadow on a surface that sits inside the layout.",
+      "Don't add a second serif element; the wordmark owns that voice.",
+      "Don't let chrome grow with the window, and don't add responsive breakpoints. The sidebar split is the only elastic axis.",
+      "Don't fill an element with the accent to say \"selected\". Use the 2px marker and a tone step."
+    ]
+  }
+}

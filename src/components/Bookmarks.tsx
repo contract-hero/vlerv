@@ -60,6 +60,17 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
     void reorder(order);
   };
 
+  /** Keyboard equivalent of drag-to-reorder: ⌥↑ / ⌥↓ on a focused row. */
+  const moveBy = (path: string, delta: 1 | -1) => {
+    const order = bookmarks.map((b) => b.path);
+    const from = order.indexOf(path);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= order.length) return;
+    const [moved] = order.splice(from, 1);
+    order.splice(to, 0, moved);
+    void reorder(order);
+  };
+
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
       const next = !prev;
@@ -85,26 +96,24 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
 
   return (
     <div data-section="bookmarks" data-testid="bookmarks-group">
-      <h4
-        className="bookmarks-header"
-        onClick={toggleCollapsed}
-        role="button"
-        aria-expanded={!collapsed}
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            toggleCollapsed();
-          }
-        }}
-      >
-        <span
-          className={`bookmarks-chevron${collapsed ? "" : " open"}`}
-          aria-hidden
+      {/* The heading stays a heading — a screen reader's rotor needs it — and
+          the control inside it is a real button rather than role="button" on
+          the h4, which used to discard the heading semantics entirely. */}
+      <h4 className="bookmarks-header">
+        <button
+          type="button"
+          className="bookmarks-header-toggle"
+          onClick={toggleCollapsed}
+          aria-expanded={!collapsed}
         >
-          <ChevronRight size={12} strokeWidth={2} />
-        </span>
-        <span>Bookmarks</span>
+          <span
+            className={`bookmarks-chevron${collapsed ? "" : " open"}`}
+            aria-hidden
+          >
+            <ChevronRight size={12} strokeWidth={2} />
+          </span>
+          <span>Bookmarks</span>
+        </button>
         <span className="bookmarks-count" aria-hidden>{bookmarks.length}</span>
       </h4>
       {!collapsed && (
@@ -146,8 +155,21 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
                 if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
               }}
               onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
+              // Openable and reorderable without a mouse: Enter/Space opens,
+              // ⌥↑/⌥↓ moves the row. Drag was the only way to reorder before.
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onOpenFile?.(entry.path, openOptsFromClick(e));
+                } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+                  e.preventDefault();
+                  moveBy(entry.path, e.key === "ArrowDown" ? 1 : -1);
+                }
+              }}
               style={{ cursor: "pointer" }}
-              title={`${entry.path}\n(drag to reorder)`}
+              title={`${entry.path}\n(drag, or ⌥↑ / ⌥↓, to reorder)`}
             >
               <span className="bookmark-label">{basename(entry.path)}</span>
               <button

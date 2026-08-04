@@ -10,6 +10,7 @@ import {
   currentEntry,
   initialTabsState,
   isLoading,
+  serializeTabs,
   tabsReducer,
 } from "./tabs";
 import type { TabsAction, TabsState } from "./tabs";
@@ -33,6 +34,9 @@ export function useActiveTab() {
 /** Debounce window for watcher-driven reloads (backend already debounces
  *  250 ms; this collapses bursts arriving across separate events). */
 const RELOAD_DEBOUNCE_MS = 150;
+
+/** Coalesce bursts of tab churn into one state.json write. */
+const SESSION_PERSIST_MS = 400;
 
 export interface TabsProviderProps {
   ipc: IpcSurface;
@@ -73,6 +77,54 @@ export function TabsProvider({ ipc, children }: TabsProviderProps): React.ReactE
     // active/entry are derived from state; the identity that matters is
     // (tab id, path, nonce) — reruns on any of those.
   }, [ipc, active.id, entry?.path, active.reloadNonce, active.loadedFor, active.loadedNonce]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Session persistence ──────────────────────────────────────────────────
+  // Window geometry already survived quit; the reading session did not. For a
+  // custody-first tool that made quitting a data-loss event. Only WHERE each
+  // tab points is stored — never its payload — so a restored tab re-reads
+  // from disk and a file that changed or vanished meanwhile shows the truth.
+  const hydratedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    if (!ipc.getState) {
+      hydratedRef.current = true;
+      return;
+    }
+    let cancelled = false;
+    void ipc
+      .getState()
+      .then((s) => {
+        if (cancelled) return;
+        const persisted = s?.panes?.tabs;
+        if (persisted) dispatch({ type: "HYDRATE", persisted: persisted as never });
+      })
+      .catch(() => {
+        // No backend or no state.json — start with the fresh empty tab.
+      })
+      .finally(() => {
+        if (!cancelled) hydratedRef.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ipc]);
+
+  // Serialize eagerly so the effect below only fires on a REAL session change;
+  // payload loads and reload nonces churn the state constantly and must not
+  // schedule a write.
+  const sessionJson = React.useMemo(
+    () => JSON.stringify(serializeTabs(state)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.tabs, state.activeTabId],
+  );
+
+  React.useEffect(() => {
+    if (!hydratedRef.current || !ipc.setStateField) return;
+    const timer = window.setTimeout(() => {
+      void ipc.setStateField?.("panes.tabs", JSON.parse(sessionJson)).catch(() => {});
+    }, SESSION_PERSIST_MS);
+    return () => window.clearTimeout(timer);
+  }, [ipc, sessionJson]);
 
   // ── Watcher-driven auto-reload ───────────────────────────────────────────
   const openPathsRef = React.useRef<Set<string>>(new Set());

@@ -1,12 +1,31 @@
 // TabView — renders the ACTIVE tab's content: start page, deleted-file
 // notice, load error, or the file preview.
 import * as React from "react";
-import { FileX } from "lucide-react";
+import { FileX, FileWarning, Folder, RotateCw } from "lucide-react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
 import { currentEntry } from "../state/tabs";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import Preview from "./Preview";
 import StartPage from "./StartPage";
+
+/**
+ * The backend hands back a machine `kind` ("Io") and an OS reason string.
+ * Neither is a headline. Name the problem in the reader's language and keep
+ * the raw reason as secondary detail.
+ */
+export function readErrorTitle(kind: string, reason: string): string {
+  const text = `${kind} ${reason}`.toLowerCase();
+  if (text.includes("not found") || text.includes("notfound") || text.includes("no such file")) {
+    return "File not found";
+  }
+  if (text.includes("permission") || text.includes("denied")) return "Permission denied";
+  if (text.includes("out of root") || text.includes("outofroot")) {
+    return "Outside the workspace";
+  }
+  if (text.includes("too large") || text.includes("oversized")) return "File too large to display";
+  return "Could not read this file";
+}
 
 export interface TabViewProps {
   onOpenFile: (path: string, opts?: OpenFileOptions) => void;
@@ -42,32 +61,59 @@ export default function TabView({
 
   if (tab.deleted) {
     return (
-      <div className="deleted-notice" data-testid="deleted-notice" role="alert">
+      <div className="file-notice" data-testid="deleted-notice" role="alert">
         <FileX size={28} strokeWidth={1.5} aria-hidden />
-        <p className="deleted-notice-title">File deleted</p>
-        <p className="deleted-notice-path">{entry.path}</p>
-        <p className="deleted-notice-hint">
+        <p className="file-notice-title">File deleted</p>
+        <p className="file-notice-path">{entry.path}</p>
+        <p className="file-notice-hint">
           The file was removed from disk. It will reload automatically if it
           comes back.
         </p>
-        <button
-          type="button"
-          className="sidebar-button"
-          onClick={() => dispatch({ type: "CLOSE_TAB", tabId: tab.id })}
-        >
-          Close tab
-        </button>
+        <div className="file-notice-actions">
+          <button
+            type="button"
+            className="notice-button"
+            onClick={() => dispatch({ type: "CLOSE_TAB", tabId: tab.id })}
+          >
+            Close tab
+          </button>
+        </div>
       </div>
     );
   }
 
+  // Same shape as the deleted-file notice on purpose: a failed read is the
+  // same class of event and deserves the same care — name it, show the path,
+  // and offer the two things worth doing about it.
   if (isErrorPayload(tab.payload)) {
     const { kind, path, reason } = tab.payload.error;
     return (
-      <div role="alert" data-testid="preview-error" className="preview-error">
-        <p className="preview-error-kind">{kind}</p>
-        <p className="preview-error-path">{path}</p>
-        <p className="preview-error-reason">{reason}</p>
+      <div role="alert" data-testid="preview-error" className="file-notice">
+        <FileWarning size={28} strokeWidth={1.5} aria-hidden />
+        <p className="file-notice-title">{readErrorTitle(kind, reason)}</p>
+        <p className="file-notice-path">{path}</p>
+        <p className="file-notice-hint">{reason}</p>
+        <div className="file-notice-actions">
+          <button
+            type="button"
+            className="notice-button"
+            data-testid="preview-error-retry"
+            onClick={() => dispatch({ type: "RELOAD" })}
+          >
+            <RotateCw size={13} strokeWidth={2} aria-hidden /> Try again
+          </button>
+          <button
+            type="button"
+            className="notice-button"
+            onClick={() => {
+              void revealItemInDir(path).catch(() => {
+                // Parent directory may be gone too — nothing useful to add.
+              });
+            }}
+          >
+            <Folder size={13} strokeWidth={2} aria-hidden /> Reveal in Finder
+          </button>
+        </div>
       </div>
     );
   }

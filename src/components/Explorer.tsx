@@ -106,6 +106,7 @@ function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps):
         data-kind="dir"
         role="treeitem"
         aria-expanded={expanded}
+        aria-selected={isSelected}
         aria-level={depth + 1}
         tabIndex={focusedPath === entry.path ? 0 : -1}
       >
@@ -117,32 +118,39 @@ function FolderNode({ ipc, entry, depth, onOpenFile, selectedFile }: NodeProps):
         </span>
         <span className="label">{entry.name}</span>
       </div>
-      {expanded && error !== null && (
-        <div className="row error-row" style={{ paddingLeft: `${indentPx + 20}px` }}>
-          {error}
+      {/* An expanded folder's children live in a `group`, so a screen reader
+          reports real nesting instead of one flat list of siblings. The
+          wrapper is layout-neutral: rows carry their own indent. */}
+      {expanded && (error !== null || entries !== null) && (
+        <div role="group">
+          {error !== null && (
+            <div className="row error-row" style={{ paddingLeft: `${indentPx + 20}px` }}>
+              {error}
+            </div>
+          )}
+          {entries !== null && sortEntries(entries).map((child) =>
+            child.is_dir ? (
+              <FolderNode
+                key={child.path}
+                ipc={ipc}
+                entry={child}
+                depth={depth + 1}
+                onOpenFile={onOpenFile}
+                selectedFile={selectedFile}
+              />
+            ) : (
+              <FileRow
+                key={child.path}
+                entry={child}
+                depth={depth + 1}
+                onOpenFile={onOpenFile}
+                selected={selectedFile === child.path}
+                bookmarked={isBookmarked(child.path)}
+                onToggleBookmark={(p) => void toggleBookmark(p)}
+              />
+            )
+          )}
         </div>
-      )}
-      {expanded && entries !== null && sortEntries(entries).map((child) =>
-        child.is_dir ? (
-          <FolderNode
-            key={child.path}
-            ipc={ipc}
-            entry={child}
-            depth={depth + 1}
-            onOpenFile={onOpenFile}
-            selectedFile={selectedFile}
-          />
-        ) : (
-          <FileRow
-            key={child.path}
-            entry={child}
-            depth={depth + 1}
-            onOpenFile={onOpenFile}
-            selected={selectedFile === child.path}
-            bookmarked={isBookmarked(child.path)}
-            onToggleBookmark={(p) => void toggleBookmark(p)}
-          />
-        )
       )}
     </>
   );
@@ -306,6 +314,15 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
     [focusedPath, setFocusedPath, expandedPaths, expand, collapse, onOpenFile],
   );
 
+  // Does a row currently hold the tabbable slot? `focusedPath` can outlive the
+  // row it names — collapsing an ancestor unmounts it — so we ask the DOM
+  // after every render that could have changed the row set.
+  const [rowIsTabbable, setRowIsTabbable] = React.useState(false);
+  React.useEffect(() => {
+    const container = containerRef.current;
+    setRowIsTabbable(!!container?.querySelector('[data-path][tabindex="0"]'));
+  });
+
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
       const next = new Map(prev);
@@ -351,13 +368,6 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
     return () => { cancelled = true; };
   }, [ipc, root, rootVersion, refreshNonce]);
 
-  if (error !== null) {
-    return <div role="alert" className="explorer-error">{error}</div>;
-  }
-  if (entries === null) {
-    return <div className="explorer-loading">Loading…</div>;
-  }
-
   return (
     <FolderCacheContext.Provider value={versions}>
       <RefreshContext.Provider value={refreshNonce}>
@@ -366,12 +376,22 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
         role="tree"
         aria-label="Workspace files"
         ref={containerRef}
-        // Tab-reachable even before any row has been focused; the keydown
-        // handler treats "no focused row" as "start at the first row".
-        tabIndex={focusedPath ? -1 : 0}
+        // Roving tabindex: exactly one element in the tree must be tabbable.
+        // The container takes the slot whenever no ROW currently holds it —
+        // before anything is focused, and after the focused row unmounts
+        // (collapse an ancestor, refresh, switch workspace). Keying this off
+        // `focusedPath` alone used to strand the tree outside the tab order,
+        // because the path stayed set while its row was gone.
+        tabIndex={rowIsTabbable ? -1 : 0}
         onKeyDown={onTreeKeyDown}
       >
-        {sortEntries(entries).map((entry) =>
+        {error !== null ? (
+          <div role="alert" className="explorer-error">{error}</div>
+        ) : null}
+        {error === null && entries === null ? (
+          <div className="explorer-loading">Loading…</div>
+        ) : null}
+        {(entries === null ? [] : sortEntries(entries)).map((entry) =>
           entry.is_dir ? (
             <FolderNode
               key={entry.path}

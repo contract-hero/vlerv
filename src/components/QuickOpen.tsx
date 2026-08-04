@@ -89,15 +89,22 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
     onClose();
   };
 
+  // The pointer must MOVE before it may retarget the selection. Without this,
+  // resting the cursor anywhere over the list silently reassigns the keyboard
+  // selection as results reflow under it, and Enter opens the wrong file.
+  const pointerActive = React.useRef(false);
+
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
       onClose();
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
+      pointerActive.current = false;
       setSelectedIndex((i) => Math.min(results.length - 1, i + 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
+      pointerActive.current = false;
       setSelectedIndex((i) => Math.max(0, i - 1));
     } else if (e.key === "Enter") {
       e.preventDefault();
@@ -105,6 +112,12 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
       if (hit) {
         open(hit.value, openOptsFromClick(e));
       }
+    } else if (e.key === "Tab") {
+      // Focus trap: the palette owns the keyboard while it is open. There is
+      // nothing else to tab to inside it, and tabbing THROUGH it would leave
+      // focus on chrome hidden behind the backdrop.
+      e.preventDefault();
+      inputRef.current?.focus();
     }
   };
 
@@ -113,6 +126,7 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
       <div
         className="quick-open"
         role="dialog"
+        aria-modal="true"
         aria-label="Quick open"
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={onKeyDown}
@@ -126,26 +140,53 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
+            role="combobox"
+            aria-expanded
+            aria-controls="quick-open-list"
+            aria-activedescendant={
+              results[selectedIndex] ? `quick-open-opt-${selectedIndex}` : undefined
+            }
+            aria-label="Go to file"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              pointerActive.current = false;
+              setQuery(e.target.value);
+            }}
           />
         </div>
-        <ul className="quick-open-list" ref={listRef} role="listbox">
+        <ul
+          className="quick-open-list"
+          id="quick-open-list"
+          ref={listRef}
+          role="listbox"
+          aria-label="Matching files"
+          onMouseMove={() => {
+            pointerActive.current = true;
+          }}
+        >
           {results.map((r, i) => (
             <li
               key={r.value}
+              id={`quick-open-opt-${i}`}
               role="option"
               aria-selected={i === selectedIndex}
               className={i === selectedIndex ? "selected" : undefined}
-              onMouseEnter={() => setSelectedIndex(i)}
+              onMouseEnter={() => {
+                if (pointerActive.current) setSelectedIndex(i);
+              }}
               onClick={(e) => open(r.value, openOptsFromClick(e))}
               title={`${root}/${r.value}`}
             >
-              <span className="quick-open-icon" aria-hidden>
+              <span className="quick-open-icon">
                 <FileGlyph name={basename(r.value)} size={14} />
               </span>
               <span className="quick-open-name">{basename(r.value)}</span>
-              <span className="quick-open-dir">{r.value.includes("/") ? r.value.slice(0, r.value.lastIndexOf("/")) : ""}</span>
+              {/* <bdi> keeps the path left-to-right inside the right-to-left
+                  box that puts the ellipsis at the head, so the repo segment
+                  survives truncation instead of the shared prefix. */}
+              <span className="quick-open-dir">
+                <bdi>{r.value.includes("/") ? r.value.slice(0, r.value.lastIndexOf("/")) : ""}</bdi>
+              </span>
             </li>
           ))}
           {files !== null && results.length === 0 ? (

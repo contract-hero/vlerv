@@ -35,13 +35,28 @@ export interface Tab {
   loadedNonce: number;
 }
 
+/** The durable part of a tab: what it points at, not what it has loaded. */
+export interface PersistedTab {
+  history: HistoryEntry[];
+  historyIndex: number;
+  zoom: number;
+}
+
+export interface PersistedTabs {
+  tabs: PersistedTab[];
+  activeIndex: number;
+}
+
 export interface TabsState {
   tabs: Tab[];
   /** Always references an existing tab; the state always has ≥ 1 tab. */
   activeTabId: string;
+  /** Most-recently-closed first; the ⌘⇧T stack. Not persisted. */
+  closed: PersistedTab[];
 }
 
 export const HISTORY_CAP = 50;
+export const CLOSED_CAP = 10;
 export const MIN_ZOOM = 0.25;
 export const MAX_ZOOM = 3;
 export const ZOOM_STEP = 0.1;
@@ -62,7 +77,9 @@ export type TabsAction =
   | { type: "LOAD_ERROR"; tabId: string; path: string; nonce: number; error: ErrorPayload["error"] }
   | { type: "FILE_CHANGED"; path: string }
   | { type: "FILE_REMOVED"; path: string }
-  | { type: "SET_ZOOM"; tabId: string; zoom: number };
+  | { type: "SET_ZOOM"; tabId: string; zoom: number }
+  | { type: "REOPEN_CLOSED_TAB" }
+  | { type: "HYDRATE"; persisted: PersistedTabs };
 
 let nextTabSeq = 0;
 export function makeTabId(): string {
@@ -88,7 +105,59 @@ export function makeTab(entry?: HistoryEntry): Tab {
 
 export function initialTabsState(): TabsState {
   const tab = makeTab();
-  return { tabs: [tab], activeTabId: tab.id };
+  return { tabs: [tab], activeTabId: tab.id, closed: [] };
+}
+
+/** The durable shape of a tab: where it points, not what it loaded. */
+export function toPersistedTab(tab: Tab): PersistedTab {
+  return { history: tab.history, historyIndex: tab.historyIndex, zoom: tab.zoom };
+}
+
+function fromPersistedTab(p: PersistedTab): Tab {
+  const history = Array.isArray(p.history) ? p.history.filter(isHistoryEntry) : [];
+  const historyIndex = Math.max(-1, Math.min(history.length - 1, p.historyIndex ?? -1));
+  return {
+    ...makeTab(),
+    history,
+    historyIndex: history.length === 0 ? -1 : historyIndex,
+    zoom: clampZoom(typeof p.zoom === "number" ? p.zoom : 1),
+  };
+}
+
+function isHistoryEntry(e: unknown): e is HistoryEntry {
+  return !!e && typeof e === "object" && typeof (e as HistoryEntry).path === "string";
+}
+
+/**
+ * The reading session as it goes to disk. Payloads are deliberately dropped:
+ * the file on disk is the truth, so a restored tab re-reads rather than
+ * showing a stale snapshot.
+ */
+export function serializeTabs(state: TabsState): PersistedTabs {
+  const withHistory = state.tabs.filter((t) => t.history.length > 0);
+  const activeIndex = withHistory.findIndex((t) => t.id === state.activeTabId);
+  return {
+    tabs: withHistory.map(toPersistedTab),
+    activeIndex: activeIndex < 0 ? 0 : activeIndex,
+  };
+}
+
+/**
+ * Rebuild a session from disk. Returns null when there is nothing worth
+ * restoring, so the caller keeps the fresh single-empty-tab state.
+ */
+export function hydrateTabsState(persisted: unknown): TabsState | null {
+  if (!persisted || typeof persisted !== "object") return null;
+  const raw = persisted as Partial<PersistedTabs>;
+  if (!Array.isArray(raw.tabs)) return null;
+  const tabs = raw.tabs
+    .filter((t): t is PersistedTab => !!t && typeof t === "object")
+    .map(fromPersistedTab)
+    .filter((t) => t.history.length > 0);
+  if (tabs.length === 0) return null;
+  const index = typeof raw.activeIndex === "number" ? raw.activeIndex : 0;
+  const active = tabs[Math.max(0, Math.min(tabs.length - 1, index))];
+  return { tabs, activeTabId: active.id, closed: [] };
 }
 
 export function currentEntry(tab: Tab): HistoryEntry | null {
@@ -169,6 +238,7 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
       // Insert after the active tab (browser convention).
       tabs.splice(activeIdx + 1, 0, tab);
       return {
+        ...state,
         tabs,
         activeTabId: action.background ? state.activeTabId : tab.id,
       };
@@ -204,10 +274,17 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
     case "CLOSE_TAB": {
       const idx = state.tabs.findIndex((t) => t.id === action.tabId);
       if (idx < 0) return state;
+      const victim = state.tabs[idx];
+      // Closing is not a destroy: an empty tab has nothing to remember, but a
+      // tab with history goes on the ⌘⇧T stack.
+      const closed =
+        victim.history.length > 0
+          ? [toPersistedTab(victim), ...state.closed].slice(0, CLOSED_CAP)
+          : state.closed;
       if (state.tabs.length === 1) {
         // Never zero tabs: closing the last tab replaces it with an empty one.
         const fresh = makeTab();
-        return { tabs: [fresh], activeTabId: fresh.id };
+        return { tabs: [fresh], activeTabId: fresh.id, closed };
       }
       const tabs = state.tabs.filter((t) => t.id !== action.tabId);
       let activeTabId = state.activeTabId;
@@ -216,7 +293,22 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         const next = tabs[Math.min(idx, tabs.length - 1)];
         activeTabId = next.id;
       }
-      return { tabs, activeTabId };
+      return { tabs, activeTabId, closed };
+    }
+
+    case "REOPEN_CLOSED_TAB": {
+      const [restored, ...rest] = state.closed;
+      if (!restored) return state;
+      const tab = fromPersistedTab(restored);
+      const activeIdx = state.tabs.findIndex((t) => t.id === state.activeTabId);
+      const tabs = [...state.tabs];
+      tabs.splice(activeIdx + 1, 0, tab);
+      return { tabs, activeTabId: tab.id, closed: rest };
+    }
+
+    case "HYDRATE": {
+      const restored = hydrateTabsState(action.persisted);
+      return restored ? { ...restored, closed: state.closed } : state;
     }
 
     case "ACTIVATE_TAB":
