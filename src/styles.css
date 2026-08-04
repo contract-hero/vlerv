@@ -54,12 +54,10 @@
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
-  --space-7: 48px;
   --r-xs: 4px;
   --r-sm: 6px;
   --r-md: 8px;
   --r-lg: 12px;
-  --r-xl: 16px;
   --r-pill: 9999px;
 
   /* motion */
@@ -94,8 +92,10 @@
      In the previous palette they needed a token of their own to clear
      4.5:1; --fg-muted clears it on every surface in this ladder (5.4:1 on
      the lightest, --bg-elevated), so the token stays as the place that
-     constraint is checked rather than as a separate value. */
-  --fg-path: #8a8f98;
+     constraint is checked rather than as a separate value. Aliased, not
+     copied, so the two cannot drift apart in one theme only. */
+  --fg-path: var(--fg-muted);
+  --empty-fg: var(--fg-muted);
   --label-active-fg: #ffffff;
 
   /* hairlines carry every boundary in the system */
@@ -108,14 +108,16 @@
   --accent-strong: #828fff;
   --accent-focus: #5e69d1;
 
-  /* semantic — success is the only one Linear documents. The source has no
-     error color (Known Gaps); #eb5757 is Linear's in-product red and clears
-     5.9:1 on canvas. */
-  --success-fg: #27a644;
+  /* semantic — the source has no error color (Known Gaps); #eb5757 is
+     Linear's in-product red and clears 5.9:1 on canvas. Linear's one
+     documented semantic, success green, has no role in this product yet and
+     so is recorded in DESIGN.md rather than declared here. */
   --error-fg: #eb5757;
 
   --code-bg: #141516;
-  --code-fg: #d0d6e0;
+  /* Code and badge text are the reading-field ink step in both themes —
+     aliased so a change to the ink ladder carries into both. */
+  --code-fg: var(--fg-strong);
   --pre-bg: #0f1011;
   --button-hover-bg: #23252a;
   --scrollbar-thumb: #2c2e33;
@@ -125,14 +127,15 @@
      field makes the swap invisible. Must track render/html.tsx themeStyle(). */
   --iframe-bg: var(--bg);
   --badge-bg: #18191a;
-  --badge-fg: #d0d6e0;
-  --empty-fg: #8a8f98;
+  --badge-fg: var(--fg-strong);
   --input-bg: #0f1011;
   --input-border: #23252a;
   --input-border-focus: #34343a;
-  --resizer-hover: #5e6ad2;
-  --star-active: #5e6ad2;
-  --star-idle: #3e3e44;
+  /* Both mark an object the user singled out, so both ARE the accent
+     rather than a copy of its value (DESIGN.md, The One Lavender Rule). */
+  --resizer-hover: var(--accent);
+  --star-active: var(--accent);
+  --star-idle: var(--border-tertiary);
   --overlay-scrim: rgba(0, 0, 0, 0.6);
 }
 
@@ -158,7 +161,6 @@
   --fg-strong: #34343a;
   --fg-muted: #6b6f76;
   --fg-dim: #8a8f98;
-  --fg-path: #6b6f76;
   --label-active-fg: #000000;
 
   --border: #dcdee3;
@@ -171,25 +173,18 @@
   --accent-strong: #4a55b8;
   --accent-focus: #5e69d1;
 
-  --success-fg: #1f8438;
   --error-fg: #c02a2a;
 
   --code-bg: #eceef1;
-  --code-fg: #34343a;
   --pre-bg: #f6f7f9;
   --button-hover-bg: #dcdfe6;
   --scrollbar-thumb: #c5c8d0;
   --scrollbar-thumb-hover: #a8abb3;
   --iframe-bg: #ffffff;
   --badge-bg: #e5e7eb;
-  --badge-fg: #34343a;
-  --empty-fg: #6b6f76;
   --input-bg: #ffffff;
   --input-border: #c5c8d0;
   --input-border-focus: #9ea2ab;
-  --resizer-hover: #5e6ad2;
-  --star-active: #5e6ad2;
-  --star-idle: #c2c4cb;
   --overlay-scrim: rgba(0, 0, 0, 0.25);
 }
 
@@ -864,7 +859,6 @@ html, body, #root {
    positive tracking against the negatively-tracked display is what marks a
    label as taxonomy. It replaces the uppercase 10-11px/700 micro-caps the
    previous system used. */
-.eyebrow,
 [data-section="bookmarks"] h4,
 .start-section h2 {
   font-family: var(--font-ui);

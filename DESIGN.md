@@ -21,7 +21,6 @@ colors:
   border: "#23252a"
   border-strong: "#34343a"
   border-tertiary: "#3e3e44"
-  success-fg: "#27a644"
   error-fg: "#eb5757"
   code-bg: "#141516"
   code-fg: "#d0d6e0"
@@ -105,7 +104,6 @@ rounded:
   sm: "6px"
   md: "8px"
   lg: "12px"
-  xl: "16px"
   pill: "9999px"
 spacing:
   "1": "4px"
@@ -114,7 +112,6 @@ spacing:
   "4": "16px"
   "5": "24px"
   "6": "32px"
-  "7": "48px"
 components:
   tab:
     backgroundColor: "transparent"
@@ -337,7 +334,8 @@ uses `{colors.fg-muted}`.
 
 ### Semantic
 
-- `{colors.success-fg}` #27a644 — the only semantic color Linear documents.
+- Linear's one documented semantic, success green (#27a644), has **no role in
+  this product yet**, so it is recorded here and not declared in the stylesheet.
 - `{colors.error-fg}` #eb5757 — Linear's source lists error styling as a known
   gap. This is Linear's in-product red; it clears 5.9:1 on canvas. It is not a
   second accent: it appears only on failure text (unreadable file, rejected
@@ -419,7 +417,7 @@ reintroduce `text-transform: uppercase`; the tracking carries the job.
 
 ### Spacing
 
-Base unit 4px. Tokens: 4 · 8 · 12 · 16 · 24 · 32 · 48.
+Base unit 4px. Tokens: 4 · 8 · 12 · 16 · 24 · 32.
 
 ### Fixed bands
 
@@ -499,7 +497,6 @@ accessibility.
 | `{rounded.sm}` | 6px | Toolbar buttons, menu items, list rows, Quick Open rows |
 | `{rounded.md}` | 8px | All buttons, all inputs, code blocks, the brand mark |
 | `{rounded.lg}` | 12px | Floating overlays — Quick Open, context menu, toast |
-| `{rounded.xl}` | 16px | Reserved for a framed artifact panel. Unused today. |
 | `{rounded.pill}` | 9999px | Status badges, the zoom control, the loading dot, scrollbar thumbs |
 
 Pills are for **status**, never for actions. A CTA is 8px, always — Linear's
@@ -622,11 +619,10 @@ rows use.
 
 ## Known Gaps
 
-- `{colors.success-fg}` is documented and unused. Nothing in the product
+- Success green is recorded above but not declared. Nothing in the product
   reports success as a state yet.
-- `{rounded.xl}` is reserved for a framed artifact panel and is unused. Framing
-  the iframe in a 16px panel would complete Linear's product-screenshot idiom,
-  but it costs reading width.
+- Framing the iframe in a 16px panel would complete Linear's product-screenshot
+  idiom, but it costs reading width, so the scale stops at 12px.
 - `src/components/Settings.tsx` is not mounted by any route and carries no
   styles. It is outside this system until it ships.
 - Shiki keeps `github-dark` / `github-light` for syntax highlighting. Its

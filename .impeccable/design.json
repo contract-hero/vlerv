@@ -272,7 +272,7 @@
         "displayName": "Path Ink",
         "canonical": "#8a8f98",
         "lightValue": "#6b6f76",
-        "purpose": "Directory paths. Holds the same value as fg-muted; it stays a separate token because a path's contrast floor is a constraint worth naming and checking.",
+        "purpose": "Directory paths. Holds the same value as fg-muted; it stays a separate token because a path's contrast floor is a constraint worth naming and checking. Aliased to fg-muted in CSS so the two cannot drift apart in one theme only.",
         "tonalRamp": [
           "oklch(0.16 0.007 262)",
           "oklch(0.24 0.009 262)",
@@ -335,23 +335,6 @@
           "oklch(0.96 0.002 90)"
         ]
       },
-      "success-fg": {
-        "role": "semantic",
-        "displayName": "Success Green",
-        "canonical": "#27a644",
-        "lightValue": "#1f8438",
-        "purpose": "The only semantic color the source documents. Declared and currently unused — nothing in the product reports success as a state.",
-        "tonalRamp": [
-          "oklch(0.18 0.079 147)",
-          "oklch(0.29 0.108 147)",
-          "oklch(0.40 0.136 147)",
-          "oklch(0.51 0.161 147)",
-          "oklch(0.62 0.175 147)",
-          "oklch(0.74 0.170 147)",
-          "oklch(0.85 0.124 147)",
-          "oklch(0.94 0.066 147)"
-        ]
-      },
       "error-fg": {
         "role": "semantic",
         "displayName": "Error Red",
@@ -391,7 +374,7 @@
         "displayName": "Code Ink",
         "canonical": "#d0d6e0",
         "lightValue": "#34343a",
-        "purpose": "Inline code text. Ink, not a hue — syntax color belongs to Shiki inside a block.",
+        "purpose": "Inline code text. Ink, not a hue — syntax color belongs to Shiki inside a block. Aliased to fg-strong in CSS — the same ink step in both themes.",
         "tonalRamp": [
           "oklch(0.16 0.007 261)",
           "oklch(0.24 0.009 261)",
@@ -459,7 +442,7 @@
         "displayName": "Badge Ink",
         "canonical": "#d0d6e0",
         "lightValue": "#34343a",
-        "purpose": "Label inside a status badge.",
+        "purpose": "Label inside a status badge. Aliased to fg-strong in CSS — the same ink step in both themes.",
         "tonalRamp": [
           "oklch(0.16 0.007 261)",
           "oklch(0.24 0.009 261)",
@@ -476,7 +459,7 @@
         "displayName": "Empty Ink",
         "canonical": "#8a8f98",
         "lightValue": "#6b6f76",
-        "purpose": "Empty-state copy in the preview pane.",
+        "purpose": "Empty-state copy in the preview pane. Aliased to fg-muted in CSS so the two cannot drift apart in one theme only.",
         "tonalRamp": [
           "oklch(0.16 0.007 262)",
           "oklch(0.24 0.009 262)",
@@ -544,7 +527,7 @@
         "displayName": "Resizer",
         "canonical": "#5e6ad2",
         "lightValue": "#5e6ad2",
-        "purpose": "The 6px sidebar resizer while hovered or dragging, at 60% opacity.",
+        "purpose": "The 6px sidebar resizer while hovered or dragging, at 60% opacity. Aliased to accent in CSS: it IS the accent, not a copy of its value.",
         "tonalRamp": [
           "oklch(0.18 0.071 275)",
           "oklch(0.29 0.098 275)",
@@ -561,7 +544,7 @@
         "displayName": "Star On",
         "canonical": "#5e6ad2",
         "lightValue": "#5e6ad2",
-        "purpose": "A bookmarked file's star. Extends the current-object marker to an object the user singled out.",
+        "purpose": "A bookmarked file's star. Extends the current-object marker to an object the user singled out. Aliased to accent in CSS: it IS the accent, not a copy of its value.",
         "tonalRamp": [
           "oklch(0.18 0.071 275)",
           "oklch(0.29 0.098 275)",
@@ -578,7 +561,7 @@
         "displayName": "Star Off",
         "canonical": "#3e3e44",
         "lightValue": "#b4b7c0",
-        "purpose": "An unbookmarked file's star, revealed at 35% opacity until the row is hovered.",
+        "purpose": "An unbookmarked file's star, revealed at 35% opacity until the row is hovered. Aliases border-tertiary rather than copying its value.",
         "tonalRamp": [
           "oklch(0.16 0.005 286)",
           "oklch(0.24 0.006 286)",
