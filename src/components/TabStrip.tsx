@@ -97,6 +97,10 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
         dispatch({ type: "OPEN_NEW_TAB" });
       }}
     >
+      {/* Overlay title bar: the strip spans the whole window, so it has to
+          keep the macOS traffic lights clear before the first tab. This
+          gutter is that reserved space, and it drags the window. */}
+      <div className="titlebar-gutter" data-tauri-drag-region />
       {tabs.map((tab, index) => {
         const entry = currentEntry(tab);
         const active = tab.id === activeTabId;

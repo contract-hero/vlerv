@@ -72,7 +72,13 @@ export default function StartPage({
   return (
     <div className="start-page" data-testid="start-page">
       <div className="start-page-inner">
-        <h1 className="start-title">Vlervtifacts</h1>
+        {/* The brand mark — a lavender tile carrying the monogram. It is one
+            of the four jobs the accent is allowed to do (DESIGN.md, The One
+            Lavender Rule); the wordmark beside it stays in ink. */}
+        <div className="start-brand">
+          <span className="start-mark" aria-hidden>V</span>
+          <h1 className="start-title">Vlervtifacts</h1>
+        </div>
         <p className="start-subtitle">
           {workspaceRoot ?? "No workspace selected"}
         </p>

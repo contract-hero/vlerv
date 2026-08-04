@@ -287,58 +287,63 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   }, [openFile]);
 
   return (
-    <div className="app">
-      <aside
-        className="pane pane-sidebar"
-        role="complementary"
-        style={{ width: `${sidebarPx}px` }}
-      >
-        <Sidebar
-          ipc={ipc}
-          onOpenFile={openFile}
-          selectedFile={entry?.path ?? null}
-          onPickFile={handlePickFile}
-          onPickWorkspace={handlePickWorkspace}
-          onRefresh={handleRefresh}
-          refreshNonce={refreshNonce}
-        />
-      </aside>
-      <SidebarResizer
-        width={sidebarPx}
-        onResize={setSidebarPx}
-        onCommit={handleSidebarResizeCommit}
-      />
-      <main className="pane pane-preview" role="main">
-        <TabStrip onOpenFile={openFile} />
-        <Toolbar addressBarRef={addressBarRef} onSubmitPath={(p) => openFile(p)} />
-        {notice ? (
-          <div className="app-notice" role="alert">
-            <span className="app-notice-text">{notice}</span>
-            <button
-              type="button"
-              className="app-notice-dismiss"
-              title="Dismiss"
-              aria-label="Dismiss notice"
-              onClick={dismissNotice}
-            >
-              <X size={13} strokeWidth={2} />
-            </button>
-          </div>
-        ) : null}
-        <div
-          className="tab-view"
-          id="tab-panel"
-          role="tabpanel"
-          aria-labelledby={`tab-${active.id}`}
+    // The tab strip spans the whole window ABOVE the panes, rather than
+    // sitting inside the preview pane. Below the sidebar it was leaving a
+    // dead 360px band whose only occupant was the traffic lights.
+    <div className="app-shell">
+      <TabStrip onOpenFile={openFile} />
+      <div className="app">
+        <aside
+          className="pane pane-sidebar"
+          role="complementary"
+          style={{ width: `${sidebarPx}px` }}
         >
-          <TabView
+          <Sidebar
+            ipc={ipc}
             onOpenFile={openFile}
+            selectedFile={entry?.path ?? null}
             onPickFile={handlePickFile}
             onPickWorkspace={handlePickWorkspace}
-            workspaceRoot={root}
+            onRefresh={handleRefresh}
+            refreshNonce={refreshNonce}
           />
-        </div>
-      </main>
+        </aside>
+        <SidebarResizer
+          width={sidebarPx}
+          onResize={setSidebarPx}
+          onCommit={handleSidebarResizeCommit}
+        />
+        <main className="pane pane-preview" role="main">
+          <Toolbar addressBarRef={addressBarRef} onSubmitPath={(p) => openFile(p)} />
+          {notice ? (
+            <div className="app-notice" role="alert">
+              <span className="app-notice-text">{notice}</span>
+              <button
+                type="button"
+                className="app-notice-dismiss"
+                title="Dismiss"
+                aria-label="Dismiss notice"
+                onClick={dismissNotice}
+              >
+                <X size={13} strokeWidth={2} />
+              </button>
+            </div>
+          ) : null}
+          <div
+            className="tab-view"
+            id="tab-panel"
+            role="tabpanel"
+            aria-labelledby={`tab-${active.id}`}
+          >
+            <TabView
+              onOpenFile={openFile}
+              onPickFile={handlePickFile}
+              onPickWorkspace={handlePickWorkspace}
+              workspaceRoot={root}
+            />
+          </div>
+        </main>
+      </div>
       {quickOpenVisible && root ? (
         <QuickOpen
           ipc={ipc}

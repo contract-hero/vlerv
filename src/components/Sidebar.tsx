@@ -42,8 +42,6 @@ export default function Sidebar({
   if (!workspaceRoot) {
     return (
       <div className="sidebar-empty">
-        {/* Overlay title bar: draggable strip under the traffic lights. */}
-        <div className="titlebar-drag" data-tauri-drag-region />
         <p className="sidebar-empty-text">Pick a folder to use as your workspace.</p>
         {/* One primary on first run. The second action used to carry the same
             filled treatment, so two buttons competed for the same first
@@ -66,8 +64,6 @@ export default function Sidebar({
 
   return (
     <div className="sidebar">
-      {/* Overlay title bar: draggable strip under the traffic lights. */}
-      <div className="titlebar-drag" data-tauri-drag-region />
       <div className="sidebar-header">
         <span className="sidebar-header-title" title={workspaceRoot}>{folderName}</span>
         <button
