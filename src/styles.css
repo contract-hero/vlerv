@@ -90,8 +90,8 @@
   --fg-dim: #62666d;
   /* Paths carry the information that tells two same-named artifacts apart.
      In the previous palette they needed a token of their own to clear
-     4.5:1; --fg-muted clears it on every surface in this ladder (5.4:1 on
-     the lightest, --bg-elevated), so the token stays as the place that
+     4.5:1; --fg-muted clears it on every surface in this ladder (5.36:1 on
+     the lightest, --bg-row-selected), so the token stays as the place that
      constraint is checked rather than as a separate value. Aliased, not
      copied, so the two cannot drift apart in one theme only. */
   --fg-path: var(--fg-muted);
@@ -107,6 +107,7 @@
   --accent: #5e6ad2;
   --accent-strong: #828fff;
   --accent-focus: #5e69d1;
+  --on-accent: #ffffff;
 
   /* semantic — the source has no error color (Known Gaps); #eb5757 is
      Linear's in-product red and clears 5.9:1 on canvas. Linear's one
@@ -130,7 +131,7 @@
   --badge-fg: var(--fg-strong);
   --input-bg: #0f1011;
   --input-border: #23252a;
-  --input-border-focus: #34343a;
+  --input-border-focus: var(--accent-focus);
   /* Both mark an object the user singled out, so both ARE the accent
      rather than a copy of its value (DESIGN.md, The One Lavender Rule). */
   --resizer-hover: var(--accent);
@@ -159,7 +160,7 @@
   --fg: #08090a;
   --heading-fg: #000000;
   --fg-strong: #34343a;
-  --fg-muted: #6b6f76;
+  --fg-muted: #5f636b;
   --fg-dim: #8a8f98;
   --label-active-fg: #000000;
 
@@ -184,7 +185,7 @@
   --badge-bg: #e5e7eb;
   --input-bg: #ffffff;
   --input-border: #c5c8d0;
-  --input-border-focus: #9ea2ab;
+  --input-border-focus: var(--accent-focus);
   --overlay-scrim: rgba(0, 0, 0, 0.25);
 }
 
@@ -254,9 +255,8 @@ html, body, #root {
 
 /* The handle is an OVERLAY, not a column. As a 6px flex item it opened a
    transparent gap between the sidebar and the preview pane that ran the full
-   height of the window — including straight through the two chrome bands,
-   where it broke the single unbroken rule those 38px and 40px heights exist
-   to produce. It now takes no width in the layout and carries its 6px
+   height of the pane row — including straight through the 40px chrome band,
+   where it broke the single unbroken rule that height exists to produce. It now takes no width in the layout and carries its 6px
    pointer target in a pseudo-element straddling the seam. */
 .sidebar-resizer {
   flex: 0 0 0;
@@ -313,6 +313,13 @@ html, body, #root {
 .tab-strip::-webkit-scrollbar { height: 0; }
 /* Width of the macOS traffic lights plus their inset. */
 .titlebar-gutter {
+  /* Sticky, not in-flow: the strip scrolls horizontally, and a scrolled-away
+     gutter would slide tabs under the traffic lights and cost the window its
+     only drag surface. Opaque so tabs pass behind it. */
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--bg-chrome);
   flex: 0 0 78px;
   width: 78px;
   height: 100%;
@@ -333,8 +340,9 @@ html, body, #root {
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tab:hover { background: var(--bg-row-hover); }
-/* The active tab drops to canvas depth — it is continuous with the reading
-   field below it, so the tab and its artifact read as one plane. */
+/* The active tab drops to canvas depth. The strip now spans the window, so
+   the tab no longer joins the reading field below it — a 40px band sits
+   between them. The canvas fill and the lavender rule carry the state. */
 .tab.active {
   background: var(--bg);
   color: var(--fg);
@@ -787,7 +795,7 @@ html, body, #root {
   align-items: center;
   gap: 7px;
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   border: 1px solid transparent;
   border-radius: var(--r-md);
   padding: 8px 14px;
@@ -1099,7 +1107,7 @@ html, body, #root {
   height: 34px;
   border-radius: var(--r-md);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: var(--font-display);
   font-size: var(--text-body);
   font-weight: 600;
@@ -1354,6 +1362,13 @@ html, body, #root {
 }
 .shiki-block pre.shiki {
   background: transparent !important;
+}
+/* Shiki writes an inline `background-color` on the <pre> it emits, and in
+   rendered Markdown that <pre> is NOT inside a .shiki-block — md.tsx replaces
+   `code.parentElement` in place. An inline style beats any selector, so the
+   block would paint GitHub's #24292e on our canvas without !important. */
+[data-testid="md-content"] pre.shiki {
+  background: var(--pre-bg) !important;
 }
 
 pre {

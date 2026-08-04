@@ -92,8 +92,10 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
       data-tauri-drag-region
       onKeyDown={onStripKeyDown}
       onDoubleClick={(e) => {
-        // Only on the empty strip area, not on a tab.
-        if ((e.target as HTMLElement).closest(".tab")) return;
+        // Only on the empty strip area — not on a tab, and not on the
+        // traffic-light gutter, where double-click is the macOS zoom gesture
+        // that data-tauri-drag-region already handles.
+        if ((e.target as HTMLElement).closest(".tab, .titlebar-gutter")) return;
         dispatch({ type: "OPEN_NEW_TAB" });
       }}
     >

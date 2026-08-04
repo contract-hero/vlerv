@@ -267,16 +267,20 @@ relationship Linear builds between a page and a product screenshot.
 
 `{colors.accent}` does four jobs and no others:
 
-1. **Brand mark** — the monogram tile on the start page.
-2. **Focus ring** — every `:focus-visible` outline.
+1. **Brand and primary fill** — the monogram tile on the start page, and
+   `{components.button-primary}`, the one filled button in the product.
+2. **Focus ring** — every `:focus-visible` outline, and the address bar's
+   focused border.
 3. **Link emphasis** — Markdown links, in the lighter step.
 4. **Current-object marker** — the 2px rule on the active tab, the 2px inset
-   edge on the selected explorer row and the selected Quick Open row, and drop
-   targets during a drag.
+   edge on the selected explorer row and the selected Quick Open row, drop
+   targets during a drag, and the pulsing dot on a tab whose file is still
+   loading.
 
-Two in-product roles extend job 4 rather than adding a fifth: the bookmark star
-(`{colors.star-active}`) and the sidebar resizer on hover
-(`{colors.resizer-hover}`) both mark an object the user has singled out.
+Three in-product roles extend job 4 rather than adding a fifth: the bookmark
+star (`{colors.star-active}`), the sidebar resizer on hover
+(`{colors.resizer-hover}`), and the loading dot — each marks an object the
+user singled out or the app is currently acting on.
 
 Everything else — a quotation rule, a separator, a hover state, a badge, a
 count, a file glyph — is ink or hairline. A blockquote edge takes
@@ -309,7 +313,7 @@ count, a file glyph — is ink or hairline. A blockquote edge takes
 |---|---|---|
 | `{colors.border}` | #23252a | Every boundary in the layout — pane seams, band rules, table cells, code-block edges |
 | `{colors.border-strong}` | #34343a | Floating-overlay edges, hovered button edges, blockquote rule, focused input |
-| `{colors.border-tertiary}` | #3e3e44 | Nested surfaces, idle star, scrollbar hover |
+| `{colors.border-tertiary}` | #3e3e44 | Idle bookmark star, scrollbar thumb on hover |
 
 ### Ink ladder
 
@@ -318,7 +322,7 @@ count, a file glyph — is ink or hairline. A blockquote edge takes
 | `{colors.fg}` | #f7f8f8 | Headings, active labels, primary chrome text | — |
 | `{colors.fg-strong}` | #d0d6e0 | Reading-field body, explorer file labels, menu items | — |
 | `{colors.fg-muted}` | #8a8f98 | Secondary chrome, eyebrows, captions, hints | 5.4:1 on the lightest surface |
-| `{colors.fg-dim}` | #62666d | Decoration and disabled only — chevrons, idle stars, disabled buttons | 3.1:1 — never carries text a user must read |
+| `{colors.fg-dim}` | #62666d | Decoration and disabled only — chevrons, close/remove buttons, file glyphs, disabled buttons | 3.1:1 — never carries text a user must read |
 | `{colors.fg-path}` | #8a8f98 | Directory paths | 4.5:1 everywhere, by definition |
 
 `{colors.fg-path}` holds the same value as `{colors.fg-muted}`. It stays a
@@ -330,7 +334,9 @@ this ladder `{colors.fg-muted}` already satisfies it.
 `{colors.fg-dim}` is the one token that does not clear 4.5:1. It is allowed on
 decoration and disabled states only. Informational micro-text — the Quick Open
 footer, the bookmarks empty hint, the start-page subtitle, section eyebrows —
-uses `{colors.fg-muted}`.
+uses `{colors.fg-muted}`, whose light value is set by the tightest pairing it
+has to survive: a path on a hovered or selected row (4.52:1 on
+`{colors.bg-row-selected}`).
 
 ### Semantic
 
@@ -361,6 +367,7 @@ has to survive the theme switch.
 | `{colors.bg-row-selected}` | #191a1b | #dcdfe6 |
 | `{colors.border}` | #23252a | #dcdee3 |
 | `{colors.border-strong}` | #34343a | #c5c8d0 |
+| `{colors.fg-muted}` | #8a8f98 | #5f636b |
 
 The accent does not change hue across themes — #5e6ad2 holds 4.7:1 on white.
 Only the emphasis step darkens, to `#4a55b8`.
@@ -427,8 +434,9 @@ heights are structural and do not scale:
 - **38px** — the tab strip. It spans the **whole window**, above both panes, and
   doubles as the overlay title bar: it carries `data-tauri-drag-region` and
   reserves a **78px gutter** for the macOS traffic lights before the first tab.
-  It used to sit inside the preview pane, which left a dead 360px band above the
-  sidebar whose only occupant was the traffic lights.
+  It used to sit inside the preview pane, which left a dead 38px band across
+  the sidebar's full width (200-480px, default 280) whose only occupant was
+  the traffic lights.
 - **40px** — the sidebar header and the toolbar. Equal by requirement: they sit
   side by side under the tab strip, so their bottom borders must form one
   unbroken rule rather than a 1px step at the sidebar seam.
@@ -493,7 +501,7 @@ accessibility.
 
 | Token | Value | Use |
 |---|---|---|
-| `{rounded.xs}` | 4px | kbd chips, tab close, star toggle, inline code, focus-ring radius |
+| `{rounded.xs}` | 4px | kbd chips, tab close, notice dismiss, bookmark remove, sidebar header change, inline code, focus-ring radius |
 | `{rounded.sm}` | 6px | Toolbar buttons, menu items, list rows, Quick Open rows |
 | `{rounded.md}` | 8px | All buttons, all inputs, code blocks, the brand mark |
 | `{rounded.lg}` | 12px | Floating overlays — Quick Open, context menu, toast |
@@ -557,7 +565,7 @@ directory, metadata renderer, file-notice path.
 
 Quick Open, the context menu and the toast share one shape: `{colors.bg-elevated}`
 fill, 12px corners, `{colors.border-strong}` hairline, shadow, edge highlight.
-The scrim behind Quick Open is pure black at 60%.
+The scrim behind Quick Open is pure black — 60% in dark, 25% in light.
 
 Quick Open truncates paths at the **tail**; the start page truncates at the
 **head**. The difference is not decoration. Quick Open paths are relative to the
@@ -625,6 +633,8 @@ rows use.
   idiom, but it costs reading width, so the scale stops at 12px.
 - `src/components/Settings.tsx` is not mounted by any route and carries no
   styles. It is outside this system until it ships.
-- Shiki keeps `github-dark` / `github-light` for syntax highlighting. Its
-  backgrounds are overridden to transparent so the block takes
-  `{colors.pre-bg}`, but the token hues are GitHub's, not Linear's.
+- Shiki keeps `github-dark` / `github-light` for syntax highlighting, so the
+  token hues inside a code block are GitHub's, not Linear's. Shiki writes an
+  inline `background-color`, which beats any selector, so both paths force the
+  surface back: `.shiki-block` (plain source files) to transparent, and
+  rendered Markdown to `{colors.pre-bg}` with `!important`.

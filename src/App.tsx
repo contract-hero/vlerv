@@ -289,7 +289,8 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   return (
     // The tab strip spans the whole window ABOVE the panes, rather than
     // sitting inside the preview pane. Below the sidebar it was leaving a
-    // dead 360px band whose only occupant was the traffic lights.
+    // dead 38px band across the sidebar's full width (200-480px, default
+    // 280) whose only occupant was the traffic lights.
     <div className="app-shell">
       <TabStrip onOpenFile={openFile} />
       <div className="app">
