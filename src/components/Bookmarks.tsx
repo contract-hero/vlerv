@@ -43,6 +43,15 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
   const [dragPath, setDragPath] = React.useState<string | null>(null);
   const [overPath, setOverPath] = React.useState<string | null>(null);
 
+  /** Move one row to a new index and persist the order. */
+  const moveTo = (fromIdx: number, toIdx: number) => {
+    const order = bookmarks.map((b) => b.path);
+    if (fromIdx < 0 || toIdx < 0 || toIdx >= order.length || fromIdx === toIdx) return;
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, moved);
+    void reorder(order);
+  };
+
   const handleDrop = (targetPath: string) => {
     const from = dragPath;
     setDragPath(null);
@@ -51,13 +60,17 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
     const order = bookmarks.map((b) => b.path);
     const fromIdx = order.indexOf(from);
     const toIdx = order.indexOf(targetPath);
-    if (fromIdx < 0 || toIdx < 0) return;
+    if (toIdx < 0) return;
     // Drop the dragged row *above* the target (matching the insertion-line
     // indicator). Removing the source first shifts every later index left by
     // one, so a downward drag inserts at toIdx-1 to land before the target.
-    const [moved] = order.splice(fromIdx, 1);
-    order.splice(fromIdx < toIdx ? toIdx - 1 : toIdx, 0, moved);
-    void reorder(order);
+    moveTo(fromIdx, fromIdx < toIdx ? toIdx - 1 : toIdx);
+  };
+
+  /** Keyboard equivalent of drag-to-reorder: ⌥↑ / ⌥↓ on a focused row. */
+  const moveBy = (path: string, delta: 1 | -1) => {
+    const from = bookmarks.findIndex((b) => b.path === path);
+    moveTo(from, from + delta);
   };
 
   const toggleCollapsed = () => {
@@ -85,26 +98,24 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
 
   return (
     <div data-section="bookmarks" data-testid="bookmarks-group">
-      <h4
-        className="bookmarks-header"
-        onClick={toggleCollapsed}
-        role="button"
-        aria-expanded={!collapsed}
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            toggleCollapsed();
-          }
-        }}
-      >
-        <span
-          className={`bookmarks-chevron${collapsed ? "" : " open"}`}
-          aria-hidden
+      {/* The heading stays a heading — a screen reader's rotor needs it — and
+          the control inside it is a real button rather than role="button" on
+          the h4, which used to discard the heading semantics entirely. */}
+      <h4 className="bookmarks-header">
+        <button
+          type="button"
+          className="bookmarks-header-toggle"
+          onClick={toggleCollapsed}
+          aria-expanded={!collapsed}
         >
-          <ChevronRight size={12} strokeWidth={2} />
-        </span>
-        <span>Bookmarks</span>
+          <span
+            className={`bookmarks-chevron${collapsed ? "" : " open"}`}
+            aria-hidden
+          >
+            <ChevronRight size={12} strokeWidth={2} />
+          </span>
+          <span>Bookmarks</span>
+        </button>
         <span className="bookmarks-count" aria-hidden>{bookmarks.length}</span>
       </h4>
       {!collapsed && (
@@ -146,8 +157,25 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
                 if (e.button === 1) onOpenFile?.(entry.path, { newTab: true, background: true });
               }}
               onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
+              // Openable and reorderable without a mouse: Enter/Space opens,
+              // ⌥↑/⌥↓ moves the row. Drag was the only way to reorder before.
+              // No role="button" here — that would strip `listitem` from the
+              // <li> and leave the <ul> reporting no list and no item count,
+              // the same defect the header comment above argues against.
+              tabIndex={0}
+              onKeyDown={(e) => {
+                // The Remove button is a child; let it handle its own keys.
+                if (e.target !== e.currentTarget) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onOpenFile?.(entry.path, openOptsFromClick(e));
+                } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+                  e.preventDefault();
+                  moveBy(entry.path, e.key === "ArrowDown" ? 1 : -1);
+                }
+              }}
               style={{ cursor: "pointer" }}
-              title={`${entry.path}\n(drag to reorder)`}
+              title={`${entry.path}\n(drag, or ⌥↑ / ⌥↓, to reorder)`}
             >
               <span className="bookmark-label">{basename(entry.path)}</span>
               <button

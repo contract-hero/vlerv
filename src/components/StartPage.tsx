@@ -6,7 +6,7 @@ import { useBookmarksContext } from "../state/bookmarks-context";
 import { FileGlyph } from "./FileIcon";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { openOptsFromClick } from "../state/TabsProvider";
-import { basename, dirname } from "../utils/path";
+import { basename, displayDir } from "../utils/path";
 
 export interface StartPageProps {
   onOpenFile: (path: string, opts?: OpenFileOptions) => void;
@@ -15,12 +15,15 @@ export interface StartPageProps {
   workspaceRoot: string | null;
 }
 
+
 function FileList({
   paths,
   onOpenFile,
+  workspaceRoot,
 }: {
   paths: string[];
   onOpenFile: StartPageProps["onOpenFile"];
+  workspaceRoot: string | null;
 }): React.ReactElement {
   return (
     <ul className="start-list">
@@ -35,11 +38,16 @@ function FileList({
               if (e.button === 1) onOpenFile(path, { newTab: true, background: true });
             }}
           >
-            <span className="start-row-icon" aria-hidden>
+            <span className="start-row-icon">
               <FileGlyph name={basename(path)} size={15} />
             </span>
             <span className="start-row-name">{basename(path)}</span>
-            <span className="start-row-dir">{dirname(path)}</span>
+            {/* <bdi> keeps the path reading left-to-right inside the
+                right-to-left box that puts the ellipsis at the head, so the
+                deepest segments survive on a long absolute path. */}
+            <span className="start-row-dir">
+              <bdi>{displayDir(path, workspaceRoot)}</bdi>
+            </span>
           </button>
         </li>
       ))}
@@ -84,7 +92,11 @@ export default function StartPage({
             <h2>
               <Star size={13} strokeWidth={2} /> Bookmarks
             </h2>
-            <FileList paths={bookmarks.map((b) => b.path)} onOpenFile={onOpenFile} />
+            <FileList
+              paths={bookmarks.map((b) => b.path)}
+              onOpenFile={onOpenFile}
+              workspaceRoot={workspaceRoot}
+            />
           </section>
         ) : null}
 
@@ -93,7 +105,11 @@ export default function StartPage({
             <h2>
               <Clock size={13} strokeWidth={2} /> Recent
             </h2>
-            <FileList paths={recents.map((r) => r.path)} onOpenFile={onOpenFile} />
+            <FileList
+              paths={recents.map((r) => r.path)}
+              onOpenFile={onOpenFile}
+              workspaceRoot={workspaceRoot}
+            />
           </section>
         ) : null}
 

@@ -51,6 +51,8 @@ export interface SettingsState {
   panes?: {
     sidebar_px?: number;
     preview_px?: number;
+    /** The reading session: open tabs, their history and zoom. */
+    tabs?: unknown;
   };
   preferences: {
     ignore_globs: string[];

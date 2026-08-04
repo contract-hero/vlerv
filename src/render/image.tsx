@@ -35,8 +35,8 @@ export default function ImageRenderer({ payload }: ImageRendererProps): React.Re
   if (mime && payload.content) {
     const dataUri = `data:${mime};base64,${payload.content}`;
     return (
-      <div style={{ padding: "16px" }}>
-        <img src={dataUri} alt={payload.path} style={{ maxWidth: "100%", maxHeight: "100%" }} />
+      <div className="image-renderer">
+        <img src={dataUri} alt={payload.path} />
       </div>
     );
   }
@@ -66,5 +66,5 @@ function SvgInline({ source }: { source: string }): React.ReactElement {
       // Source unparseable — show empty container.
     }
   }, [source]);
-  return <div ref={ref} data-svg-inline="true" style={{ padding: "16px" }} />;
+  return <div ref={ref} data-svg-inline="true" className="image-renderer" />;
 }

@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "design-system-font-size",
+        "value": "10px",
+        "createdAt": "2026-08-04T13:41:24.814Z",
+        "reason": "Documented in DESIGN.md: bookmarks, kbd chips, footer hint"
+      },
+      {
+        "rule": "design-system-font-size",
+        "value": "14px",
+        "createdAt": "2026-08-04T13:41:24.853Z",
+        "reason": "Documented in DESIGN.md: explorer rows"
+      },
+      {
+        "rule": "design-system-radius",
+        "value": "5px",
+        "createdAt": "2026-08-04T13:41:24.891Z",
+        "reason": "Documented in DESIGN.md: menu items and scrollbar thumb"
+      }
+    ]
+  }
+}

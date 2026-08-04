@@ -29,9 +29,33 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
   const { open: openMenu } = useContextMenu();
   const fileMenu = useFileMenu(onOpenFile);
 
+  const tabRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+
   const endDrag = () => {
     setDragId(null);
     setOverIndex(null);
+  };
+
+  /**
+   * Arrow-key navigation inside the strip. `role="tablist"` promises this;
+   * without it the tabs were announced as a tablist that no keyboard could
+   * reach. Activation follows focus, which is the standard behavior for tabs
+   * whose panels are already loaded.
+   */
+  const onStripKeyDown = (e: React.KeyboardEvent) => {
+    const index = tabs.findIndex((t) => t.id === activeTabId);
+    if (index < 0) return;
+    let next: number | null = null;
+    if (e.key === "ArrowRight") next = (index + 1) % tabs.length;
+    else if (e.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = tabs.length - 1;
+    if (next === null) return;
+    e.preventDefault();
+    const target = tabs[next];
+    if (!target) return;
+    dispatch({ type: "ACTIVATE_TAB", tabId: target.id });
+    tabRefs.current.get(target.id)?.focus();
   };
 
   const tabMenu = (tab: Tab, index: number) => {
@@ -66,6 +90,7 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
       className="tab-strip"
       role="tablist"
       data-tauri-drag-region
+      onKeyDown={onStripKeyDown}
       onDoubleClick={(e) => {
         // Only on the empty strip area, not on a tab.
         if ((e.target as HTMLElement).closest(".tab")) return;
@@ -78,8 +103,18 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
         return (
           <div
             key={tab.id}
+            ref={(el) => {
+              if (el) tabRefs.current.set(tab.id, el);
+              else tabRefs.current.delete(tab.id);
+            }}
             role="tab"
+            id={`tab-${tab.id}`}
+            aria-controls="tab-panel"
             aria-selected={active}
+            // Roving tabindex over the tabs: arrows move within. Each
+            // .tab-close is still separately tabbable, so the strip is not
+            // yet a single tab stop.
+            tabIndex={active ? 0 : -1}
             className={[
               "tab",
               active ? "active" : "",

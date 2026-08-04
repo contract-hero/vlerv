@@ -1,6 +1,7 @@
 // Root app — provider stack + browser-style chrome: TabStrip over
 // Toolbar over TabView, with the Explorer sidebar on the left.
 import * as React from "react";
+import { X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Sidebar from "./components/Sidebar";
 import SidebarResizer from "./components/SidebarResizer";
@@ -39,11 +40,14 @@ const DEFAULT_SIDEBAR_PX = 280;
 const MIN_SIDEBAR_PX = 200;
 const MAX_SIDEBAR_PX = 480;
 
+/** How long a transient notice stays up before it dismisses itself. */
+const NOTICE_MS = 10000;
+
 // Chords honored when forwarded from a preview iframe (tab/nav/zoom only —
 // nothing that opens native dialogs or steals focus). Must stay in sync with
 // the FORWARD map in the injected script in src/render/html.tsx.
 const IFRAME_FORWARDABLE = new Set([
-  "mod+t", "mod+w", "ctrl+tab", "ctrl+shift+tab",
+  "mod+t", "mod+w", "mod+shift+t", "ctrl+tab", "ctrl+shift+tab",
   "mod+shift+bracketright", "mod+shift+bracketleft",
   "mod+bracketleft", "mod+bracketright", "mod+r",
   "mod+equal", "mod+shift+equal", "mod+minus",
@@ -110,10 +114,16 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   const addressBarRef = React.useRef<HTMLInputElement | null>(null);
   const noticeTimer = React.useRef<number | null>(null);
 
+  const dismissNotice = React.useCallback(() => {
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = null;
+    setNotice(null);
+  }, []);
+
   const showNotice = React.useCallback((text: string) => {
     setNotice(text);
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 6000);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), NOTICE_MS);
   }, []);
 
   // ── Persisted sidebar width ────────────────────────────────────────────
@@ -193,6 +203,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   const bindings: Binding[] = [
     { combo: "mod+t", allowInInput: true, handler: () => dispatch({ type: "OPEN_NEW_TAB" }) },
     { combo: "mod+w", allowInInput: true, handler: () => dispatch({ type: "CLOSE_TAB", tabId: active.id }) },
+    { combo: "mod+shift+t", allowInInput: true, handler: () => dispatch({ type: "REOPEN_CLOSED_TAB" }) },
     { combo: "ctrl+tab", allowInInput: true, handler: () => dispatch({ type: "ACTIVATE_DELTA", delta: 1 }) },
     { combo: "ctrl+shift+tab", allowInInput: true, handler: () => dispatch({ type: "ACTIVATE_DELTA", delta: -1 }) },
     { combo: "mod+shift+bracketright", allowInInput: true, handler: () => dispatch({ type: "ACTIVATE_DELTA", delta: 1 }) },
@@ -302,10 +313,24 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
         <Toolbar addressBarRef={addressBarRef} onSubmitPath={(p) => openFile(p)} />
         {notice ? (
           <div className="app-notice" role="alert">
-            {notice}
+            <span className="app-notice-text">{notice}</span>
+            <button
+              type="button"
+              className="app-notice-dismiss"
+              title="Dismiss"
+              aria-label="Dismiss notice"
+              onClick={dismissNotice}
+            >
+              <X size={13} strokeWidth={2} />
+            </button>
           </div>
         ) : null}
-        <div className="tab-view">
+        <div
+          className="tab-view"
+          id="tab-panel"
+          role="tabpanel"
+          aria-labelledby={`tab-${active.id}`}
+        >
           <TabView
             onOpenFile={openFile}
             onPickFile={handlePickFile}

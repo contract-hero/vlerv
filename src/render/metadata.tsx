@@ -39,17 +39,13 @@ export default function MetadataRenderer({
   reason,
 }: MetadataRendererProps): React.ReactElement {
   return (
-    <div data-testid="metadata-renderer" style={{ padding: "16px", fontFamily: "monospace" }}>
-      <div data-field="path" style={{ marginBottom: "8px", wordBreak: "break-all" }}>
+    <div data-testid="metadata-renderer" className="metadata-renderer">
+      <div data-field="path" className="metadata-path">
         {path}
       </div>
-      <div data-field="size" style={{ marginBottom: "4px" }}>
-        Size: {formatBytes(size)}
-      </div>
-      <div data-field="mtime" style={{ marginBottom: "4px" }}>
-        Modified: {formatMtime(mtime)}
-      </div>
-      <div data-field="reason">
+      <div data-field="size">Size: {formatBytes(size)}</div>
+      <div data-field="mtime">Modified: {formatMtime(mtime)}</div>
+      <div data-field="reason" className="metadata-reason">
         {reason === "binary" ? "binary file" : "oversize file"}
       </div>
     </div>

@@ -196,12 +196,14 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
         <ArrowRight size={15} strokeWidth={2} />
       </IconButton>
       <IconButton
-        title="Reload (⌘R)"
+        title="Reload this file (⌘R)"
         disabled={!entry}
         onClick={() => dispatch({ type: "RELOAD" })}
       >
         <RotateCw size={13.5} strokeWidth={2} />
       </IconButton>
+
+      <span className="toolbar-sep" aria-hidden />
 
       <div className="address-bar" data-error={error ? "true" : undefined}>
         <input
@@ -245,6 +247,20 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
             external
           </span>
         ) : null}
+        {/* The zoom chip lives INSIDE the address bar so that showing it
+            shrinks the input instead of pushing the whole action cluster
+            left every time you press ⌘+. */}
+        {zoomPct !== 100 ? (
+          <button
+            type="button"
+            className="toolbar-zoom"
+            title="Reset zoom (⌘0)"
+            aria-label={`Zoom ${zoomPct} percent. Reset zoom`}
+            onClick={() => dispatch({ type: "SET_ZOOM", tabId: tab.id, zoom: 1 })}
+          >
+            {zoomPct}%
+          </button>
+        ) : null}
       </div>
 
       {entry ? (
@@ -260,21 +276,13 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
           >
             <Star size={13.5} strokeWidth={2} fill={bookmarked ? "currentColor" : "none"} />
           </button>
+          {/* Keep (star) and hand over (copy / share / Slack) are different
+              jobs; the rule between them is the grouping cue. */}
+          <span className="toolbar-sep" aria-hidden />
           <CopyPathButton path={entry.path} />
           <ShareButton path={entry.path} />
           {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
-      ) : null}
-
-      {zoomPct !== 100 ? (
-        <button
-          type="button"
-          className="toolbar-zoom"
-          title="Reset zoom (⌘0)"
-          onClick={() => dispatch({ type: "SET_ZOOM", tabId: tab.id, zoom: 1 })}
-        >
-          {zoomPct}%
-        </button>
       ) : null}
     </div>
   );

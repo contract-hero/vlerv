@@ -8,8 +8,10 @@ import { useWatcherBus } from "./watcher-bus";
 import {
   activeTab,
   currentEntry,
+  hydrateTabsState,
   initialTabsState,
   isLoading,
+  serializeTabs,
   tabsReducer,
 } from "./tabs";
 import type { TabsAction, TabsState } from "./tabs";
@@ -33,6 +35,9 @@ export function useActiveTab() {
 /** Debounce window for watcher-driven reloads (backend already debounces
  *  250 ms; this collapses bursts arriving across separate events). */
 const RELOAD_DEBOUNCE_MS = 150;
+
+/** Coalesce bursts of tab churn into one state.json write. */
+const SESSION_PERSIST_MS = 400;
 
 export interface TabsProviderProps {
   ipc: IpcSurface;
@@ -60,19 +65,96 @@ export function TabsProvider({ ipc, children }: TabsProviderProps): React.ReactE
         if (loadSeq.current !== seq) return;
         dispatch({ type: "LOAD_SUCCESS", tabId, path, nonce: reloadNonce, payload });
       })
-      .catch((e: Error) => {
+      .catch((e: unknown) => {
         if (loadSeq.current !== seq) return;
+        // Tauri rejects with the command's `Err` value, and `read_file` is
+        // declared `Result<FilePayload, String>` — so this is usually a plain
+        // string, not an Error. Reading `.message` off it gave `undefined`
+        // and left the error screen with no detail at all.
+        const reason = e instanceof Error ? e.message : String(e);
         dispatch({
           type: "LOAD_ERROR",
           tabId,
           path,
           nonce: reloadNonce,
-          error: { kind: "Io", path, reason: e.message },
+          error: { kind: "Io", path, reason },
         });
       });
     // active/entry are derived from state; the identity that matters is
     // (tab id, path, nonce) — reruns on any of those.
   }, [ipc, active.id, entry?.path, active.reloadNonce, active.loadedFor, active.loadedNonce]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Session persistence ──────────────────────────────────────────────────
+  // Window geometry already survived quit; the reading session did not. For a
+  // custody-first tool that made quitting a data-loss event. Only WHERE each
+  // tab points is stored — never its payload — so a restored tab re-reads
+  // from disk and a file that changed or vanished meanwhile shows the truth.
+  // Writing is gated on a SUCCESSFUL read. A failed read used to arm the
+  // writer anyway, so one rejected `getState()` at launch could overwrite a
+  // nine-tab session with the single empty tab the app fell back to. State,
+  // not a ref, because the write effect has to re-run when the gate opens.
+  const [writable, setWritable] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!ipc.getState) {
+      // No backend to read from and none to write to; nothing to protect.
+      setWritable(true);
+      return;
+    }
+    let cancelled = false;
+    void ipc
+      .getState()
+      .then((s) => {
+        if (cancelled) return;
+        const persisted = s?.panes?.tabs;
+        if (persisted) dispatch({ type: "HYDRATE", persisted });
+        // A document a newer build wrote stays untouched: restore nothing and
+        // never overwrite it.
+        setWritable(hydrateTabsState(persisted).kind !== "unreadable");
+      })
+      .catch(() => {
+        // Read failed. The document may still be intact, so leave `writable`
+        // false: this run runs without session persistence rather than
+        // destroying what it could not read.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ipc]);
+
+  // Serialize eagerly and carry the JSON alongside the value: `key` is what
+  // the effect depends on, so a write is scheduled only when the session
+  // genuinely changed. Payload loads and reload nonces churn `state` on every
+  // read and must not each schedule a state.json write.
+  const session = React.useMemo(() => {
+    const value = serializeTabs(state);
+    return { value, key: JSON.stringify(value) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.tabs, state.activeTabId]);
+
+  React.useEffect(() => {
+    if (!writable || !ipc.setStateField) return;
+    const timer = window.setTimeout(() => {
+      void ipc.setStateField?.("panes.tabs", session.value).catch(() => {});
+    }, SESSION_PERSIST_MS);
+    return () => window.clearTimeout(timer);
+    // `session.key` is the stable identity of `session.value`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ipc, writable, session.key]);
+
+  // Quitting inside the debounce window would drop the last change — close a
+  // tab, press ⌘Q, and it comes back next launch. `pagehide` fires on webview
+  // teardown, before the Rust side flushes its own debounce on exit.
+  const pendingRef = React.useRef(session.value);
+  pendingRef.current = session.value;
+  React.useEffect(() => {
+    if (!writable || !ipc.setStateField) return;
+    const flush = () => {
+      void ipc.setStateField?.("panes.tabs", pendingRef.current).catch(() => {});
+    };
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
+  }, [ipc, writable]);
 
   // ── Watcher-driven auto-reload ───────────────────────────────────────────
   const openPathsRef = React.useRef<Set<string>>(new Set());

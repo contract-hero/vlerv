@@ -45,15 +45,18 @@ export default function Sidebar({
         {/* Overlay title bar: draggable strip under the traffic lights. */}
         <div className="titlebar-drag" data-tauri-drag-region />
         <p className="sidebar-empty-text">Pick a folder to use as your workspace.</p>
-        <button className="sidebar-button" onClick={onPickWorkspace}>
+        {/* One primary on first run. The second action used to carry the same
+            filled treatment, so two buttons competed for the same first
+            click. */}
+        <button className="button" onClick={onPickWorkspace}>
           Choose workspace folder…
         </button>
         <button
-          className="sidebar-button"
+          className="button button-secondary"
           onClick={onPickFile}
           title="Open a single file (⌘O)"
         >
-          Open file…
+          Open a single file…
         </button>
       </div>
     );
@@ -70,8 +73,8 @@ export default function Sidebar({
         <button
           className="sidebar-header-change"
           onClick={onRefresh}
-          title="Refresh files"
-          aria-label="Refresh files"
+          title="Refresh the workspace tree"
+          aria-label="Refresh the workspace tree"
         >
           <RotateCw size={13} strokeWidth={2} />
         </button>
