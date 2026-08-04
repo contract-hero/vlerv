@@ -8,24 +8,9 @@ import { currentEntry } from "../state/tabs";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import Preview from "./Preview";
 import StartPage from "./StartPage";
+import { dirname } from "../utils/path";
+import { readErrorTitle } from "../utils/read-error";
 
-/**
- * The backend hands back a machine `kind` ("Io") and an OS reason string.
- * Neither is a headline. Name the problem in the reader's language and keep
- * the raw reason as secondary detail.
- */
-export function readErrorTitle(kind: string, reason: string): string {
-  const text = `${kind} ${reason}`.toLowerCase();
-  if (text.includes("not found") || text.includes("notfound") || text.includes("no such file")) {
-    return "File not found";
-  }
-  if (text.includes("permission") || text.includes("denied")) return "Permission denied";
-  if (text.includes("out of root") || text.includes("outofroot")) {
-    return "Outside the workspace";
-  }
-  if (text.includes("too large") || text.includes("oversized")) return "File too large to display";
-  return "Could not read this file";
-}
 
 export interface TabViewProps {
   onOpenFile: (path: string, opts?: OpenFileOptions) => void;
@@ -106,9 +91,15 @@ export default function TabView({
             type="button"
             className="button"
             onClick={() => {
-              void revealItemInDir(path).catch(() => {
-                // Parent directory may be gone too — nothing useful to add.
-              });
+              // tauri-plugin-opener canonicalizes first, so revealing a file
+              // that no longer exists always rejects — which is exactly the
+              // state that renders this button most often. Fall back to the
+              // folder that contained it.
+              void revealItemInDir(path)
+                .catch(() => revealItemInDir(dirname(path)))
+                .catch(() => {
+                  // The folder is gone too. Nothing left to show.
+                });
             }}
           >
             <Folder size={13} strokeWidth={2} aria-hidden /> Reveal in Finder

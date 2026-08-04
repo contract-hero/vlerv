@@ -315,13 +315,23 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
   );
 
   // Does a row currently hold the tabbable slot? `focusedPath` can outlive the
-  // row it names — collapsing an ancestor unmounts it — so we ask the DOM
-  // after every render that could have changed the row set.
+  // row it names — collapsing an ancestor unmounts it. Rows are rendered by
+  // FolderNode children holding their own state, so a render of THIS component
+  // is not a reliable signal; watch the DOM instead.
   const [rowIsTabbable, setRowIsTabbable] = React.useState(false);
   React.useEffect(() => {
     const container = containerRef.current;
-    setRowIsTabbable(!!container?.querySelector('[data-path][tabindex="0"]'));
-  });
+    if (!container) return;
+    const probe = () => setRowIsTabbable(!!container.querySelector('[data-path][tabindex="0"]'));
+    probe();
+    const observer = new MutationObserver(probe);
+    observer.observe(container, {
+      childList: true,
+      subtree: true,
+      attributeFilter: ["tabindex"],
+    });
+    return () => observer.disconnect();
+  }, []);
 
   const invalidate = React.useCallback((path: string) => {
     setVersions((prev) => {
@@ -363,7 +373,12 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
         }
       })
       .catch((e: Error) => {
-        if (!cancelled) setError(e.message);
+        if (cancelled) return;
+        setError(e.message);
+        // Drop the rows too. Keeping the last good listing under an error
+        // banner presents dead paths as live content — every row opens a tab
+        // that then fails to read (eject the workspace volume, hit Refresh).
+        setEntries(null);
       });
     return () => { cancelled = true; };
   }, [ipc, root, rootVersion, refreshNonce]);
@@ -371,6 +386,15 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
   return (
     <FolderCacheContext.Provider value={versions}>
       <RefreshContext.Provider value={refreshNonce}>
+      {/* Status messages sit OUTSIDE role="tree": a tree accepts only
+          treeitem and group children, and a screen reader filters the rest
+          out of the tree structure entirely. */}
+      {error !== null ? (
+        <div role="alert" className="explorer-error">{error}</div>
+      ) : null}
+      {error === null && entries === null ? (
+        <div className="explorer-loading">Loading…</div>
+      ) : null}
       <div
         className="explorer"
         role="tree"
@@ -385,12 +409,6 @@ export default function Explorer({ ipc, root, onOpenFile, selectedFile, refreshN
         tabIndex={rowIsTabbable ? -1 : 0}
         onKeyDown={onTreeKeyDown}
       >
-        {error !== null ? (
-          <div role="alert" className="explorer-error">{error}</div>
-        ) : null}
-        {error === null && entries === null ? (
-          <div className="explorer-loading">Loading…</div>
-        ) : null}
         {(entries === null ? [] : sortEntries(entries)).map((entry) =>
           entry.is_dir ? (
             <FolderNode

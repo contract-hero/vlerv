@@ -20,6 +20,24 @@ export function dirname(path: string): string {
  * are known edge cases. The Rust security gate (`canonicalize_and_check_root`)
  * is the authoritative check for any code path that actually reads the file.
  */
+/**
+ * The directory to show beside a filename in a retrieval surface. It exists to
+ * tell two same-named artifacts apart, and an absolute path spends its whole
+ * width on the prefix every row shares — so inside the workspace we show the
+ * path relative to the root.
+ *
+ * The trailing slash in the prefix test is load-bearing: without it a root of
+ * `/w/vlerv` would match `/w/vlerv-worktrees/x` and render a relative path
+ * that does not exist. Git worktrees produce exactly that layout.
+ */
+export function displayDir(path: string, root: string | null): string {
+  const dir = dirname(path);
+  if (!root) return dir;
+  if (dir === root) return "";
+  if (dir.startsWith(`${root}/`)) return dir.slice(root.length + 1);
+  return dir;
+}
+
 export function isUnderRoot(path: string, root: string | null | undefined): boolean {
   if (!root) return false;
   const normalized = root.endsWith("/") ? root : `${root}/`;

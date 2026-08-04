@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { basename, dirname, isUnderRoot, normalizePathBarInput } from "./path";
+import { basename, dirname, displayDir, isUnderRoot, normalizePathBarInput } from "./path";
 
 describe("basename / dirname", () => {
   it("splits regular paths", () => {
@@ -75,5 +75,27 @@ describe("normalizePathBarInput", () => {
     expect(normalizePathBarInput("vlerv://open?foo=1").kind).toBe("error");
     expect(normalizePathBarInput("vlerv://open?path=%ZZ").kind).toBe("error");
     expect(normalizePathBarInput("vlerv://open?path=/tmp/a%00b").kind).toBe("error");
+  });
+});
+
+describe("displayDir", () => {
+  it("shows a path relative to the workspace root", () => {
+    expect(displayDir("/w/vlerv/src/components/a.tsx", "/w/vlerv")).toBe("src/components");
+  });
+
+  it("shows nothing for a file sitting at the root", () => {
+    expect(displayDir("/w/vlerv/README.md", "/w/vlerv")).toBe("");
+  });
+
+  it("never fakes a relative path for a prefix sibling", () => {
+    // `/w/vlerv-worktrees/x` is NOT inside `/w/vlerv`. Without the trailing
+    // slash in the prefix test this returns "worktrees/x", a path that does
+    // not exist. Git worktrees produce exactly this layout.
+    expect(displayDir("/w/vlerv-worktrees/x/a.md", "/w/vlerv")).toBe("/w/vlerv-worktrees/x");
+  });
+
+  it("falls back to the absolute directory outside the root or with no root", () => {
+    expect(displayDir("/tmp/a.md", "/w/vlerv")).toBe("/tmp");
+    expect(displayDir("/w/vlerv/src/a.md", null)).toBe("/w/vlerv/src");
   });
 });

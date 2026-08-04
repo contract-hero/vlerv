@@ -1,6 +1,6 @@
 // File-type icon mapping via lucide-react.
 //
-// Glyphs carry SHAPE, never hue. The icon tables used to hold ~110 hard-coded
+// Glyphs carry SHAPE, never hue. The icon tables used to hold 86 hard-coded
 // hex values borrowed from the VS Code / Seti convention — cool blue-greys and
 // saturated brand colors that fought the design system on every surface at
 // once (tree rows, tabs, quick open, the start page). Per DESIGN.md's Single

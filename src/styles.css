@@ -59,7 +59,7 @@
   --fg-dim: #6b6458;
   /* Paths carry the information that tells two same-named artifacts apart, so
      they get their own token at >=4.5:1 on every surface they land on rather
-     than borrowing --fg-dim (2.8:1 on --bg-elevated). */
+     than borrowing --fg-dim (2.6:1 on --bg-elevated). */
   --fg-path: #a49b8a;
   --heading-fg: #ece6da;
   --border: #413a31;
@@ -115,9 +115,10 @@
   --label-active-fg: #14120e;
   --scrollbar-thumb: #cfc7b8;
   --scrollbar-thumb-hover: #b8ae9c;
-  /* Same reason as the ink block: the pre-paint frame must match the reading
-     field, not a hard white that flashes on every load. */
-  --iframe-bg: var(--bg);
+  /* Must match the background themeStyle() injects into the artifact
+     document (render/html.tsx) — that value is #ffffff in light, so pointing
+     this at --bg (#faf8f4) would trade one visible step for another. */
+  --iframe-bg: #ffffff;
   --badge-bg: #efe4cd;
   --badge-fg: #8a5f1b;
   --empty-fg: #8a8274;
@@ -346,7 +347,8 @@ html, body, #root {
 .toolbar-button:disabled { color: var(--fg-dim); opacity: 0.5; cursor: default; }
 .toolbar-button.star-active { color: var(--star-active); }
 /* Navigation and file actions are different jobs. Without a separator the
-   toolbar reads as one undifferentiated run of nine identical 28px squares. */
+   toolbar reads as one undifferentiated run of up to seven identical
+   28px squares. */
 .toolbar-sep {
   flex: 0 0 1px;
   align-self: center;
@@ -693,7 +695,8 @@ html, body, #root {
 }
 /* Height matches the Toolbar band exactly (40px). Both sit under the 38px
    titlebar/tab-strip band, so their bottom borders form ONE unbroken rule
-   across the window instead of stepping by ~10px at the sidebar seam. */
+   across the window instead of a 1px step at the sidebar seam (the old
+   auto height came out at 39px: 8 + 22 + 8 + 1). */
 .sidebar-header {
   display: flex;
   align-items: center;
@@ -1029,10 +1032,11 @@ html, body, #root {
 .start-row:hover { background: var(--bg-row-hover); }
 .start-row-icon { display: inline-flex; flex: 0 0 auto; }
 .start-row-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* `direction: rtl` moves the ellipsis to the HEAD of the string. A tail
-   ellipsis cuts the only segment that tells `evm-wal/report.html` apart from
-   `clud/report.html`. The path itself is wrapped in <bdi> so it still reads
-   left-to-right inside the right-to-left box. */
+/* `direction: rtl` moves the ellipsis to the HEAD, so the DEEPEST segments
+   survive. That is the right trade here: recents can hold absolute paths for
+   files outside the workspace, where the head is the `/Users/…/workspace/`
+   prefix every row shares. <bdi> keeps the path reading left-to-right inside
+   the right-to-left box. Quick Open does the opposite — see .quick-open-dir. */
 .start-row-dir {
   flex: 1 1 auto;
   overflow: hidden;
@@ -1108,13 +1112,15 @@ html, body, #root {
 .quick-open-list li.selected { background: var(--bg-row-selected); }
 .quick-open-icon { display: inline-flex; flex: 0 0 auto; }
 .quick-open-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Head-truncated for the same reason as .start-row-dir. */
+/* TAIL-truncated, unlike .start-row-dir. These paths are always relative to
+   the workspace root, so there is no shared prefix to drop and the leading
+   segment is the repo name — the one part that disambiguates two files with
+   the same name. Cutting the head would remove exactly that. */
 .quick-open-dir {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  direction: rtl;
   text-align: right;
   color: var(--fg-path);
   font-size: var(--text-xs);

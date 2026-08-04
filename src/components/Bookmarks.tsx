@@ -159,9 +159,13 @@ export default function Bookmarks({ onOpenFile }: BookmarksProps): React.ReactEl
               onContextMenu={(e) => openMenu(e, fileMenu(entry.path))}
               // Openable and reorderable without a mouse: Enter/Space opens,
               // ⌥↑/⌥↓ moves the row. Drag was the only way to reorder before.
-              role="button"
+              // No role="button" here — that would strip `listitem` from the
+              // <li> and leave the <ul> reporting no list and no item count,
+              // the same defect the header comment above argues against.
               tabIndex={0}
               onKeyDown={(e) => {
+                // The Remove button is a child; let it handle its own keys.
+                if (e.target !== e.currentTarget) return;
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   onOpenFile?.(entry.path, openOptsFromClick(e));

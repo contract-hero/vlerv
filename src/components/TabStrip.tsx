@@ -111,7 +111,9 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
             id={`tab-${tab.id}`}
             aria-controls="tab-panel"
             aria-selected={active}
-            // Roving tabindex: the strip is one tab stop, arrows move within.
+            // Roving tabindex over the tabs: arrows move within. Each
+            // .tab-close is still separately tabbable, so the strip is not
+            // yet a single tab stop.
             tabIndex={active ? 0 : -1}
             className={[
               "tab",

@@ -42,10 +42,30 @@ export interface PersistedTab {
   zoom: number;
 }
 
+/**
+ * Wire shape of `panes.tabs` in state.json. One build writes this document and
+ * another one reads it, so it carries a version: a reader that does not
+ * recognise `v` restores nothing AND refuses to overwrite, rather than
+ * silently rewriting a newer document in an older shape.
+ */
+export const TABS_SCHEMA = 1;
+
 export interface PersistedTabs {
+  v: typeof TABS_SCHEMA;
   tabs: PersistedTab[];
   activeIndex: number;
 }
+
+/**
+ * What a stored session turned out to be.
+ * - `restored`: use it.
+ * - `none`: nothing worth restoring; safe to overwrite.
+ * - `unreadable`: written by a build we do not understand; never overwrite.
+ */
+export type HydrateOutcome =
+  | { kind: "restored"; state: TabsState }
+  | { kind: "none" }
+  | { kind: "unreadable" };
 
 export interface TabsState {
   tabs: Tab[];
@@ -79,7 +99,10 @@ export type TabsAction =
   | { type: "FILE_REMOVED"; path: string }
   | { type: "SET_ZOOM"; tabId: string; zoom: number }
   | { type: "REOPEN_CLOSED_TAB" }
-  | { type: "HYDRATE"; persisted: PersistedTabs };
+  // Carries a document read off disk, not a validated value: the reducer
+  // hands it to hydrateTabsState. Typing it as PersistedTabs would be a
+  // promise the caller has to lie about.
+  | { type: "HYDRATE"; persisted: unknown };
 
 let nextTabSeq = 0;
 export function makeTabId(): string {
@@ -108,24 +131,38 @@ export function initialTabsState(): TabsState {
   return { tabs: [tab], activeTabId: tab.id, closed: [] };
 }
 
-/** The durable shape of a tab: where it points, not what it loaded. */
 export function toPersistedTab(tab: Tab): PersistedTab {
   return { history: tab.history, historyIndex: tab.historyIndex, zoom: tab.zoom };
 }
 
 function fromPersistedTab(p: PersistedTab): Tab {
-  const history = Array.isArray(p.history) ? p.history.filter(isHistoryEntry) : [];
-  const historyIndex = Math.max(-1, Math.min(history.length - 1, p.historyIndex ?? -1));
+  const history = Array.isArray(p.history)
+    ? p.history.map(toHistoryEntry).filter((e): e is HistoryEntry => e !== null)
+    : [];
+  // A non-empty history must land on a real entry. A stored -1, a missing
+  // field, or a non-number would otherwise restore a tab that holds history
+  // but shows the start page, with Forward live and Back dead.
+  const wanted = Number.isInteger(p.historyIndex) ? p.historyIndex : history.length - 1;
+  const historyIndex =
+    history.length === 0 ? -1 : Math.max(0, Math.min(history.length - 1, wanted));
   return {
     ...makeTab(),
     history,
-    historyIndex: history.length === 0 ? -1 : historyIndex,
+    historyIndex,
     zoom: clampZoom(typeof p.zoom === "number" ? p.zoom : 1),
   };
 }
 
-function isHistoryEntry(e: unknown): e is HistoryEntry {
-  return !!e && typeof e === "object" && typeof (e as HistoryEntry).path === "string";
+/**
+ * Normalize one stored history entry. A predicate would only *assert* that
+ * `external` is a boolean; this returns a fresh entry where it actually is
+ * one. That flag drives out-of-root watch registration, so an entry missing
+ * it would restore a tab that never live-reloads.
+ */
+function toHistoryEntry(e: unknown): HistoryEntry | null {
+  if (!e || typeof e !== "object") return null;
+  const { path, external } = e as Partial<HistoryEntry>;
+  return typeof path === "string" ? { path, external: external === true } : null;
 }
 
 /**
@@ -133,31 +170,41 @@ function isHistoryEntry(e: unknown): e is HistoryEntry {
  * the file on disk is the truth, so a restored tab re-reads rather than
  * showing a stale snapshot.
  */
-export function serializeTabs(state: TabsState): PersistedTabs {
+// `Pick` rather than the whole state: `closed` must never reach disk, and the
+// compiler now enforces that instead of a comment. It also states the exact
+// dependency set the provider's memo relies on.
+export function serializeTabs(state: Pick<TabsState, "tabs" | "activeTabId">): PersistedTabs {
   const withHistory = state.tabs.filter((t) => t.history.length > 0);
   const activeIndex = withHistory.findIndex((t) => t.id === state.activeTabId);
   return {
+    v: TABS_SCHEMA,
     tabs: withHistory.map(toPersistedTab),
     activeIndex: activeIndex < 0 ? 0 : activeIndex,
   };
 }
 
 /**
- * Rebuild a session from disk. Returns null when there is nothing worth
- * restoring, so the caller keeps the fresh single-empty-tab state.
+ * Rebuild a session from disk. The three outcomes are distinct on purpose:
+ * "nothing to restore" is safe to overwrite, "unreadable" is not.
  */
-export function hydrateTabsState(persisted: unknown): TabsState | null {
-  if (!persisted || typeof persisted !== "object") return null;
+export function hydrateTabsState(persisted: unknown): HydrateOutcome {
+  if (!persisted || typeof persisted !== "object") return { kind: "none" };
   const raw = persisted as Partial<PersistedTabs>;
-  if (!Array.isArray(raw.tabs)) return null;
+  // An absent `v` is the pre-versioning writer, which wrote v1.
+  const version = raw.v ?? TABS_SCHEMA;
+  if (version !== TABS_SCHEMA) return { kind: "unreadable" };
+  if (!Array.isArray(raw.tabs)) return { kind: "none" };
   const tabs = raw.tabs
     .filter((t): t is PersistedTab => !!t && typeof t === "object")
     .map(fromPersistedTab)
     .filter((t) => t.history.length > 0);
-  if (tabs.length === 0) return null;
-  const index = typeof raw.activeIndex === "number" ? raw.activeIndex : 0;
-  const active = tabs[Math.max(0, Math.min(tabs.length - 1, index))];
-  return { tabs, activeTabId: active.id, closed: [] };
+  if (tabs.length === 0) return { kind: "none" };
+  // Clamp AND floor: a fractional index would index past the array and make
+  // `active` undefined, throwing inside the reducer on every launch.
+  const rawIndex = typeof raw.activeIndex === "number" ? Math.floor(raw.activeIndex) : 0;
+  const index = Number.isFinite(rawIndex) ? rawIndex : 0;
+  const active = tabs[Math.max(0, Math.min(tabs.length - 1, index))] ?? tabs[0];
+  return { kind: "restored", state: { tabs, activeTabId: active.id, closed: [] } };
 }
 
 export function currentEntry(tab: Tab): HistoryEntry | null {
@@ -307,8 +354,15 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
     }
 
     case "HYDRATE": {
-      const restored = hydrateTabsState(action.persisted);
-      return restored ? { ...restored, closed: state.closed } : state;
+      // Anything the user (or a deep link) already opened outranks the disk.
+      // `getState()` is an async read and nothing blocks dispatches while it
+      // is in flight, so a cold start from `vlerv open <path>` would otherwise
+      // show the requested file and then replace it with the old session.
+      if (state.tabs.some((t) => t.history.length > 0)) return state;
+      const outcome = hydrateTabsState(action.persisted);
+      return outcome.kind === "restored"
+        ? { ...outcome.state, closed: state.closed }
+        : state;
     }
 
     case "ACTIVATE_TAB":

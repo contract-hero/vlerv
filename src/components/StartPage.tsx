@@ -6,7 +6,7 @@ import { useBookmarksContext } from "../state/bookmarks-context";
 import { FileGlyph } from "./FileIcon";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { openOptsFromClick } from "../state/TabsProvider";
-import { basename, dirname } from "../utils/path";
+import { basename, displayDir } from "../utils/path";
 
 export interface StartPageProps {
   onOpenFile: (path: string, opts?: OpenFileOptions) => void;
@@ -15,19 +15,6 @@ export interface StartPageProps {
   workspaceRoot: string | null;
 }
 
-/**
- * The directory shown beside a filename exists to tell two same-named
- * artifacts apart. An absolute path spends its whole width on the prefix
- * every row shares, so inside the workspace we show the path relative to the
- * root — matching what Quick Open already displays.
- */
-export function displayDir(path: string, root: string | null): string {
-  const dir = dirname(path);
-  if (!root) return dir;
-  if (dir === root) return "";
-  if (dir.startsWith(`${root}/`)) return dir.slice(root.length + 1);
-  return dir;
-}
 
 function FileList({
   paths,
@@ -56,7 +43,8 @@ function FileList({
             </span>
             <span className="start-row-name">{basename(path)}</span>
             {/* <bdi> keeps the path reading left-to-right inside the
-                right-to-left box that puts the ellipsis at the head. */}
+                right-to-left box that puts the ellipsis at the head, so the
+                deepest segments survive on a long absolute path. */}
             <span className="start-row-dir">
               <bdi>{displayDir(path, workspaceRoot)}</bdi>
             </span>

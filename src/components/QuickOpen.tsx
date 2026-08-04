@@ -181,9 +181,8 @@ export default function QuickOpen({ ipc, root, onOpenFile, onClose }: QuickOpenP
                 <FileGlyph name={basename(r.value)} size={14} />
               </span>
               <span className="quick-open-name">{basename(r.value)}</span>
-              {/* <bdi> keeps the path left-to-right inside the right-to-left
-                  box that puts the ellipsis at the head, so the repo segment
-                  survives truncation instead of the shared prefix. */}
+              {/* Tail-truncated: these paths are workspace-relative, so the
+                  leading repo segment is the discriminator. */}
               <span className="quick-open-dir">
                 <bdi>{r.value.includes("/") ? r.value.slice(0, r.value.lastIndexOf("/")) : ""}</bdi>
               </span>

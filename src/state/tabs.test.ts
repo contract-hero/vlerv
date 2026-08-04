@@ -7,6 +7,7 @@ import {
   currentEntry,
   HISTORY_CAP,
   hydrateTabsState,
+  TABS_SCHEMA,
   initialTabsState,
   isLoading,
   serializeTabs,
@@ -238,6 +239,11 @@ describe("tabsReducer", () => {
 });
 
 describe("session persistence", () => {
+  const restored = (o: ReturnType<typeof hydrateTabsState>) => {
+    if (o.kind !== "restored") throw new Error(`expected restored, got ${o.kind}`);
+    return o.state;
+  };
+
   it("serializes only tabs that point somewhere, and marks the active one", () => {
     let s = nav(initialTabsState(), "/a");
     s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b" });
@@ -245,50 +251,108 @@ describe("session persistence", () => {
     s = tabsReducer(s, { type: "OPEN_NEW_TAB", background: true }); // empty tab
 
     const persisted = serializeTabs(s);
+    expect(persisted.v).toBe(TABS_SCHEMA);
     expect(persisted.tabs.map((t) => t.history[t.historyIndex].path)).toEqual(["/a", "/b"]);
     expect(persisted.tabs[persisted.activeIndex].zoom).toBe(1.5);
   });
 
-  it("round-trips history, position and zoom", () => {
-    let s = nav(initialTabsState(), "/a");
-    s = nav(s, "/b");
+  it("activeIndex is the index into the serialized set, not the tab list", () => {
+    // The app always starts with an empty start-page tab at index 0, so this
+    // is the shape of nearly every real session: the two indices differ.
+    let s = tabsReducer(initialTabsState(), { type: "OPEN_NEW_TAB", path: "/a" });
+    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/b" });
+    const aId = s.tabs[1].id;
+    s = tabsReducer(s, { type: "ACTIVATE_TAB", tabId: aId });
+
+    const persisted = serializeTabs(s);
+    expect(persisted.activeIndex).toBe(0);
+    expect(currentEntry(activeTab(restored(hydrateTabsState(persisted))))?.path).toBe("/a");
+  });
+
+  it("round-trips history, position, zoom and the external flag", () => {
+    let s = nav(initialTabsState(), "/a", true);
+    s = nav(s, "/b", true);
     s = tabsReducer(s, { type: "GO_BACK" });
     s = tabsReducer(s, { type: "SET_ZOOM", tabId: s.activeTabId, zoom: 1.2 });
 
-    const restored = hydrateTabsState(serializeTabs(s))!;
-    expect(currentEntry(activeTab(restored))?.path).toBe("/a");
-    expect(canGoForward(activeTab(restored))).toBe(true);
-    expect(activeTab(restored).zoom).toBe(1.2);
+    const r = restored(hydrateTabsState(serializeTabs(s)));
+    expect(currentEntry(activeTab(r))?.path).toBe("/a");
+    expect(canGoForward(activeTab(r))).toBe(true);
+    expect(activeTab(r).zoom).toBe(1.2);
+    // `external` drives out-of-root watch registration: lose it and live
+    // reload dies silently for every restored external tab.
+    expect(currentEntry(activeTab(r))?.external).toBe(true);
     // Payloads are deliberately NOT persisted: a restored tab re-reads disk.
-    expect(activeTab(restored).payload).toBeNull();
+    expect(activeTab(r).payload).toBeNull();
   });
 
-  it("refuses junk and empty sessions so the app falls back to a fresh tab", () => {
-    expect(hydrateTabsState(null)).toBeNull();
-    expect(hydrateTabsState({})).toBeNull();
-    expect(hydrateTabsState({ tabs: [] })).toBeNull();
-    expect(hydrateTabsState({ tabs: [{ history: [], historyIndex: -1, zoom: 1 }] })).toBeNull();
-    expect(hydrateTabsState({ tabs: [{ history: [{ nope: 1 }], historyIndex: 0, zoom: 1 }] })).toBeNull();
+  it("reports nothing to restore for junk and empty sessions", () => {
+    expect(hydrateTabsState(null).kind).toBe("none");
+    expect(hydrateTabsState({}).kind).toBe("none");
+    expect(hydrateTabsState({ tabs: [] }).kind).toBe("none");
+    expect(hydrateTabsState({ tabs: [{ history: [], historyIndex: -1, zoom: 1 }] }).kind).toBe("none");
+    expect(hydrateTabsState({ tabs: [{ history: [{ nope: 1 }], historyIndex: 0, zoom: 1 }] }).kind).toBe("none");
   });
 
-  it("clamps an out-of-range activeIndex and historyIndex", () => {
-    const restored = hydrateTabsState({
+  it("refuses to read — and so to overwrite — a document from a newer build", () => {
+    const outcome = hydrateTabsState({
+      v: TABS_SCHEMA + 1,
+      tabs: [{ history: [{ path: "/a", external: false }], historyIndex: 0, zoom: 1 }],
+      activeIndex: 0,
+    });
+    expect(outcome.kind).toBe("unreadable");
+  });
+
+  it("clamps an out-of-range activeIndex, historyIndex and zoom", () => {
+    const r = restored(hydrateTabsState({
       tabs: [{ history: [{ path: "/a", external: false }], historyIndex: 99, zoom: 99 }],
       activeIndex: 99,
-    })!;
-    expect(currentEntry(activeTab(restored))?.path).toBe("/a");
-    expect(activeTab(restored).zoom).toBe(3);
+    }));
+    expect(currentEntry(activeTab(r))?.path).toBe("/a");
+    expect(activeTab(r).zoom).toBe(3);
   });
 
-  it("HYDRATE replaces the session and keeps the closed stack", () => {
-    let s = nav(initialTabsState(), "/old");
-    s = tabsReducer(s, { type: "OPEN_NEW_TAB", path: "/gone" });
+  it("never restores a non-empty history parked on no entry", () => {
+    // -1, missing, and non-numeric all used to survive, producing a tab that
+    // holds history but shows the start page with Forward live.
+    for (const historyIndex of [-1, undefined, "abc"]) {
+      const r = restored(hydrateTabsState({
+        tabs: [{ history: [{ path: "/a", external: false }], historyIndex, zoom: 1 }],
+        activeIndex: 0,
+      }));
+      expect(currentEntry(activeTab(r))?.path).toBe("/a");
+      expect(canGoForward(activeTab(r))).toBe(false);
+    }
+  });
+
+  it("survives a fractional activeIndex instead of throwing on every launch", () => {
+    const r = restored(hydrateTabsState({
+      tabs: [
+        { history: [{ path: "/a", external: false }], historyIndex: 0, zoom: 1 },
+        { history: [{ path: "/b", external: false }], historyIndex: 0, zoom: 1 },
+      ],
+      activeIndex: 0.5,
+    }));
+    expect(currentEntry(activeTab(r))?.path).toBe("/a");
+  });
+
+  it("defaults a missing external flag to false rather than undefined", () => {
+    const r = restored(hydrateTabsState({
+      tabs: [{ history: [{ path: "/a" }], historyIndex: 0, zoom: 1 }],
+      activeIndex: 0,
+    }));
+    expect(currentEntry(activeTab(r))?.external).toBe(false);
+  });
+
+  it("HYDRATE restores into a pristine session and keeps the closed stack", () => {
+    let s = tabsReducer(initialTabsState(), { type: "OPEN_NEW_TAB", path: "/gone" });
     s = tabsReducer(s, { type: "CLOSE_TAB", tabId: s.activeTabId });
     const closedBefore = s.closed;
 
     s = tabsReducer(s, {
       type: "HYDRATE",
       persisted: {
+        v: TABS_SCHEMA,
         tabs: [{ history: [{ path: "/restored", external: false }], historyIndex: 0, zoom: 1 }],
         activeIndex: 0,
       },
@@ -296,6 +360,28 @@ describe("session persistence", () => {
     expect(s.tabs).toHaveLength(1);
     expect(currentEntry(activeTab(s))?.path).toBe("/restored");
     expect(s.closed).toEqual(closedBefore);
+  });
+
+  it("HYDRATE never discards a session the user already opened", () => {
+    // A cold start from `vlerv open <path>` dispatches FOCUS_OR_OPEN before
+    // the async getState() read lands. The user's file must win.
+    let s = nav(initialTabsState(), "/deeplinked.md");
+    s = tabsReducer(s, {
+      type: "HYDRATE",
+      persisted: {
+        v: TABS_SCHEMA,
+        tabs: [{ history: [{ path: "/old", external: false }], historyIndex: 0, zoom: 1 }],
+        activeIndex: 0,
+      },
+    });
+    expect(s.tabs.map((t) => currentEntry(t)?.path)).toEqual(["/deeplinked.md"]);
+  });
+
+  it("HYDRATE with a corrupt payload keeps the live session", () => {
+    let s = nav(initialTabsState(), "/live");
+    s = tabsReducer(s, { type: "HYDRATE", persisted: { tabs: "corrupt" } });
+    expect(s.tabs).toHaveLength(1);
+    expect(currentEntry(activeTab(s))?.path).toBe("/live");
   });
 });
 
