@@ -4,6 +4,7 @@ import * as React from "react";
 import type { IpcSurface } from "../ipc";
 import { isUnderRoot } from "../utils/path";
 import type { OpenFileOptions } from "./open-opts";
+import { useRecentsContext } from "./recents-context";
 import { useWatcherBus } from "./watcher-bus";
 import {
   activeTab,
@@ -226,6 +227,7 @@ export function useOpenFile(
   workspaceRoot: string | null,
 ): (path: string, opts?: OpenFileOptions) => void {
   const dispatch = useTabsDispatch();
+  const { refresh: refreshRecents } = useRecentsContext();
   return React.useCallback(
     (path: string, opts?: OpenFileOptions) => {
       const external = opts?.external ?? !isUnderRoot(path, workspaceRoot);
@@ -234,8 +236,14 @@ export function useOpenFile(
       } else {
         dispatch({ type: "NAVIGATE", path, external });
       }
-      void ipc.pushRecent?.(path).catch(() => {});
+      // Refresh AFTER the push settles: consumers (sidebar Recent drawer)
+      // would otherwise race the write and miss the newest entry — and
+      // background-tab opens never change the active path, so the open
+      // funnel is the only reliable trigger.
+      void ipc.pushRecent?.(path)
+        .then(() => refreshRecents())
+        .catch((e: unknown) => console.error("vlerv: failed to record recent", path, e));
     },
-    [dispatch, ipc, workspaceRoot],
+    [dispatch, ipc, refreshRecents, workspaceRoot],
   );
 }

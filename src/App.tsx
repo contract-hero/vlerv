@@ -1,6 +1,7 @@
 // Root app — provider stack + browser-style chrome: TabStrip over
 // Toolbar over TabView, with the Explorer sidebar on the left.
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Sidebar from "./components/Sidebar";
@@ -43,14 +44,16 @@ const MAX_SIDEBAR_PX = 480;
 /** How long a transient notice stays up before it dismisses itself. */
 const NOTICE_MS = 10000;
 
-// Chords honored when forwarded from a preview iframe (tab/nav/zoom only —
-// nothing that opens native dialogs or steals focus). Must stay in sync with
+// Chords honored when forwarded from a preview iframe: tab, nav, zoom and
+// view-mode chords, plus bare Escape (bound only while reader mode is on) —
+// nothing that opens native dialogs or steals focus. Must stay in sync with
 // the FORWARD map in the injected script in src/render/html.tsx.
 const IFRAME_FORWARDABLE = new Set([
   "mod+t", "mod+w", "mod+shift+t", "ctrl+tab", "ctrl+shift+tab",
   "mod+shift+bracketright", "mod+shift+bracketleft",
   "mod+bracketleft", "mod+bracketright", "mod+r",
   "mod+equal", "mod+shift+equal", "mod+minus",
+  "mod+b", "mod+shift+f", "escape",
   ...Array.from({ length: 10 }, (_, i) => `mod+digit${i}`),
 ]);
 
@@ -108,6 +111,10 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   }, [activePath, root, reveal]);
 
   const [sidebarPx, setSidebarPx] = React.useState<number>(DEFAULT_SIDEBAR_PX);
+  const [sidebarVisible, setSidebarVisible] = React.useState<boolean>(true);
+  // Reader mode: chrome down to tabs + document. Deliberately transient —
+  // a reading posture, not a workspace setting, so it never persists.
+  const [readerMode, setReaderMode] = React.useState<boolean>(false);
   const [refreshNonce, setRefreshNonce] = React.useState<number>(0);
   const [quickOpenVisible, setQuickOpenVisible] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
@@ -136,8 +143,13 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       if (typeof px === "number" && px > 0) {
         setSidebarPx(clampSidebarPx(px));
       }
+      // Don't clobber a ⌘B the user pressed before this snapshot resolved.
+      if (!userToggledSidebar.current && s?.panes?.sidebar_visible === false) {
+        setSidebarVisible(false);
+      }
     }).catch(() => {
-      // Backend not wired or state.json missing — keep the default width.
+      // Backend not wired or state.json missing — keep the default width
+      // and visibility.
     });
     return () => { cancelled = true; };
   }, [ipc]);
@@ -147,6 +159,38 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       void ipc.setStateField("panes.sidebar_px", clampSidebarPx(finalPx));
     }
   }, [ipc]);
+
+  // ── View modes ─────────────────────────────────────────────────────────
+  // Set true on the first ⌘B so the async getState() hydration can't clobber
+  // a toggle that raced it.
+  const userToggledSidebar = React.useRef(false);
+
+  const persistSidebarVisible = React.useCallback((visible: boolean) => {
+    ipc.setStateField?.("panes.sidebar_visible", visible).catch((e: unknown) => {
+      console.error("vlerv: failed to persist sidebar visibility", e);
+    });
+  }, [ipc]);
+
+  // ⌘B. In reader mode the sidebar is already gone, so the intuitive result
+  // of "show me the sidebar" is to leave reader mode with the sidebar on.
+  // No functional setState here: updaters must stay pure (StrictMode
+  // double-invokes them), and the IPC write is a side effect.
+  const toggleSidebar = React.useCallback(() => {
+    userToggledSidebar.current = true;
+    if (readerMode) {
+      setReaderMode(false);
+      setSidebarVisible(true);
+      persistSidebarVisible(true);
+      return;
+    }
+    const next = !sidebarVisible;
+    setSidebarVisible(next);
+    persistSidebarVisible(next);
+  }, [persistSidebarVisible, readerMode, sidebarVisible]);
+
+  const toggleReaderMode = React.useCallback(() => {
+    setReaderMode((v) => !v);
+  }, []);
 
   // ── Pickers ────────────────────────────────────────────────────────────
   const handlePickFile = React.useCallback(() => {
@@ -193,6 +237,10 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
 
   // ── Keyboard shortcuts ─────────────────────────────────────────────────
   const focusAddressBar = React.useCallback(() => {
+    // ⌘L must work from reader mode: leave it first. flushSync, not a timer —
+    // the chord can arrive via the iframe message path, where nothing
+    // guarantees a macrotask lands after the commit that re-mounts the bar.
+    flushSync(() => setReaderMode(false));
     const input = addressBarRef.current;
     if (input) {
       input.focus();
@@ -220,6 +268,21 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
     { combo: "mod+l", allowInInput: true, handler: focusAddressBar },
     { combo: "mod+o", allowInInput: true, handler: handlePickFile },
     { combo: "mod+p", allowInInput: true, handler: () => setQuickOpenVisible((v) => !v) },
+    { combo: "mod+b", allowInInput: true, handler: toggleSidebar },
+    { combo: "mod+shift+f", allowInInput: true, handler: toggleReaderMode },
+    // Esc leaves reader mode. Registered only while the mode is on, so plain
+    // Escape keeps its meaning everywhere else (QuickOpen, address bar). An
+    // open context menu still owns Esc — it closes itself on the same window
+    // event, and one keypress must not do both.
+    ...(readerMode
+      ? [{
+          combo: "escape",
+          handler: () => {
+            if (document.querySelector(".context-menu")) return;
+            setReaderMode(false);
+          },
+        } satisfies Binding]
+      : []),
     { combo: "mod+equal", handler: () => zoomBy(ZOOM_STEP) },
     { combo: "mod+shift+equal", handler: () => zoomBy(ZOOM_STEP) },
     { combo: "mod+minus", handler: () => zoomBy(-ZOOM_STEP) },
@@ -235,6 +298,8 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   }
 
   useShortcuts(bindings);
+
+  const showSidebar = sidebarVisible && !readerMode;
 
   // Keep a ref for the iframe-forwarded chord path.
   const bindingsRef = React.useRef<readonly Binding[]>(bindings);
@@ -287,35 +352,51 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   }, [openFile]);
 
   return (
-    // The tab strip spans the whole window ABOVE the panes, rather than
-    // sitting inside the preview pane. Below the sidebar it was leaving a
-    // dead 38px band across the sidebar's full width (200-480px, default
-    // 280) whose only occupant was the traffic lights.
+    // The sidebar is a full-height column; the tab strip lives inside the
+    // preview pane, aligned with the reading field. On the left the sidebar
+    // reserves the traffic-light space and drags the window — via its header
+    // when a workspace is open, via the empty-state pane before that. The
+    // strip keeps drag duty over the preview column, and takes the gutter
+    // itself when the sidebar is hidden.
     <div className="app-shell">
-      <TabStrip onOpenFile={openFile} />
       <div className="app">
-        <aside
-          className="pane pane-sidebar"
-          role="complementary"
-          style={{ width: `${sidebarPx}px` }}
-        >
-          <Sidebar
-            ipc={ipc}
-            onOpenFile={openFile}
-            selectedFile={entry?.path ?? null}
-            onPickFile={handlePickFile}
-            onPickWorkspace={handlePickWorkspace}
-            onRefresh={handleRefresh}
-            refreshNonce={refreshNonce}
-          />
-        </aside>
-        <SidebarResizer
-          width={sidebarPx}
-          onResize={setSidebarPx}
-          onCommit={handleSidebarResizeCommit}
-        />
+        {showSidebar ? (
+          <>
+            <aside
+              className="pane pane-sidebar"
+              role="complementary"
+              style={{ width: `${sidebarPx}px` }}
+            >
+              <Sidebar
+                ipc={ipc}
+                onOpenFile={openFile}
+                selectedFile={entry?.path ?? null}
+                onPickFile={handlePickFile}
+                onPickWorkspace={handlePickWorkspace}
+                onRefresh={handleRefresh}
+                refreshNonce={refreshNonce}
+              />
+            </aside>
+            <SidebarResizer
+              width={sidebarPx}
+              onResize={setSidebarPx}
+              onCommit={handleSidebarResizeCommit}
+            />
+          </>
+        ) : null}
         <main className="pane pane-preview" role="main">
-          <Toolbar addressBarRef={addressBarRef} onSubmitPath={(p) => openFile(p)} />
+          {/* With the sidebar gone the strip is the leftmost band, so it
+              takes back the traffic-light gutter. */}
+          <TabStrip onOpenFile={openFile} showGutter={!showSidebar} />
+          {readerMode ? null : (
+            <Toolbar
+              addressBarRef={addressBarRef}
+              onSubmitPath={(p) => openFile(p)}
+              sidebarVisible={sidebarVisible}
+              onToggleSidebar={toggleSidebar}
+              onEnterReaderMode={toggleReaderMode}
+            />
+          )}
           {notice ? (
             <div className="app-notice" role="alert">
               <span className="app-notice-text">{notice}</span>

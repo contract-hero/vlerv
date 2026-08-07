@@ -38,6 +38,19 @@ export function displayDir(path: string, root: string | null): string {
   return dir;
 }
 
+/**
+ * What the idle address bar shows: the path relative to the workspace root.
+ * The absolute prefix is identical on every workspace file — pure noise in a
+ * reading surface — and editing still operates on the full path (the bar
+ * swaps back to it on focus). Out-of-root paths stay absolute.
+ */
+export function displayPath(path: string, root: string | null): string {
+  if (root && path !== root && isUnderRoot(path, root)) {
+    return path.slice(root.endsWith("/") ? root.length : root.length + 1);
+  }
+  return path;
+}
+
 export function isUnderRoot(path: string, root: string | null | undefined): boolean {
   if (!root) return false;
   const normalized = root.endsWith("/") ? root : `${root}/`;

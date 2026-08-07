@@ -6,6 +6,8 @@ import { FilePlus2, FolderOpen, RotateCw } from "lucide-react";
 import type { IpcSurface } from "../ipc";
 import Explorer from "./Explorer";
 import Bookmarks from "./Bookmarks";
+import RecentFiles from "./RecentFiles";
+import SidebarSection from "./SidebarSection";
 import { useWorkspace } from "../state/workspace";
 import { basename } from "../utils/path";
 import type { OpenFileOptions } from "../state/TabsProvider";
@@ -41,7 +43,7 @@ export default function Sidebar({
 
   if (!workspaceRoot) {
     return (
-      <div className="sidebar-empty">
+      <div className="sidebar-empty" data-tauri-drag-region>
         <p className="sidebar-empty-text">Pick a folder to use as your workspace.</p>
         {/* One primary on first run. The second action used to carry the same
             filled treatment, so two buttons competed for the same first
@@ -64,7 +66,10 @@ export default function Sidebar({
 
   return (
     <div className="sidebar">
-      <div className="sidebar-header">
+      {/* Overlay title bar duty: the sidebar owns the window's top-left
+          corner, so this header keeps the macOS traffic lights clear
+          (--titlebar-inset in CSS) and drags the window. */}
+      <div className="sidebar-header" data-tauri-drag-region>
         <span className="sidebar-header-title" title={workspaceRoot}>{folderName}</span>
         <button
           className="sidebar-header-change"
@@ -91,14 +96,25 @@ export default function Sidebar({
           <FolderOpen size={13} strokeWidth={2} />
         </button>
       </div>
-      <Bookmarks onOpenFile={onOpenFile} />
-      <Explorer
-        ipc={ipc}
-        root={workspaceRoot}
-        onOpenFile={onOpenFile}
-        selectedFile={selectedFile}
-        refreshNonce={refreshNonce}
-      />
+      {/* Only the drawers scroll — the header above owns the traffic-light
+          inset and the drag region, so it must stay pinned. */}
+      <div className="sidebar-drawers">
+        <Bookmarks onOpenFile={onOpenFile} />
+        <RecentFiles onOpenFile={onOpenFile} />
+        {/* The whole tree is one drawer, folded by default: a project root
+            lists directories, not artifacts. Bookmarks, Recent and ⌘P are
+            the primary paths to a file; the tree is for the
+            walk-the-project case. */}
+        <SidebarSection id="files" title="Files" defaultCollapsed grow>
+          <Explorer
+            ipc={ipc}
+            root={workspaceRoot}
+            onOpenFile={onOpenFile}
+            selectedFile={selectedFile}
+            refreshNonce={refreshNonce}
+          />
+        </SidebarSection>
+      </div>
     </div>
   );
 }

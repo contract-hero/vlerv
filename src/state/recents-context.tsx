@@ -1,4 +1,5 @@
-// RecentsProvider — one recents subscription for the whole app (StartPage).
+// RecentsProvider — one recents subscription for the whole app (StartPage
+// and the sidebar Recent drawer).
 import * as React from "react";
 import type { IpcSurface, RecentEntry } from "../ipc";
 import { useTauriEvent } from "../hooks/useTauriEvent";
@@ -29,8 +30,10 @@ export function RecentsProvider({
 
   const refresh = React.useCallback(() => {
     if (!ipc.listRecents) return;
-    ipc.listRecents().then(setRecents).catch(() => {
-      // backend not wired; ignore
+    ipc.listRecents().then(setRecents).catch((e: unknown) => {
+      // Keep the last good list, but leave a trace: a silent failure here
+      // makes the Recent drawer indistinguishable from "no recents yet".
+      console.error("vlerv: failed to list recents", e);
     });
   }, [ipc]);
 

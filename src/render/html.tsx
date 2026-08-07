@@ -95,20 +95,36 @@ const HOST_BRIDGE_SCRIPT = `
     }
   });
 
-  // Forward global-shortcut chords to the host. Only tab/nav/zoom codes are
-  // intercepted (the host ignores anything else — see IFRAME_FORWARDABLE in
-  // App.tsx), so in-page ⌘C/⌘V/⌘A keep working and dialog-opening chords
-  // (⌘O/⌘L/⌘P) can't be synthesized by page content.
+  // Forward global-shortcut chords to the host. Only tab/nav/zoom/view-mode
+  // codes are intercepted (the host ignores anything else — see
+  // IFRAME_FORWARDABLE in App.tsx), so in-page ⌘C/⌘V/⌘A keep working and
+  // dialog-opening chords (⌘O/⌘L/⌘P) can't be synthesized by page content.
   var FORWARD = {
-    KeyT: 1, KeyW: 1, KeyR: 1,
+    KeyT: 1, KeyW: 1, KeyR: 1, KeyB: 1,
     BracketLeft: 1, BracketRight: 1, Equal: 1, Minus: 1,
     Digit0: 1, Digit1: 1, Digit2: 1, Digit3: 1, Digit4: 1,
     Digit5: 1, Digit6: 1, Digit7: 1, Digit8: 1, Digit9: 1
   };
   window.addEventListener('keydown', function (e) {
     var isChord = e.metaKey || e.ctrlKey;
-    if (!isChord) return;
-    var forward = FORWARD[e.code] || (e.code === 'Tab' && e.ctrlKey);
+    // Bare Escape is the one modifier-less key that crosses the bridge: the
+    // host binds it only while reader mode is on, so at all other times a
+    // page-synthesized Escape is inert. Don't preventDefault — the page may
+    // have its own Escape behavior (close a dialog) that should still run.
+    if (!isChord) {
+      if (e.code !== 'Escape') return;
+      window.parent.postMessage({
+        type: 'vlerv:keydown',
+        code: e.code, key: e.key,
+        metaKey: false, ctrlKey: false,
+        shiftKey: e.shiftKey, altKey: e.altKey
+      }, '*');
+      return;
+    }
+    // KeyF only with shift (⇧⌘F reader mode) — plain ⌘F stays with the page.
+    var forward = FORWARD[e.code] ||
+      (e.code === 'Tab' && e.ctrlKey) ||
+      (e.code === 'KeyF' && e.shiftKey);
     if (!forward) return;
     e.preventDefault();
     window.parent.postMessage({

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { basename, dirname, displayDir, isUnderRoot, normalizePathBarInput } from "./path";
+import { basename, dirname, displayDir, displayPath, isUnderRoot, normalizePathBarInput } from "./path";
 
 describe("basename / dirname", () => {
   it("splits regular paths", () => {
@@ -97,5 +97,29 @@ describe("displayDir", () => {
   it("falls back to the absolute directory outside the root or with no root", () => {
     expect(displayDir("/tmp/a.md", "/w/vlerv")).toBe("/tmp");
     expect(displayDir("/w/vlerv/src/a.md", null)).toBe("/w/vlerv/src");
+  });
+});
+
+describe("displayPath", () => {
+  it("shows a workspace file relative to the root", () => {
+    expect(displayPath("/w/vlerv/src/a.md", "/w/vlerv")).toBe("src/a.md");
+  });
+
+  it("keeps absolute form outside the root, with no root, or for the root itself", () => {
+    expect(displayPath("/tmp/a.md", "/w/vlerv")).toBe("/tmp/a.md");
+    expect(displayPath("/w/vlerv/src/a.md", null)).toBe("/w/vlerv/src/a.md");
+    expect(displayPath("/w/vlerv", "/w/vlerv")).toBe("/w/vlerv");
+  });
+
+  it("never relativizes a prefix sibling (worktree layout)", () => {
+    expect(displayPath("/w/vlerv-worktrees/x/a.md", "/w/vlerv")).toBe("/w/vlerv-worktrees/x/a.md");
+  });
+
+  it("tolerates a root that already ends in a slash", () => {
+    expect(displayPath("/w/vlerv/src/a.md", "/w/vlerv/")).toBe("src/a.md");
+  });
+
+  it("relativizes against the filesystem root", () => {
+    expect(displayPath("/Users/x/a.md", "/")).toBe("Users/x/a.md");
   });
 });

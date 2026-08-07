@@ -118,13 +118,13 @@ components:
     textColor: "{colors.fg-muted}"
     typography: "{typography.ui}"
     padding: "0 8px 0 12px"
-    height: "38px"
+    height: "40px"
   tab-active:
     backgroundColor: "{colors.bg}"
     textColor: "{colors.fg}"
     typography: "{typography.ui}"
     padding: "0 8px 0 12px"
-    height: "38px"
+    height: "40px"
   toolbar-button:
     backgroundColor: "transparent"
     textColor: "{colors.fg-muted}"
@@ -428,24 +428,59 @@ Base unit 4px. Tokens: 4 · 8 · 12 · 16 · 24 · 32.
 
 ### Fixed bands
 
-The window is a column: one full-width tab strip, then a row of two panes. Band
+The window is a row: a full-height sidebar, then the preview column. Band
 heights are structural and do not scale:
 
-- **38px** — the tab strip. It spans the **whole window**, above both panes, and
-  doubles as the overlay title bar: it carries `data-tauri-drag-region` and
-  reserves a **78px gutter** for the macOS traffic lights before the first tab.
-  It used to sit inside the preview pane, which left a dead 38px band across
-  the sidebar's full width (200-480px, default 280) whose only occupant was
-  the traffic lights.
-- **40px** — the sidebar header and the toolbar. Equal by requirement: they sit
-  side by side under the tab strip, so their bottom borders must form one
-  unbroken rule rather than a 1px step at the sidebar seam.
+- **40px** — the sidebar header and the tab strip. Equal by requirement: they
+  sit side by side at the very top of the window, so their bottom borders
+  must form one unbroken rule rather than a 1px step at the sidebar seam.
+  The sidebar header is the overlay title bar on the left: it carries
+  `data-tauri-drag-region` and a **78px left inset** that keeps the macOS
+  traffic lights clear. The tab strip belongs to the preview column only —
+  tabs align with the reading field and never cross into the sidebar. (A
+  full-window strip was tried; it pushed the sidebar header down and left a
+  dead 78px gutter as the strip's only occupant before the first tab.)
+- **40px** — the toolbar, under the tab strip.
 - **30px** — an explorer row.
+
+When the sidebar is hidden (see View modes), the tab strip is the leftmost
+band and takes the 78px traffic-light gutter back as a sticky, opaque spacer
+before the first tab.
+
+### View modes
+
+Two subtractive modes serve the product's north star — distraction-free
+reading of local artifacts. Both are keyboard-first with a toolbar affordance:
+
+- **⌘B** hides/shows the sidebar (PanelLeft button, far left of the toolbar).
+  Persisted (`panes.sidebar_visible`) — a workspace posture.
+- **⇧⌘F** is reader mode: sidebar AND toolbar gone, tabs + document only
+  (BookOpen button, far right). Esc, ⇧⌘F, ⌘L, or ⌘B leaves it — all but ⌘L
+  also cross the iframe bridge, so they work with focus inside a preview
+  (⌘L is deliberately not forwardable). Deliberately transient — a reading
+  posture, never persisted.
+
+Chrome is only removed, never re-flowed: the reading field keeps its position
+and the tab strip keeps its shape, except for the traffic-light gutter the
+strip inherits while the sidebar is gone. ⌘B from reader mode is the one
+intentional exception to "restore the prior layout" — it exits with the
+sidebar on, because that is what the key asks for.
 
 ### Panes
 
 The sidebar is the only elastic axis: 200px minimum, 480px maximum. The reading
 field takes the rest.
+
+The sidebar stacks a fixed header over three collapsible drawers of one
+shape (SidebarSection: eyebrow header, chevron, optional count): **Bookmarks**
+(pinned), **Recent** (last 8 opened — the self-maintaining working set), and
+**Files** (the whole workspace tree, folded by default: a project root is a
+directory listing, not a reading list). Retrieval order is Bookmarks → Recent
+→ ⌘P; the tree is for walking a project. Collapse state persists per-drawer
+in localStorage. Empty sections degrade: Bookmarks shows a static heading and
+a hint, Recent hides itself until a file is opened. Only the drawers scroll;
+the header — which owns the traffic-light inset and the drag region — stays
+pinned.
 
 The resizer is an **overlay, not a column**. It takes zero width in the layout
 and carries its 6px pointer target in a pseudo-element straddling the seam,
@@ -515,10 +550,10 @@ Pills are for **status**, never for actions. A CTA is 8px, always — Linear's
 ### Tabs
 
 The active tab drops to `{colors.bg}` — canvas depth — and carries the 2px
-lavender rule on its top edge. Because the strip now spans the window, an active
-tab sitting over the sidebar no longer joins the reading field below it; the
-canvas fill and the lavender rule carry the state on their own, and the tab
-reads as lifted rather than as continuous.
+lavender rule on its top edge. Because the 40px toolbar band sits between the
+strip and the reading field, the active tab does not physically join the
+field; the canvas fill and the lavender rule carry the state on their own
+(and keep carrying it in reader mode, where the toolbar is gone).
 
 An inactive tab is transparent over `{colors.bg-chrome}` and lifts to
 `{colors.bg-row-hover}` on hover. A tab loading its file shows a 6px lavender
@@ -560,6 +595,12 @@ Mono type on `{colors.input-bg}`, 8px corners, hairline border that strengthens
 to `{colors.input-border-focus}` on focus. A path is machine text; it is set in
 mono everywhere it appears — address bar, explorer path column, Quick Open
 directory, metadata renderer, file-notice path.
+
+Idle, the bar shows the **workspace-relative** path — the absolute prefix is
+identical on every workspace file and says nothing. Focus swaps in the full
+absolute path and selects it, so editing always operates on the real path and
+the swap is never mistaken for a caret jump. Out-of-root files stay absolute
+and keep the `external` badge.
 
 ### Floating overlays
 
