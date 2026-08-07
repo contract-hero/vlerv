@@ -244,7 +244,9 @@ export default function Toolbar({
           data-testid="path-bar-input"
           onFocus={(e) => {
             setEditing(true);
-            const input = e.target as HTMLInputElement;
+            // Select after the value swaps from relative to absolute (next
+            // commit), not the soon-to-be-replaced display text.
+            const input = e.currentTarget;
             window.setTimeout(() => input.select(), 0);
           }}
           onBlur={() => setEditing(false)}
