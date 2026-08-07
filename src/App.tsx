@@ -1,6 +1,7 @@
 // Root app — provider stack + browser-style chrome: TabStrip over
 // Toolbar over TabView, with the Explorer sidebar on the left.
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Sidebar from "./components/Sidebar";
@@ -43,15 +44,16 @@ const MAX_SIDEBAR_PX = 480;
 /** How long a transient notice stays up before it dismisses itself. */
 const NOTICE_MS = 10000;
 
-// Chords honored when forwarded from a preview iframe (tab/nav/zoom only —
-// nothing that opens native dialogs or steals focus). Must stay in sync with
+// Chords honored when forwarded from a preview iframe: tab, nav, zoom and
+// view-mode chords, plus bare Escape (bound only while reader mode is on) —
+// nothing that opens native dialogs or steals focus. Must stay in sync with
 // the FORWARD map in the injected script in src/render/html.tsx.
 const IFRAME_FORWARDABLE = new Set([
   "mod+t", "mod+w", "mod+shift+t", "ctrl+tab", "ctrl+shift+tab",
   "mod+shift+bracketright", "mod+shift+bracketleft",
   "mod+bracketleft", "mod+bracketright", "mod+r",
   "mod+equal", "mod+shift+equal", "mod+minus",
-  "mod+b", "mod+shift+f",
+  "mod+b", "mod+shift+f", "escape",
   ...Array.from({ length: 10 }, (_, i) => `mod+digit${i}`),
 ]);
 
@@ -141,11 +143,13 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       if (typeof px === "number" && px > 0) {
         setSidebarPx(clampSidebarPx(px));
       }
-      if (s?.panes?.sidebar_visible === false) {
+      // Don't clobber a ⌘B the user pressed before this snapshot resolved.
+      if (!userToggledSidebar.current && s?.panes?.sidebar_visible === false) {
         setSidebarVisible(false);
       }
     }).catch(() => {
-      // Backend not wired or state.json missing — keep the default width.
+      // Backend not wired or state.json missing — keep the default width
+      // and visibility.
     });
     return () => { cancelled = true; };
   }, [ipc]);
@@ -157,21 +161,32 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   }, [ipc]);
 
   // ── View modes ─────────────────────────────────────────────────────────
+  // Set true on the first ⌘B so the async getState() hydration can't clobber
+  // a toggle that raced it.
+  const userToggledSidebar = React.useRef(false);
+
+  const persistSidebarVisible = React.useCallback((visible: boolean) => {
+    ipc.setStateField?.("panes.sidebar_visible", visible).catch((e: unknown) => {
+      console.error("vlerv: failed to persist sidebar visibility", e);
+    });
+  }, [ipc]);
+
   // ⌘B. In reader mode the sidebar is already gone, so the intuitive result
   // of "show me the sidebar" is to leave reader mode with the sidebar on.
+  // No functional setState here: updaters must stay pure (StrictMode
+  // double-invokes them), and the IPC write is a side effect.
   const toggleSidebar = React.useCallback(() => {
+    userToggledSidebar.current = true;
     if (readerMode) {
       setReaderMode(false);
       setSidebarVisible(true);
-      void ipc.setStateField?.("panes.sidebar_visible", true);
+      persistSidebarVisible(true);
       return;
     }
-    setSidebarVisible((v) => {
-      const next = !v;
-      void ipc.setStateField?.("panes.sidebar_visible", next);
-      return next;
-    });
-  }, [ipc, readerMode]);
+    const next = !sidebarVisible;
+    setSidebarVisible(next);
+    persistSidebarVisible(next);
+  }, [persistSidebarVisible, readerMode, sidebarVisible]);
 
   const toggleReaderMode = React.useCallback(() => {
     setReaderMode((v) => !v);
@@ -222,16 +237,15 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
 
   // ── Keyboard shortcuts ─────────────────────────────────────────────────
   const focusAddressBar = React.useCallback(() => {
-    // ⌘L must work from reader mode: leave it first, then focus once the
-    // toolbar has re-mounted (setTimeout lands after the React commit).
-    setReaderMode(false);
-    window.setTimeout(() => {
-      const input = addressBarRef.current;
-      if (input) {
-        input.focus();
-        input.select();
-      }
-    }, 0);
+    // ⌘L must work from reader mode: leave it first. flushSync, not a timer —
+    // the chord can arrive via the iframe message path, where nothing
+    // guarantees a macrotask lands after the commit that re-mounts the bar.
+    flushSync(() => setReaderMode(false));
+    const input = addressBarRef.current;
+    if (input) {
+      input.focus();
+      input.select();
+    }
   }, []);
 
   const bindings: Binding[] = [
@@ -257,9 +271,17 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
     { combo: "mod+b", allowInInput: true, handler: toggleSidebar },
     { combo: "mod+shift+f", allowInInput: true, handler: toggleReaderMode },
     // Esc leaves reader mode. Registered only while the mode is on, so plain
-    // Escape keeps its meaning everywhere else (QuickOpen, address bar).
+    // Escape keeps its meaning everywhere else (QuickOpen, address bar). An
+    // open context menu still owns Esc — it closes itself on the same window
+    // event, and one keypress must not do both.
     ...(readerMode
-      ? [{ combo: "escape", handler: () => setReaderMode(false) } satisfies Binding]
+      ? [{
+          combo: "escape",
+          handler: () => {
+            if (document.querySelector(".context-menu")) return;
+            setReaderMode(false);
+          },
+        } satisfies Binding]
       : []),
     { combo: "mod+equal", handler: () => zoomBy(ZOOM_STEP) },
     { combo: "mod+shift+equal", handler: () => zoomBy(ZOOM_STEP) },
@@ -331,9 +353,11 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
 
   return (
     // The sidebar is a full-height column; the tab strip lives inside the
-    // preview pane, aligned with the reading field. The sidebar header (not
-    // the strip) reserves the traffic-light gutter and drags the window on
-    // the left; the strip keeps drag duty over the preview column.
+    // preview pane, aligned with the reading field. On the left the sidebar
+    // reserves the traffic-light space and drags the window — via its header
+    // when a workspace is open, via the empty-state pane before that. The
+    // strip keeps drag duty over the preview column, and takes the gutter
+    // itself when the sidebar is hidden.
     <div className="app-shell">
       <div className="app">
         {showSidebar ? (

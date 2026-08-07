@@ -27,7 +27,10 @@ import { tauriIpc } from "../ipc";
 export interface ToolbarProps {
   addressBarRef: React.MutableRefObject<HTMLInputElement | null>;
   onSubmitPath: (path: string) => void;
-  /** Whether the sidebar is currently shown (drives the toggle's state). */
+  /**
+   * Whether the sidebar is currently shown. Picks the toggle button's title
+   * and aria-label only — the button carries no pressed state.
+   */
   sidebarVisible: boolean;
   onToggleSidebar: () => void;
   onEnterReaderMode: () => void;

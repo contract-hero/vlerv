@@ -67,8 +67,8 @@ export default function Sidebar({
   return (
     <div className="sidebar">
       {/* Overlay title bar duty: the sidebar owns the window's top-left
-          corner, so this header keeps the macOS traffic lights clear (78px
-          left inset in CSS) and drags the window. */}
+          corner, so this header keeps the macOS traffic lights clear
+          (--titlebar-inset in CSS) and drags the window. */}
       <div className="sidebar-header" data-tauri-drag-region>
         <span className="sidebar-header-title" title={workspaceRoot}>{folderName}</span>
         <button
@@ -96,21 +96,25 @@ export default function Sidebar({
           <FolderOpen size={13} strokeWidth={2} />
         </button>
       </div>
-      <Bookmarks onOpenFile={onOpenFile} />
-      <RecentFiles onOpenFile={onOpenFile} selectedFile={selectedFile} />
-      {/* The whole tree is one drawer, folded by default: with ~100 project
-          dirs at the root it is a directory listing, not a reading list.
-          Bookmarks + Recent + ⌘P are the primary paths to an artifact; the
-          tree is for the walk-the-project case. */}
-      <SidebarSection id="files" title="Files" defaultCollapsed grow>
-        <Explorer
-          ipc={ipc}
-          root={workspaceRoot}
-          onOpenFile={onOpenFile}
-          selectedFile={selectedFile}
-          refreshNonce={refreshNonce}
-        />
-      </SidebarSection>
+      {/* Only the drawers scroll — the header above owns the traffic-light
+          inset and the drag region, so it must stay pinned. */}
+      <div className="sidebar-drawers">
+        <Bookmarks onOpenFile={onOpenFile} />
+        <RecentFiles onOpenFile={onOpenFile} />
+        {/* The whole tree is one drawer, folded by default: a project root
+            lists directories, not artifacts. Bookmarks, Recent and ⌘P are
+            the primary paths to a file; the tree is for the
+            walk-the-project case. */}
+        <SidebarSection id="files" title="Files" defaultCollapsed grow>
+          <Explorer
+            ipc={ipc}
+            root={workspaceRoot}
+            onOpenFile={onOpenFile}
+            selectedFile={selectedFile}
+            refreshNonce={refreshNonce}
+          />
+        </SidebarSection>
+      </div>
     </div>
   );
 }

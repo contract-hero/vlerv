@@ -5,6 +5,8 @@
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
 
+// Key changed from vlerv.bookmarks.collapsed when sections were generalized;
+// the old value is intentionally dropped rather than migrated.
 function storageKey(id: string): string {
   return `vlerv.section.${id}.collapsed`;
 }
@@ -28,7 +30,7 @@ function saveCollapsed(id: string, collapsed: boolean): void {
 }
 
 export interface SidebarSectionProps {
-  /** Stable id — becomes the data-section value and the storage key. */
+  /** Stable id — the data-section value; forms the storage key `vlerv.section.<id>.collapsed`. */
   id: string;
   title: string;
   /** Row count shown at the header's right edge; omit to hide. */

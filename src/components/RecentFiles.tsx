@@ -17,25 +17,21 @@ const MAX_ROWS = 8;
 
 export interface RecentFilesProps {
   onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
-  /**
-   * Active file path. Doubles as the refresh trigger: recents have no
-   * backend update event, and every change to the active file is exactly a
-   * moment the list may have grown.
-   */
-  selectedFile?: string | null;
 }
 
 export default function RecentFiles({
   onOpenFile,
-  selectedFile,
 }: RecentFilesProps): React.ReactElement | null {
   const { recents, refresh } = useRecentsContext();
   const { open: openMenu } = useContextMenu();
   const fileMenu = useFileMenu(onOpenFile);
 
+  // Mount-only: after this, the open funnel (useOpenFile) refreshes the
+  // store once each push settles, so the drawer never races the write and
+  // background-tab opens are covered too.
   React.useEffect(() => {
     refresh();
-  }, [refresh, selectedFile]);
+  }, [refresh]);
 
   const rows = recents.slice(0, MAX_ROWS);
   // No empty-state hint: an empty Recent section teaches nothing (opening

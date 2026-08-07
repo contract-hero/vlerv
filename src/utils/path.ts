@@ -46,7 +46,7 @@ export function displayDir(path: string, root: string | null): string {
  */
 export function displayPath(path: string, root: string | null): string {
   if (root && path !== root && isUnderRoot(path, root)) {
-    return path.slice(root.length + 1);
+    return path.slice(root.endsWith("/") ? root.length : root.length + 1);
   }
   return path;
 }

@@ -48,6 +48,10 @@ pub struct PaneSizes {
     pub sidebar_visible: bool,
 }
 
+// Hand-written because `sidebar_visible` must default to TRUE: every
+// pre-upgrade state.json lacks the field, and a derived default would hide
+// the sidebar for the whole installed base. The px zeros keep the derived
+// behavior — the frontend treats 0 as "no saved width".
 impl Default for PaneSizes {
     fn default() -> Self {
         Self { sidebar_px: 0, preview_px: 0, sidebar_visible: true }
@@ -369,6 +373,33 @@ fn do_write_value(val: &serde_json::Value, counter: &AtomicU64) {
 /// Test/inspection: count of disk writes since process start.
 pub fn write_count() -> u64 {
     write_counter_arc().load(Ordering::SeqCst)
+}
+
+// Pure serde — no filesystem, no VLERV_STATE_DIR, no debounce thread.
+#[cfg(test)]
+mod pane_sizes_tests {
+    use super::{PaneSizes, State};
+
+    #[test]
+    fn state_json_without_sidebar_visible_keeps_the_sidebar_shown() {
+        let p: PaneSizes = serde_json::from_str(r#"{"sidebar_px":280,"preview_px":0}"#).unwrap();
+        assert!(p.sidebar_visible, "pre-upgrade state.json must not hide the sidebar");
+        assert_eq!(p.sidebar_px, 280);
+    }
+
+    #[test]
+    fn state_without_a_panes_object_keeps_the_sidebar_shown() {
+        let s: State = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
+        assert!(s.panes.sidebar_visible);
+    }
+
+    #[test]
+    fn hidden_sidebar_round_trips_through_json() {
+        let hidden = PaneSizes { sidebar_px: 280, preview_px: 0, sidebar_visible: false };
+        let json = serde_json::to_string(&hidden).unwrap();
+        assert!(json.contains("\"sidebar_visible\":false"));
+        assert_eq!(serde_json::from_str::<PaneSizes>(&json).unwrap(), hidden);
+    }
 }
 
 /// Flush any pending debounced write immediately.

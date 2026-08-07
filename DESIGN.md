@@ -118,13 +118,13 @@ components:
     textColor: "{colors.fg-muted}"
     typography: "{typography.ui}"
     padding: "0 8px 0 12px"
-    height: "38px"
+    height: "40px"
   tab-active:
     backgroundColor: "{colors.bg}"
     textColor: "{colors.fg}"
     typography: "{typography.ui}"
     padding: "0 8px 0 12px"
-    height: "38px"
+    height: "40px"
   toolbar-button:
     backgroundColor: "transparent"
     textColor: "{colors.fg-muted}"
@@ -455,11 +455,16 @@ reading of local artifacts. Both are keyboard-first with a toolbar affordance:
 - **⌘B** hides/shows the sidebar (PanelLeft button, far left of the toolbar).
   Persisted (`panes.sidebar_visible`) — a workspace posture.
 - **⇧⌘F** is reader mode: sidebar AND toolbar gone, tabs + document only
-  (BookOpen button, far right). Esc, ⇧⌘F, ⌘L, or ⌘B leaves it. Deliberately
-  transient — a reading posture, never persisted.
+  (BookOpen button, far right). Esc, ⇧⌘F, ⌘L, or ⌘B leaves it — all but ⌘L
+  also cross the iframe bridge, so they work with focus inside a preview
+  (⌘L is deliberately not forwardable). Deliberately transient — a reading
+  posture, never persisted.
 
-Chrome is only ever removed, never rearranged: leaving a mode restores the
-exact prior layout.
+Chrome is only removed, never re-flowed: the reading field keeps its position
+and the tab strip keeps its shape, except for the traffic-light gutter the
+strip inherits while the sidebar is gone. ⌘B from reader mode is the one
+intentional exception to "restore the prior layout" — it exits with the
+sidebar on, because that is what the key asks for.
 
 ### Panes
 
@@ -469,10 +474,13 @@ field takes the rest.
 The sidebar stacks a fixed header over three collapsible drawers of one
 shape (SidebarSection: eyebrow header, chevron, optional count): **Bookmarks**
 (pinned), **Recent** (last 8 opened — the self-maintaining working set), and
-**Files** (the whole workspace tree, folded by default: with ~100 project dirs
-at the root it is a directory listing, not a reading list). Retrieval order is
-Bookmarks → Recent → ⌘P; the tree is for walking a project. Collapse state
-persists per-drawer in localStorage.
+**Files** (the whole workspace tree, folded by default: a project root is a
+directory listing, not a reading list). Retrieval order is Bookmarks → Recent
+→ ⌘P; the tree is for walking a project. Collapse state persists per-drawer
+in localStorage. Empty sections degrade: Bookmarks shows a static heading and
+a hint, Recent hides itself until a file is opened. Only the drawers scroll;
+the header — which owns the traffic-light inset and the drag region — stays
+pinned.
 
 The resizer is an **overlay, not a column**. It takes zero width in the layout
 and carries its 6px pointer target in a pseudo-element straddling the seam,
@@ -542,10 +550,10 @@ Pills are for **status**, never for actions. A CTA is 8px, always — Linear's
 ### Tabs
 
 The active tab drops to `{colors.bg}` — canvas depth — and carries the 2px
-lavender rule on its top edge. Because the strip now spans the window, an active
-tab sitting over the sidebar no longer joins the reading field below it; the
-canvas fill and the lavender rule carry the state on their own, and the tab
-reads as lifted rather than as continuous.
+lavender rule on its top edge. Because the 40px toolbar band sits between the
+strip and the reading field, the active tab does not physically join the
+field; the canvas fill and the lavender rule carry the state on their own
+(and keep carrying it in reader mode, where the toolbar is gone).
 
 An inactive tab is transparent over `{colors.bg-chrome}` and lifts to
 `{colors.bg-row-hover}` on hover. A tab loading its file shows a 6px lavender

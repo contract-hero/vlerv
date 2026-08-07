@@ -114,4 +114,12 @@ describe("displayPath", () => {
   it("never relativizes a prefix sibling (worktree layout)", () => {
     expect(displayPath("/w/vlerv-worktrees/x/a.md", "/w/vlerv")).toBe("/w/vlerv-worktrees/x/a.md");
   });
+
+  it("tolerates a root that already ends in a slash", () => {
+    expect(displayPath("/w/vlerv/src/a.md", "/w/vlerv/")).toBe("src/a.md");
+  });
+
+  it("relativizes against the filesystem root", () => {
+    expect(displayPath("/Users/x/a.md", "/")).toBe("Users/x/a.md");
+  });
 });

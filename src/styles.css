@@ -60,6 +60,13 @@
   --r-lg: 12px;
   --r-pill: 9999px;
 
+  /* chrome bands — the sidebar header, tab strip and toolbar are all one
+     height so their bottom borders can form unbroken rules; the inset is
+     the macOS traffic-light clearance (titleBarStyle: Overlay). Tokens so
+     the equalities are real instead of asserted in comments. */
+  --band-h: 40px;
+  --titlebar-inset: 78px;
+
   /* motion */
   --dur-fast: 80ms;
   --dur: 160ms;
@@ -221,7 +228,8 @@ html, body, #root {
   }
 }
 
-/* The window is a column: one full-width tab strip, then the pane row. */
+/* The window is a row: the sidebar column, then the preview column.
+   .app-shell only owns the viewport box. */
 .app-shell {
   display: flex;
   flex-direction: column;
@@ -244,13 +252,16 @@ html, body, #root {
 
 .pane-sidebar {
   /* Width applied inline by App.tsx (state.panes.sidebar_px); min/max are
-     the clamp constraints honored by the resizer. */
+     the clamp constraints honored by the resizer. Overflow hidden, not
+     auto: the header owns the traffic-light inset and the drag region, so
+     it must never scroll out of the window — the drawers scroll instead. */
   min-width: 200px;
   max-width: 480px;
   flex-shrink: 0;
   background: var(--bg-chrome);
   border-right: 1px solid var(--border);
   position: relative;
+  overflow: hidden;
 }
 
 /* The handle is an OVERLAY, not a column. As a 6px flex item it opened a
@@ -296,14 +307,15 @@ html, body, #root {
 
 /* ── Tab strip ─────────────────────────────────────────────────────────── */
 /* Sits at the top of the preview column, aligned with the reading field —
-   it never crosses into the sidebar. 40px to match the sidebar header, so
-   their bottom borders form one unbroken rule across the seam. Still a
-   drag region: empty strip space drags the window over the preview half. */
+   it never crosses into the sidebar. Band height matches the sidebar
+   header, so their bottom borders form one unbroken rule across the seam.
+   Still a drag region: empty strip space drags the window over the preview
+   half. */
 .tab-strip {
   display: flex;
   align-items: stretch;
-  flex: 0 0 40px;
-  min-height: 40px;
+  flex: 0 0 var(--band-h);
+  min-height: var(--band-h);
   width: 100%;
   background: var(--bg-chrome);
   border-bottom: 1px solid var(--border);
@@ -321,8 +333,8 @@ html, body, #root {
   left: 0;
   z-index: 1;
   background: var(--bg-chrome);
-  flex: 0 0 78px;
-  width: 78px;
+  flex: 0 0 var(--titlebar-inset);
+  width: var(--titlebar-inset);
   height: 100%;
 }
 .tab {
@@ -341,9 +353,10 @@ html, body, #root {
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tab:hover { background: var(--bg-row-hover); }
-/* The active tab drops to canvas depth. The 40px toolbar band sits between
-   the tab and the reading field, so the tab does not physically join it —
-   the canvas fill and the lavender rule carry the state. */
+/* The active tab drops to canvas depth. Outside reader mode a toolbar band
+   separates the tab from the reading field, so the canvas fill and the
+   lavender rule carry the state rather than physical continuity — and they
+   keep carrying it in reader mode, where the tab meets the field directly. */
 .tab.active {
   background: var(--bg);
   color: var(--fg);
@@ -424,8 +437,8 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  flex: 0 0 40px;
-  min-height: 40px;
+  flex: 0 0 var(--band-h);
+  min-height: var(--band-h);
   padding: 0 var(--space-2);
   background: var(--bg-chrome);
   border-bottom: 1px solid var(--border);
@@ -826,18 +839,29 @@ html, body, #root {
   flex-direction: column;
   height: 100%;
 }
-/* The window's top-left band. Height matches the tab strip exactly (40px):
+/* The scroll container for the three drawers. The header stays out of it,
+   pinned to the top of the pane, so overflow can never move the traffic
+   lights or the drag region. */
+.sidebar-drawers {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* The window's top-left band. Height matches the tab strip (same token):
    they sit side by side at the top of the window, so their bottom borders
    form ONE unbroken rule instead of a 1px step at the sidebar seam. The
-   78px left inset keeps the macOS traffic lights clear (titleBarStyle:
-   Overlay); the header itself is the drag region on this side. */
+   left inset keeps the macOS traffic lights clear (titleBarStyle: Overlay);
+   the header itself is the drag region on this side. It never scrolls —
+   .pane-sidebar is overflow:hidden and only .sidebar-drawers scrolls. */
 .sidebar-header {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 0 0 40px;
-  height: 40px;
-  padding: 0 var(--space-3) 0 78px;
+  flex: 0 0 var(--band-h);
+  height: var(--band-h);
+  padding: 0 var(--space-3) 0 var(--titlebar-inset);
   font-size: var(--text-ui);
   font-weight: 500;
   letter-spacing: 0;

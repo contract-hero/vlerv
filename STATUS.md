@@ -9,7 +9,7 @@
 - **Sidebar sections**: fixed header over three collapsible drawers of one shape (`SidebarSection`, per-drawer localStorage) — Bookmarks (pinned), Recent (last 8 opened, from the recents store), Files (the whole workspace tree, **folded by default**). Retrieval order: Bookmarks → Recent → ⌘P; the tree is for walking a project.
 - **Start page** on empty tabs: New York serif wordmark, bookmarks + recents lists, open/pick actions.
 - **Quick open (⌘P)**: fuzzy palette over `list_files_recursive` (BFS, 20k cap, ignore/hidden/symlink policy), in-house subsequence scorer, cache invalidated by watcher events.
-- **Keyboard registry** (`src/keyboard/shortcuts.ts`): declarative combos, `e.code`-based exact-modifier matching; HTML preview iframes forward tab/nav/zoom chords via `vlerv:keydown` so those survive iframe focus (dialog/focus chords ⌘O/⌘L/⌘P are deliberately not forwardable — page content could synthesize them).
+- **Keyboard registry** (`src/keyboard/shortcuts.ts`): declarative combos, `e.code`-based exact-modifier matching; HTML preview iframes forward tab/nav/zoom/view-mode chords plus bare Escape (bound only in reader mode) via `vlerv:keydown` so those survive iframe focus (dialog/focus chords ⌘O/⌘L/⌘P are deliberately not forwardable — page content could synthesize them).
 - **Per-tab zoom** (⌘+/−/0) via CSS `zoom` — host content directly, iframes via `vlerv:setZoom`.
 
 ### Live reload (the headline feature)
