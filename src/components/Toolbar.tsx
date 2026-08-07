@@ -5,8 +5,10 @@ import * as React from "react";
 import {
   ArrowLeft,
   ArrowRight,
+  BookOpen,
   Check,
   Copy,
+  PanelLeft,
   RotateCw,
   Share,
   Slack,
@@ -16,7 +18,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
 import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useBookmarksContext } from "../state/bookmarks-context";
-import { normalizePathBarInput } from "../utils/path";
+import { useWorkspace } from "../state/workspace";
+import { displayPath, normalizePathBarInput } from "../utils/path";
 import { slackUrlFromTarget } from "../utils/slack";
 import { useSettings } from "../hooks/useSettings";
 import { tauriIpc } from "../ipc";
@@ -24,6 +27,10 @@ import { tauriIpc } from "../ipc";
 export interface ToolbarProps {
   addressBarRef: React.MutableRefObject<HTMLInputElement | null>;
   onSubmitPath: (path: string) => void;
+  /** Whether the sidebar is currently shown (drives the toggle's state). */
+  sidebarVisible: boolean;
+  onToggleSidebar: () => void;
+  onEnterReaderMode: () => void;
 }
 
 function ShareButton({ path }: { path: string }): React.ReactElement {
@@ -138,9 +145,16 @@ function CopyPathButton({ path }: { path: string }): React.ReactElement {
   );
 }
 
-export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): React.ReactElement {
+export default function Toolbar({
+  addressBarRef,
+  onSubmitPath,
+  sidebarVisible,
+  onToggleSidebar,
+  onEnterReaderMode,
+}: ToolbarProps): React.ReactElement {
   const tab = useActiveTab();
   const dispatch = useTabsDispatch();
+  const { root } = useWorkspace();
   const { isBookmarked, toggle } = useBookmarksContext();
   // One settings subscription for the toolbar; the Slack affordance stays
   // hidden until a target is configured.
@@ -182,6 +196,15 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
   return (
     <div className="toolbar">
       <IconButton
+        title={sidebarVisible ? "Hide sidebar (⌘B)" : "Show sidebar (⌘B)"}
+        onClick={onToggleSidebar}
+      >
+        <PanelLeft size={14.5} strokeWidth={2} />
+      </IconButton>
+
+      <span className="toolbar-sep" aria-hidden />
+
+      <IconButton
         title="Back (⌘[)"
         disabled={!canGoBack(tab)}
         onClick={() => dispatch({ type: "GO_BACK" })}
@@ -213,9 +236,17 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
           autoCapitalize="off"
           autoCorrect="off"
           placeholder="Enter a file path, file:// or vlerv:// URL  (⌘L)"
-          value={draft}
+          // Idle, the bar shows the workspace-relative path — the absolute
+          // prefix is the same on every row and says nothing. Focus swaps in
+          // the full path (draft) for editing and selects it, so the swap is
+          // never mistaken for a caret jump.
+          value={editing ? draft : displayPath(currentPath, root)}
           data-testid="path-bar-input"
-          onFocus={() => setEditing(true)}
+          onFocus={(e) => {
+            setEditing(true);
+            const input = e.target as HTMLInputElement;
+            window.setTimeout(() => input.select(), 0);
+          }}
           onBlur={() => setEditing(false)}
           onChange={(e) => {
             setDraft(e.target.value);
@@ -284,6 +315,15 @@ export default function Toolbar({ addressBarRef, onSubmitPath }: ToolbarProps): 
           {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
       ) : null}
+
+      <span className="toolbar-sep" aria-hidden />
+
+      <IconButton
+        title="Reader mode (⇧⌘F — Esc to leave)"
+        onClick={onEnterReaderMode}
+      >
+        <BookOpen size={14} strokeWidth={2} />
+      </IconButton>
     </div>
   );
 }

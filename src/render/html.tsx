@@ -100,7 +100,7 @@ const HOST_BRIDGE_SCRIPT = `
   // App.tsx), so in-page ⌘C/⌘V/⌘A keep working and dialog-opening chords
   // (⌘O/⌘L/⌘P) can't be synthesized by page content.
   var FORWARD = {
-    KeyT: 1, KeyW: 1, KeyR: 1,
+    KeyT: 1, KeyW: 1, KeyR: 1, KeyB: 1,
     BracketLeft: 1, BracketRight: 1, Equal: 1, Minus: 1,
     Digit0: 1, Digit1: 1, Digit2: 1, Digit3: 1, Digit4: 1,
     Digit5: 1, Digit6: 1, Digit7: 1, Digit8: 1, Digit9: 1
@@ -108,7 +108,10 @@ const HOST_BRIDGE_SCRIPT = `
   window.addEventListener('keydown', function (e) {
     var isChord = e.metaKey || e.ctrlKey;
     if (!isChord) return;
-    var forward = FORWARD[e.code] || (e.code === 'Tab' && e.ctrlKey);
+    // KeyF only with shift (⇧⌘F reader mode) — plain ⌘F stays with the page.
+    var forward = FORWARD[e.code] ||
+      (e.code === 'Tab' && e.ctrlKey) ||
+      (e.code === 'KeyF' && e.shiftKey);
     if (!forward) return;
     e.preventDefault();
     window.parent.postMessage({

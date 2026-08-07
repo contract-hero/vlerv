@@ -40,11 +40,18 @@ impl Default for WindowGeom {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PaneSizes {
     pub sidebar_px: u32,
     pub preview_px: u32,
+    pub sidebar_visible: bool,
+}
+
+impl Default for PaneSizes {
+    fn default() -> Self {
+        Self { sidebar_px: 0, preview_px: 0, sidebar_visible: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

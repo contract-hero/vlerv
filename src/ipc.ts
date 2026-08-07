@@ -51,6 +51,7 @@ export interface SettingsState {
   panes?: {
     sidebar_px?: number;
     preview_px?: number;
+    sidebar_visible?: boolean;
     /** The reading session: open tabs, their history and zoom. */
     tabs?: unknown;
   };

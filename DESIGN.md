@@ -428,24 +428,51 @@ Base unit 4px. Tokens: 4 · 8 · 12 · 16 · 24 · 32.
 
 ### Fixed bands
 
-The window is a column: one full-width tab strip, then a row of two panes. Band
+The window is a row: a full-height sidebar, then the preview column. Band
 heights are structural and do not scale:
 
-- **38px** — the tab strip. It spans the **whole window**, above both panes, and
-  doubles as the overlay title bar: it carries `data-tauri-drag-region` and
-  reserves a **78px gutter** for the macOS traffic lights before the first tab.
-  It used to sit inside the preview pane, which left a dead 38px band across
-  the sidebar's full width (200-480px, default 280) whose only occupant was
-  the traffic lights.
-- **40px** — the sidebar header and the toolbar. Equal by requirement: they sit
-  side by side under the tab strip, so their bottom borders must form one
-  unbroken rule rather than a 1px step at the sidebar seam.
+- **40px** — the sidebar header and the tab strip. Equal by requirement: they
+  sit side by side at the very top of the window, so their bottom borders
+  must form one unbroken rule rather than a 1px step at the sidebar seam.
+  The sidebar header is the overlay title bar on the left: it carries
+  `data-tauri-drag-region` and a **78px left inset** that keeps the macOS
+  traffic lights clear. The tab strip belongs to the preview column only —
+  tabs align with the reading field and never cross into the sidebar. (A
+  full-window strip was tried; it pushed the sidebar header down and left a
+  dead 78px gutter as the strip's only occupant before the first tab.)
+- **40px** — the toolbar, under the tab strip.
 - **30px** — an explorer row.
+
+When the sidebar is hidden (see View modes), the tab strip is the leftmost
+band and takes the 78px traffic-light gutter back as a sticky, opaque spacer
+before the first tab.
+
+### View modes
+
+Two subtractive modes serve the product's north star — distraction-free
+reading of local artifacts. Both are keyboard-first with a toolbar affordance:
+
+- **⌘B** hides/shows the sidebar (PanelLeft button, far left of the toolbar).
+  Persisted (`panes.sidebar_visible`) — a workspace posture.
+- **⇧⌘F** is reader mode: sidebar AND toolbar gone, tabs + document only
+  (BookOpen button, far right). Esc, ⇧⌘F, ⌘L, or ⌘B leaves it. Deliberately
+  transient — a reading posture, never persisted.
+
+Chrome is only ever removed, never rearranged: leaving a mode restores the
+exact prior layout.
 
 ### Panes
 
 The sidebar is the only elastic axis: 200px minimum, 480px maximum. The reading
 field takes the rest.
+
+The sidebar stacks a fixed header over three collapsible drawers of one
+shape (SidebarSection: eyebrow header, chevron, optional count): **Bookmarks**
+(pinned), **Recent** (last 8 opened — the self-maintaining working set), and
+**Files** (the whole workspace tree, folded by default: with ~100 project dirs
+at the root it is a directory listing, not a reading list). Retrieval order is
+Bookmarks → Recent → ⌘P; the tree is for walking a project. Collapse state
+persists per-drawer in localStorage.
 
 The resizer is an **overlay, not a column**. It takes zero width in the layout
 and carries its 6px pointer target in a pseudo-element straddling the seam,
@@ -560,6 +587,12 @@ Mono type on `{colors.input-bg}`, 8px corners, hairline border that strengthens
 to `{colors.input-border-focus}` on focus. A path is machine text; it is set in
 mono everywhere it appears — address bar, explorer path column, Quick Open
 directory, metadata renderer, file-notice path.
+
+Idle, the bar shows the **workspace-relative** path — the absolute prefix is
+identical on every workspace file and says nothing. Focus swaps in the full
+absolute path and selects it, so editing always operates on the real path and
+the swap is never mistaken for a caret jump. Out-of-root files stay absolute
+and keep the `external` badge.
 
 ### Floating overlays
 

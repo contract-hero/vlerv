@@ -19,9 +19,16 @@ function tabTitle(tab: Tab): string {
 
 export interface TabStripProps {
   onOpenFile?: (path: string, opts?: OpenFileOptions) => void;
+  /**
+   * Reserve the macOS traffic-light gutter before the first tab. On while
+   * the sidebar is hidden (⌘B, reader mode) — the strip is then the
+   * window's leftmost band and inherits overlay-title-bar duty from the
+   * sidebar header.
+   */
+  showGutter?: boolean;
 }
 
-export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.ReactElement {
+export default function TabStrip({ onOpenFile, showGutter = false }: TabStripProps = {}): React.ReactElement {
   const { tabs, activeTabId } = useTabs();
   const dispatch = useTabsDispatch();
   const [dragId, setDragId] = React.useState<string | null>(null);
@@ -99,10 +106,7 @@ export default function TabStrip({ onOpenFile }: TabStripProps = {}): React.Reac
         dispatch({ type: "OPEN_NEW_TAB" });
       }}
     >
-      {/* Overlay title bar: the strip spans the whole window, so it has to
-          keep the macOS traffic lights clear before the first tab. This
-          gutter is that reserved space, and it drags the window. */}
-      <div className="titlebar-gutter" data-tauri-drag-region />
+      {showGutter ? <div className="titlebar-gutter" data-tauri-drag-region /> : null}
       {tabs.map((tab, index) => {
         const entry = currentEntry(tab);
         const active = tab.id === activeTabId;

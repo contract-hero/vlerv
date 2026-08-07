@@ -295,14 +295,15 @@ html, body, #root {
 }
 
 /* ── Tab strip ─────────────────────────────────────────────────────────── */
-/* Spans the whole window above both panes. It is also the overlay title bar
-   (titleBarStyle: Overlay), so it drags the window and reserves a gutter for
-   the macOS traffic lights before the first tab. */
+/* Sits at the top of the preview column, aligned with the reading field —
+   it never crosses into the sidebar. 40px to match the sidebar header, so
+   their bottom borders form one unbroken rule across the seam. Still a
+   drag region: empty strip space drags the window over the preview half. */
 .tab-strip {
   display: flex;
   align-items: stretch;
-  flex: 0 0 38px;
-  min-height: 38px;
+  flex: 0 0 40px;
+  min-height: 40px;
   width: 100%;
   background: var(--bg-chrome);
   border-bottom: 1px solid var(--border);
@@ -311,11 +312,11 @@ html, body, #root {
   user-select: none;
 }
 .tab-strip::-webkit-scrollbar { height: 0; }
-/* Width of the macOS traffic lights plus their inset. */
+/* Traffic-light clearance while the sidebar is hidden (⌘B, reader mode) —
+   the strip is then the leftmost band. Sticky, not in-flow: the strip
+   scrolls horizontally, and a scrolled-away gutter would slide tabs under
+   the traffic lights. Opaque so tabs pass behind it. */
 .titlebar-gutter {
-  /* Sticky, not in-flow: the strip scrolls horizontally, and a scrolled-away
-     gutter would slide tabs under the traffic lights and cost the window its
-     only drag surface. Opaque so tabs pass behind it. */
   position: sticky;
   left: 0;
   z-index: 1;
@@ -340,9 +341,9 @@ html, body, #root {
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tab:hover { background: var(--bg-row-hover); }
-/* The active tab drops to canvas depth. The strip now spans the window, so
-   the tab no longer joins the reading field below it — a 40px band sits
-   between them. The canvas fill and the lavender rule carry the state. */
+/* The active tab drops to canvas depth. The 40px toolbar band sits between
+   the tab and the reading field, so the tab does not physically join it —
+   the canvas fill and the lavender rule carry the state. */
 .tab.active {
   background: var(--bg);
   color: var(--fg);
@@ -759,7 +760,7 @@ html, body, #root {
   .row.selected,
   .start-row:hover,
   .quick-open-list li.selected,
-  [data-section="bookmarks"] li:hover
+  [data-section] li:hover
 ) .file-glyph { color: var(--fg-muted); }
 
 :is(
@@ -767,7 +768,7 @@ html, body, #root {
   .row.selected,
   .start-row:hover,
   .quick-open-list li.selected,
-  [data-section="bookmarks"] li:hover
+  [data-section] li:hover
 ) .file-glyph.is-subject { color: var(--fg); }
 
 .row:hover .folder-glyph,
@@ -779,7 +780,9 @@ html, body, #root {
 
 /* ── Sidebar ──────────────────────────────────────────────────────────── */
 .sidebar-empty {
-  padding: var(--space-5);
+  /* Extra top padding: with no header row, the macOS traffic lights overlay
+     this pane's top-left corner — content starts below their band. */
+  padding: 52px var(--space-5) var(--space-5);
   text-align: center;
 }
 .sidebar-empty-text {
@@ -823,16 +826,18 @@ html, body, #root {
   flex-direction: column;
   height: 100%;
 }
-/* Height matches the Toolbar band exactly (40px). Both sit directly under
-   the full-width tab strip, so their bottom borders form ONE unbroken rule
-   across the window instead of a 1px step at the sidebar seam. */
+/* The window's top-left band. Height matches the tab strip exactly (40px):
+   they sit side by side at the top of the window, so their bottom borders
+   form ONE unbroken rule instead of a 1px step at the sidebar seam. The
+   78px left inset keeps the macOS traffic lights clear (titleBarStyle:
+   Overlay); the header itself is the drag region on this side. */
 .sidebar-header {
   display: flex;
   align-items: center;
   gap: 2px;
   flex: 0 0 40px;
   height: 40px;
-  padding: 0 var(--space-3);
+  padding: 0 var(--space-3) 0 78px;
   font-size: var(--text-ui);
   font-weight: 500;
   letter-spacing: 0;
@@ -867,7 +872,7 @@ html, body, #root {
    positive tracking against the negatively-tracked display is what marks a
    label as taxonomy. It replaces the uppercase 10-11px/700 micro-caps the
    previous system used. */
-[data-section="bookmarks"] h4,
+[data-section] h4,
 .start-section h2 {
   font-family: var(--font-ui);
   font-size: var(--text-caption);
@@ -877,18 +882,34 @@ html, body, #root {
   color: var(--fg-muted);
 }
 
-/* ── Bookmarks ────────────────────────────────────────────────────────── */
-[data-section="bookmarks"] { flex: 0 0 auto; }
-[data-section="bookmarks"] h4 {
+/* ── Sidebar sections (Bookmarks / Recent / Files) ────────────────────── */
+/* One collapsible shape for every sidebar group, so "pinned", "recently
+   read", and "the whole tree" read as three drawers of one cabinet instead
+   of two lists fused to an explorer. */
+[data-section] { flex: 0 0 auto; }
+/* The Files section owns the leftover height and hands it to the Explorer's
+   internal scroll (flex column all the way down, min-height 0 to allow it). */
+[data-section].section-grow {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+[data-section] .section-row-icon {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+[data-section] h4 {
   margin: var(--space-3) var(--space-3) var(--space-1);
 }
-[data-section="bookmarks"] .bookmarks-header {
+[data-section] .section-header {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   user-select: none;
 }
-[data-section="bookmarks"] .bookmarks-header-toggle {
+[data-section] .section-header-toggle {
   display: flex;
   align-items: center;
   gap: var(--space-1);
@@ -902,8 +923,8 @@ html, body, #root {
   text-transform: inherit;
   cursor: pointer;
 }
-[data-section="bookmarks"] .bookmarks-header-toggle:hover { color: var(--fg); }
-[data-section="bookmarks"] .bookmarks-chevron {
+[data-section] .section-header-toggle:hover { color: var(--fg); }
+[data-section] .section-chevron {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -911,19 +932,19 @@ html, body, #root {
   height: 12px;
   transition: transform var(--dur-fast) var(--ease);
 }
-[data-section="bookmarks"] .bookmarks-chevron.open { transform: rotate(90deg); }
-[data-section="bookmarks"] .bookmarks-count {
+[data-section] .section-chevron.open { transform: rotate(90deg); }
+[data-section] .section-count {
   margin-left: auto;
   margin-right: var(--space-1);
   color: var(--fg-muted);
   font-weight: 500;
 }
-[data-section="bookmarks"] ul {
+[data-section] ul {
   list-style: none;
   margin: 0;
   padding: 0;
 }
-[data-section="bookmarks"] li {
+[data-section] li {
   display: flex;
   align-items: center;
   gap: var(--space-1);
@@ -934,25 +955,25 @@ html, body, #root {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-[data-section="bookmarks"] li:hover {
+[data-section] li:hover {
   background: var(--bg-row-hover);
   color: var(--fg);
 }
-[data-section="bookmarks"] li.dragging { opacity: 0.4; }
-[data-section="bookmarks"] li.drop-target {
+[data-section] li.dragging { opacity: 0.4; }
+[data-section] li.drop-target {
   box-shadow: inset 0 2px 0 0 var(--accent);
 }
-[data-section="bookmarks"] .bookmark-label {
+[data-section] .section-row-label {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.bookmarks-empty-hint {
+.section-empty-hint {
   margin: 2px var(--space-3) var(--space-2);
   font-size: var(--text-caption);
   color: var(--fg-muted);
 }
-.bookmarks-header-empty { cursor: default; }
+.section-header-empty { cursor: default; }
 .bookmark-remove {
   display: inline-flex;
   align-items: center;
@@ -968,7 +989,7 @@ html, body, #root {
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-[data-section="bookmarks"] li:hover .bookmark-remove,
+[data-section] li:hover .bookmark-remove,
 .bookmark-remove:focus-visible { opacity: 1; }
 .bookmark-remove:hover { color: var(--error-fg); }
 
