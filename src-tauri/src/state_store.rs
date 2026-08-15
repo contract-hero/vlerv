@@ -68,11 +68,20 @@ pub struct Preferences {
     /// stays hidden.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slack_target: Option<String>,
+    /// Beam offer lifetime in hours. None = the built-in default (24 h);
+    /// clamped to ≥ 1 at the use site so a zero can't mint dead tickets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beam_ttl_hours: Option<u32>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { ignore_globs: Vec::new(), drag_out_mode: "file".to_string(), slack_target: None }
+        Self {
+            ignore_globs: Vec::new(),
+            drag_out_mode: "file".to_string(),
+            slack_target: None,
+            beam_ttl_hours: None,
+        }
     }
 }
 

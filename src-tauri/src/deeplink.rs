@@ -1,4 +1,5 @@
-// Deep-link parser — `vlerv://open?path=<abs>`, `vlerv://reveal?path=<abs>`.
+// Deep-link parser — `vlerv://open?path=<abs>`, `vlerv://reveal?path=<abs>`,
+// `vlerv://receive?ticket=<t>`, `vlerv://beam?path=<abs>`.
 // Pure URL parsing, no Tauri dependency.
 
 use percent_encoding::percent_decode_str;
@@ -12,6 +13,21 @@ pub enum DeepLinkIntent {
     },
     /// C3: the `reveal` verb selects + expands in the tree without switching the preview.
     Reveal {
+        path: PathBuf,
+    },
+    /// Beam v1: an incoming artifact offer. `name`/`size` are untrusted
+    /// display hints; the ticket's hash is the truth. Parsing performs NO
+    /// network action — the confirm dialog stands between this intent and
+    /// any fetch.
+    Receive {
+        ticket: String,
+        name: Option<String>,
+        size: Option<u64>,
+    },
+    /// Beam v1: ask the app to offer a file (CLI `vlerv beam <path>`).
+    /// Opens the send dialog — a hostile link cannot mint an offer without
+    /// the user clicking through it.
+    Beam {
         path: PathBuf,
     },
 }
@@ -201,6 +217,94 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
             }
 
             Ok(DeepLinkIntent::Reveal {
+                path: PathBuf::from(path_val),
+            })
+        }
+        "receive" => {
+            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
+                input: input.clone(),
+                param: "ticket".to_string(),
+            })?;
+
+            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
+                input: input.clone(),
+                reason,
+            })?;
+
+            let ticket = params
+                .iter()
+                .find(|(k, _)| k == "ticket")
+                .map(|(_, v)| v.as_str())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| DeepLinkError::MissingParameter {
+                    input: input.clone(),
+                    param: "ticket".to_string(),
+                })?;
+
+            // Tickets are base32 strings. Alphanumeric-only is a strict
+            // superset that rejects NUL, separators, and quoting tricks
+            // before the ticket parser ever sees the value.
+            if !ticket.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(DeepLinkError::Malformed {
+                    input: input.clone(),
+                    reason: "ticket must be alphanumeric".to_string(),
+                });
+            }
+
+            let name = params
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone())
+                .filter(|v| !v.is_empty());
+
+            let size = params
+                .iter()
+                .find(|(k, _)| k == "size")
+                .and_then(|(_, v)| v.parse::<u64>().ok());
+
+            Ok(DeepLinkIntent::Receive {
+                ticket: ticket.to_string(),
+                name,
+                size,
+            })
+        }
+        "beam" => {
+            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
+                input: input.clone(),
+                param: "path".to_string(),
+            })?;
+
+            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
+                input: input.clone(),
+                reason,
+            })?;
+
+            let path_val = params
+                .iter()
+                .find(|(k, _)| k == "path")
+                .map(|(_, v)| v.as_str())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| DeepLinkError::MissingParameter {
+                    input: input.clone(),
+                    param: "path".to_string(),
+                })?;
+
+            // Same validation as `open`/`reveal`.
+            if !path_val.starts_with('/') {
+                return Err(DeepLinkError::Malformed {
+                    input: input.clone(),
+                    reason: "path must be absolute (start with '/')".to_string(),
+                });
+            }
+
+            if path_val.contains('\0') {
+                return Err(DeepLinkError::Malformed {
+                    input: input.clone(),
+                    reason: "path must not contain NUL bytes".to_string(),
+                });
+            }
+
+            Ok(DeepLinkIntent::Beam {
                 path: PathBuf::from(path_val),
             })
         }

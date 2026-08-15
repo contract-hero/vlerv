@@ -11,6 +11,7 @@ pub mod state_store;
 pub mod recents;
 pub mod bookmarks;
 pub mod watcher;
+pub mod remote;
 
 /// Intent kind surfaced to the webview as a lowercase string in JSON
 /// (`"open"` or `"reveal"`).
@@ -44,6 +45,45 @@ pub struct DeepLinkErrorEvent {
     pub reason: String,
 }
 
+/// Typed payload emitted on `vlerv://beam-receive-request` after a
+/// `vlerv://receive` link parses and its ticket validates. Nothing has
+/// been fetched at this point — the frontend's confirm dialog gates the
+/// actual transfer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BeamReceiveRequest {
+    pub ticket: String,
+    /// Sanitized display name (attacker-controlled hint, already reduced to
+    /// a safe bare filename).
+    pub name: String,
+    /// Size hint in bytes. Display only — the cap is enforced on the actual
+    /// stream.
+    pub size: Option<u64>,
+    /// The sender's NodeId (full and short fingerprint), straight from the
+    /// ticket. What the user verifies before accepting.
+    pub sender_id: String,
+    pub sender_id_short: String,
+    pub hash: String,
+}
+
+/// Typed payload emitted on `vlerv://beam-send-request` for the CLI's
+/// `vlerv beam <path>`. Opens the send dialog; the offer is only minted when
+/// the user confirms there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BeamSendRequest {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub size: u64,
+}
+
+/// What a successfully dispatched deep link asks the app to do. `main.rs`
+/// maps each variant onto its `vlerv://*` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeepLinkAction {
+    OpenFile(OpenFileEvent),
+    BeamReceive(BeamReceiveRequest),
+    BeamSend(BeamSendRequest),
+}
+
 /// C2: truncate-at-char-boundary helper exposed to tests (B5 carry-forward).
 /// Uses `chars().take(N).collect()` semantics so multibyte boundaries never
 /// panic. Public for T-019.
@@ -52,13 +92,13 @@ pub fn snippet_chars_take(s: &str, max_chars: usize) -> String {
 }
 
 /// Parse a `vlerv://` URL, canonicalize the path against `roots`, push the
-/// path to Recents on Open intent (best-effort), and return a typed event
+/// path to Recents on Open intent (best-effort), and return a typed action
 /// the webview can consume. Single entry point used by `main.rs`'s
 /// `on_open_url` callback.
 pub fn dispatch_deep_link(
     url: &str,
     roots: &security::RootSet,
-) -> Result<OpenFileEvent, DeepLinkErrorEvent> {
+) -> Result<DeepLinkAction, DeepLinkErrorEvent> {
     let make_err = |reason: String| DeepLinkErrorEvent {
         url: url.to_string(),
         reason,
@@ -69,6 +109,41 @@ pub fn dispatch_deep_link(
     let (path, kind, line) = match intent {
         deeplink::DeepLinkIntent::Open { path, line } => (path, DeepLinkIntentKind::Open, line),
         deeplink::DeepLinkIntent::Reveal { path } => (path, DeepLinkIntentKind::Reveal, None),
+        deeplink::DeepLinkIntent::Receive { ticket, name, size } => {
+            // Validate the ticket and surface the sender's identity for the
+            // confirm dialog. Pure parse — no endpoint boot, no fetch.
+            let info = remote::beam::ticket_info(&ticket).map_err(&make_err)?;
+            let name = remote::beam::sanitize_beam_name(name.as_deref(), &info.hash);
+            return Ok(DeepLinkAction::BeamReceive(BeamReceiveRequest {
+                ticket,
+                name,
+                size,
+                sender_id: info.node_id,
+                sender_id_short: info.node_id_short,
+                hash: info.hash,
+            }));
+        }
+        deeplink::DeepLinkIntent::Beam { path } => {
+            // Beam sends data OFF the machine, so the conservative share
+            // policy applies (empty root set rejects; existing external
+            // files are beamable on purpose, same as the share sheet).
+            let (canonical, _out_of_root) = security::canonicalize_allow_external(&path, roots)
+                .map_err(|_| make_err("path not found or out of root".to_string()))?;
+            let meta = std::fs::metadata(&canonical)
+                .map_err(|_| make_err("path not found or out of root".to_string()))?;
+            if !meta.is_file() {
+                return Err(make_err("only files can be beamed".to_string()));
+            }
+            let name = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "artifact".to_string());
+            return Ok(DeepLinkAction::BeamSend(BeamSendRequest {
+                path: canonical,
+                name,
+                size: meta.len(),
+            }));
+        }
     };
 
     // Ad-hoc external-open policy: paths that exist but lie outside every
@@ -85,12 +160,12 @@ pub fn dispatch_deep_link(
         let _ = recents::push(&canonical);
     }
 
-    Ok(OpenFileEvent {
+    Ok(DeepLinkAction::OpenFile(OpenFileEvent {
         path: canonical,
         intent: kind,
         out_of_root,
         line,
-    })
+    }))
 }
 
 /// Handle a deep-link URL: parse it and (when the `e2e-hooks` feature is
@@ -109,6 +184,12 @@ pub fn handle_deep_link(url: &str) {
     let path = match intent {
         deeplink::DeepLinkIntent::Open { path, .. } => path,
         deeplink::DeepLinkIntent::Reveal { path } => path,
+        deeplink::DeepLinkIntent::Beam { path } => path,
+        deeplink::DeepLinkIntent::Receive { ticket, .. } => {
+            // No local path to echo — the ticket names remote content.
+            eprintln!("vlerv: deep-link: receive ticket {}…", &ticket[..16.min(ticket.len())]);
+            return;
+        }
     };
     eprintln!("vlerv: deep-link: {}", path.display());
 
@@ -162,12 +243,19 @@ mod dispatch_deep_link_tests {
         (dir, file_path, roots)
     }
 
+    fn expect_open(action: DeepLinkAction) -> OpenFileEvent {
+        match action {
+            DeepLinkAction::OpenFile(ev) => ev,
+            other => panic!("expected OpenFile action, got {other:?}"),
+        }
+    }
+
     #[test]
     fn open_intent_within_root_returns_open_event() {
         let (_dir, file_path, roots) = setup_root_with_file("hello.html");
         let url = format!("vlerv://open?path={}", file_path.display());
 
-        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        let event = expect_open(dispatch_deep_link(&url, &roots).expect("ok"));
 
         assert_eq!(event.intent, DeepLinkIntentKind::Open);
         assert_eq!(event.path, file_path.canonicalize().unwrap());
@@ -179,7 +267,7 @@ mod dispatch_deep_link_tests {
         let (_dir, file_path, roots) = setup_root_with_file("revealme.txt");
         let url = format!("vlerv://reveal?path={}", file_path.display());
 
-        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        let event = expect_open(dispatch_deep_link(&url, &roots).expect("ok"));
 
         assert_eq!(event.intent, DeepLinkIntentKind::Reveal);
         assert_eq!(event.path, file_path.canonicalize().unwrap());
@@ -196,7 +284,7 @@ mod dispatch_deep_link_tests {
         let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
         let url = format!("vlerv://open?path={}", outside_file.display());
 
-        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        let event = expect_open(dispatch_deep_link(&url, &roots).expect("ok"));
 
         assert_eq!(event.intent, DeepLinkIntentKind::Open);
         assert_eq!(event.path, outside_file.canonicalize().unwrap());
@@ -233,7 +321,7 @@ mod dispatch_deep_link_tests {
         let roots = security::RootSet::empty();
         let url = format!("vlerv://open?path={}", file_path.display());
 
-        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        let event = expect_open(dispatch_deep_link(&url, &roots).expect("ok"));
 
         assert_eq!(event.path, file_path.canonicalize().unwrap());
         assert!(event.out_of_root);
@@ -254,7 +342,7 @@ mod dispatch_deep_link_tests {
         let (_dir, file_path, roots) = setup_root_with_file("lined.md");
         let url = format!("vlerv://open?path={}&line=42", file_path.display());
 
-        let event = dispatch_deep_link(&url, &roots).expect("ok");
+        let event = expect_open(dispatch_deep_link(&url, &roots).expect("ok"));
         assert_eq!(event.line, Some(42));
     }
 
@@ -309,5 +397,102 @@ mod dispatch_deep_link_tests {
         dispatch_deep_link(&url, &roots).expect("ok");
 
         assert!(!recents_contains(&file_path.canonicalize().unwrap()));
+    }
+
+    // ── Beam verbs through the dispatcher ────────────────────────────────
+
+    #[test]
+    fn beam_verb_returns_send_request_with_metadata() {
+        let (_dir, file_path, roots) = setup_root_with_file("to-beam.html");
+        let url = format!("vlerv://beam?path={}", file_path.display());
+
+        let action = dispatch_deep_link(&url, &roots).expect("ok");
+
+        match action {
+            DeepLinkAction::BeamSend(req) => {
+                assert_eq!(req.path, file_path.canonicalize().unwrap());
+                assert_eq!(req.name, "to-beam.html");
+                assert_eq!(req.size, "content".len() as u64);
+            }
+            other => panic!("expected BeamSend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn beam_verb_rejects_on_empty_root_set() {
+        // Beaming sends data off the machine: conservative like share, not
+        // permissive like open.
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let file_path = dir.path().join("adhoc.html");
+        fs::write(&file_path, "x").expect("write");
+        let url = format!("vlerv://beam?path={}", file_path.display());
+
+        let err = dispatch_deep_link(&url, &security::RootSet::empty()).expect_err("err");
+        assert_eq!(err.reason, "path not found or out of root");
+    }
+
+    #[test]
+    fn beam_verb_rejects_directories() {
+        ensure_isolated_state_dir();
+        let dir = TempDir::new().expect("tempdir");
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).expect("mkdir");
+        let roots = security::RootSet::new(vec![dir.path().to_path_buf()]);
+        let url = format!("vlerv://beam?path={}", sub.display());
+
+        let err = dispatch_deep_link(&url, &roots).expect_err("err");
+        assert_eq!(err.reason, "only files can be beamed");
+    }
+
+    #[test]
+    fn receive_verb_with_garbage_ticket_is_rejected_before_any_ui() {
+        let roots = security::RootSet::empty();
+        let err =
+            dispatch_deep_link("vlerv://receive?ticket=notaticket123", &roots).expect_err("err");
+        assert!(err.reason.contains("invalid beam ticket"));
+    }
+
+    #[test]
+    fn receive_verb_with_valid_ticket_surfaces_sender_and_sanitized_name() {
+        // Mint a real ticket shape without any network: a made-up node id
+        // plus a content hash, exactly what a hostile link could carry.
+        let secret = iroh::SecretKey::generate();
+        let hash = iroh_blobs::Hash::new(b"payload");
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            secret.public().into(),
+            hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let url = format!("vlerv://receive?ticket={ticket}&name=..%2F..%2Fevil.html&size=42");
+
+        let action = dispatch_deep_link(&url, &security::RootSet::empty()).expect("ok");
+
+        match action {
+            DeepLinkAction::BeamReceive(req) => {
+                assert_eq!(req.ticket, ticket);
+                assert_eq!(req.name, "evil.html", "path traversal in the hint must be stripped");
+                assert_eq!(req.size, Some(42));
+                assert_eq!(req.sender_id, secret.public().to_string());
+                assert_eq!(req.hash, hash.to_string());
+            }
+            other => panic!("expected BeamReceive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receive_verb_rejects_hashseq_tickets() {
+        let secret = iroh::SecretKey::generate();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            secret.public().into(),
+            iroh_blobs::Hash::new(b"seq"),
+            iroh_blobs::BlobFormat::HashSeq,
+        )
+        .to_string();
+        let url = format!("vlerv://receive?ticket={ticket}");
+
+        let err = dispatch_deep_link(&url, &security::RootSet::empty()).expect_err("err");
+        assert!(err.reason.contains("single-file"));
     }
 }

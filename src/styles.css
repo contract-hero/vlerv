@@ -1438,3 +1438,225 @@ pre {
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Beam (remote-control-design.html v1) ──────────────────────────────── */
+/* Send/receive dialog: same overlay grammar as QuickOpen — scrim, elevated
+   card, hairline border. Kept narrower: it is a confirm, not a palette. */
+.beam-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--overlay-scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 18vh;
+}
+.beam-dialog {
+  width: min(460px, 86vw);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-overlay), var(--edge-highlight);
+  overflow: hidden;
+}
+.beam-dialog-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 12px var(--space-4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  color: var(--fg);
+}
+.beam-dialog-header svg { color: var(--accent-strong); flex: 0 0 auto; }
+.beam-dialog-close {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.beam-dialog-close:hover { background: var(--button-hover-bg); color: var(--fg); }
+.beam-dialog-body { padding: var(--space-4); }
+.beam-file-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.beam-file-name {
+  font-size: var(--text-body-sm);
+  font-weight: 600;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.beam-file-meta { font-size: var(--text-caption); color: var(--fg-muted); flex: 0 0 auto; }
+.beam-file-path {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.beam-sender-row {
+  margin-top: var(--space-2);
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
+}
+.beam-fingerprint {
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--fg);
+  background: var(--badge-bg);
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+}
+.beam-hint {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-caption);
+  line-height: 1.5;
+  color: var(--fg-muted);
+}
+.beam-warn { margin: var(--space-2) 0 0; font-size: var(--text-caption); color: var(--warning-fg, var(--fg)); }
+.beam-error {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-caption);
+  line-height: 1.5;
+  color: var(--error-fg);
+  overflow-wrap: anywhere;
+}
+.beam-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-4);
+  /* .button carries --space-1 margins; the row only aligns them. */
+}
+.beam-link-input {
+  width: 100%;
+  margin-top: var(--space-3);
+  padding: 7px 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--fg);
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  outline: none;
+}
+.beam-link-input:focus { border-color: var(--input-border-focus); }
+.beam-progress {
+  margin-top: var(--space-4);
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--badge-bg);
+  overflow: hidden;
+}
+/* Determinate progress scales a full-width fill (compositor-only transform,
+   never width) via --beam-progress ∈ [0,1] set inline by the dialog. */
+.beam-progress-fill {
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transform-origin: left;
+  transform: scaleX(var(--beam-progress, 0));
+  transition: transform var(--dur-fast) var(--ease);
+}
+.beam-progress-fill.indeterminate {
+  width: 30%;
+  transform: none;
+  transition: none;
+  animation: beam-slide 1.2s var(--ease) infinite;
+}
+/* -100% … 334% of the 30%-wide fill = fully off both ends of the track. */
+@keyframes beam-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(334%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .beam-progress-fill.indeterminate { animation: none; width: 100%; opacity: 0.4; }
+}
+
+/* Toolbar "beaming" indicator: a pill that exists only while serving. */
+.beam-indicator-wrap { position: relative; display: inline-flex; }
+.beam-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+.beam-indicator:hover { background: var(--button-hover-bg); }
+.beam-popover-scrim { position: fixed; inset: 0; z-index: 119; }
+.beam-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 120;
+  width: 280px;
+  padding: var(--space-2);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-overlay), var(--edge-highlight);
+}
+.beam-popover-title {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.beam-popover-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+.beam-popover-info { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.beam-popover-name {
+  font-size: var(--text-ui);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.beam-popover-meta { font-size: var(--text-caption); color: var(--fg-muted); }
+.beam-popover-row .button { padding: 3px 10px; font-size: var(--text-caption); margin: 0; }
+.beam-stop:hover { color: var(--error-fg); border-color: var(--error-fg); }
+.beam-popover-received {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.beam-popover-received:hover { background: var(--bg-row-hover); }
+.beam-popover-received .beam-popover-meta { margin-left: auto; flex: 0 0 auto; }

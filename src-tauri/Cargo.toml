@@ -25,6 +25,11 @@ tauri-plugin-drag = "2"
 tauri-plugin-opener = "2"
 base64 = "0.22"
 tauri-plugin-window-state = "2.4.1"
+iroh = "1"
+iroh-blobs = "0.103"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+n0-future = "0.3"
+bao-tree = "0.16"
 
 # Share sheet (NSSharingServicePicker) bindings. Pinned to the same lines wry
 # uses (objc2 0.6 / objc2-* 0.3) so there's only one NSView type universe.

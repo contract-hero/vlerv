@@ -13,13 +13,17 @@ import {
   Share,
   Slack,
   Star,
+  Zap,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
 import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { useWorkspace } from "../state/workspace";
+import { useBeam } from "../state/beam";
+import { BeamIndicator } from "./BeamDialog";
 import { displayPath, normalizePathBarInput } from "../utils/path";
+import { isBeamedPath } from "../utils/beam-format";
 import { slackUrlFromTarget } from "../utils/slack";
 import { useSettings } from "../hooks/useSettings";
 import { tauriIpc } from "../ipc";
@@ -86,6 +90,23 @@ function OpenInSlackButton({ url }: { url: string }): React.ReactElement {
       }}
     >
       <Slack size={13} strokeWidth={2} />
+    </button>
+  );
+}
+
+/** Beam v1: stage this file and mint a shareable `vlerv://receive` link. */
+function BeamButton({ path }: { path: string }): React.ReactElement {
+  const { beginSend } = useBeam();
+  return (
+    <button
+      type="button"
+      className="toolbar-button"
+      data-testid="preview-beam"
+      title="Beam to Vlervcode…"
+      aria-label="Beam this file to another Vlervcode"
+      onClick={() => beginSend(path)}
+    >
+      <Zap size={13} strokeWidth={2} />
     </button>
   );
 }
@@ -158,6 +179,7 @@ export default function Toolbar({
   const tab = useActiveTab();
   const dispatch = useTabsDispatch();
   const { root } = useWorkspace();
+  const { receivedDir } = useBeam();
   const { isBookmarked, toggle } = useBookmarksContext();
   // One settings subscription for the toolbar; the Slack affordance stays
   // hidden until a target is configured.
@@ -274,7 +296,17 @@ export default function Toolbar({
             {error}
           </span>
         ) : null}
-        {entry?.external ? (
+        {entry?.external && isBeamedPath(entry.path, receivedDir) ? (
+          // Beamed files are technically external (they live in the app's
+          // state dir), but their provenance is the interesting fact.
+          <span
+            className="preview-badge-external"
+            data-testid="preview-beamed-badge"
+            title="Received via Beam from another Vlervcode"
+          >
+            beamed
+          </span>
+        ) : entry?.external ? (
           <span
             className="preview-badge-external"
             data-testid="preview-external-badge"
@@ -317,9 +349,12 @@ export default function Toolbar({
           <span className="toolbar-sep" aria-hidden />
           <CopyPathButton path={entry.path} />
           <ShareButton path={entry.path} />
+          <BeamButton path={entry.path} />
           {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
       ) : null}
+
+      <BeamIndicator />
 
       <span className="toolbar-sep" aria-hidden />
 
