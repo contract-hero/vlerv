@@ -26,12 +26,12 @@ use n0_future::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use super::endpoint::RemoteNode;
-use crate::state_store;
+use crate::security::{self, RootSet};
 
-/// Soft warn threshold (frontend dialog copy) and hard cap, per design §5.
+/// Soft warn threshold (receive-dialog copy) and hard cap, per design §5.
 pub const WARN_BYTES: u64 = 20 * 1024 * 1024;
 pub const HARD_CAP_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_TTL_HOURS: u32 = 24;
+pub const DEFAULT_TTL_HOURS: u32 = 24;
 
 /// Emit a progress event roughly once per this many received bytes — leaves
 /// arrive every 16 KiB and per-leaf events would flood the webview bridge.
@@ -120,11 +120,15 @@ impl Offers {
     }
 
     fn remove(&self, id: &str) -> Option<iroh_blobs::api::Tag> {
+        // An offer id IS the blob hash in hex (see `offer`), so the key is
+        // derivable — no scan. The length guard keeps the parse on the hex
+        // path: `Hash::from_str` treats other lengths as base32 and can
+        // PANIC on malformed input, and this id arrives over IPC.
+        if id.len() != 64 {
+            return None;
+        }
+        let hash: Hash = id.parse().ok()?;
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let hash = map
-            .iter()
-            .find(|(_, e)| e.info.id == id)
-            .map(|(h, _)| *h)?;
         map.remove(&hash).map(|e| e.tag)
     }
 
@@ -172,8 +176,12 @@ impl Offers {
 
     /// Build the provider-event gate for BlobsProtocol. Every get request is
     /// intercepted and admitted against the registry — this is what makes
-    /// Stop an *instant* revocation instead of a GC eventually.
-    pub fn gate(self: Arc<Self>, on_change: impl Fn() + Send + Sync + 'static) -> EventSender {
+    /// Stop an *instant* revocation instead of a GC eventually. `on_change`
+    /// receives the fresh offers list (fetch counts moved), ready to emit.
+    pub fn gate(
+        self: Arc<Self>,
+        on_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
+    ) -> EventSender {
         let mask = EventMask { get: RequestMode::Intercept, ..EventMask::DEFAULT };
         let (tx, mut rx) = EventSender::channel(32, mask);
         tokio::spawn(async move {
@@ -183,7 +191,7 @@ impl Offers {
                     let admitted = res.is_ok();
                     msg.tx.send(res).await.ok();
                     if admitted {
-                        on_change();
+                        on_change(self.list());
                     }
                 }
             }
@@ -196,12 +204,16 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn ttl_hours() -> u32 {
-    state_store::current_state()
-        .preferences
-        .beam_ttl_hours
-        .unwrap_or(DEFAULT_TTL_HOURS)
-        .max(1)
+/// v1 ticket policy in one place: parse + single-raw-blob check. Shared by
+/// `ticket_info` (dispatch-time validation) and `receive`.
+fn parse_raw_ticket(ticket_str: &str) -> Result<BlobTicket, String> {
+    let ticket: BlobTicket = ticket_str
+        .parse()
+        .map_err(|e| format!("invalid beam ticket: {e}"))?;
+    if ticket.format() != BlobFormat::Raw {
+        return Err("beam v1 supports single-file tickets only".to_string());
+    }
+    Ok(ticket)
 }
 
 /// Build the `vlerv://receive?…` link. `name`/`size` are display hints for
@@ -211,15 +223,10 @@ pub fn build_link(ticket: &str, name: &str, size: u64) -> String {
     format!("vlerv://receive?ticket={ticket}&name={name_enc}&size={size}")
 }
 
-/// Parse a ticket string into the facts the confirm dialog shows. Rejects
-/// malformed tickets and (v1) anything that isn't a single raw blob.
+/// Parse a ticket string into the facts the confirm dialog shows. Pure
+/// parse — no endpoint, no network.
 pub fn ticket_info(ticket_str: &str) -> Result<TicketInfo, String> {
-    let ticket: BlobTicket = ticket_str
-        .parse()
-        .map_err(|e| format!("invalid beam ticket: {e}"))?;
-    if ticket.format() != BlobFormat::Raw {
-        return Err("beam v1 supports single-file tickets only".to_string());
-    }
+    let ticket = parse_raw_ticket(ticket_str)?;
     let id = ticket.addr().id;
     Ok(TicketInfo {
         node_id: id.to_string(),
@@ -228,10 +235,26 @@ pub fn ticket_info(ticket_str: &str) -> Result<TicketInfo, String> {
     })
 }
 
-/// Stage `path` into the store and register an offer. Re-beaming the same
-/// content refreshes the offer (same hash ⇒ same id) with a fresh TTL.
-pub async fn offer(node: &RemoteNode, canonical: &Path) -> Result<OfferInfo, String> {
-    let meta = std::fs::metadata(canonical).map_err(|e| e.to_string())?;
+/// A path that passed the full offer policy: share-module root gate,
+/// regular file, size under the hard cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferCandidate {
+    pub canonical: PathBuf,
+    pub name: String,
+    pub size: u64,
+}
+
+/// The single offer-path policy, shared by the `vlerv://beam` dispatch arm
+/// (dialog metadata) and `beam_offer` (confirm-time recheck): resolve via
+/// the conservative share gate, require a regular file, enforce the hard
+/// cap. Keeping it in one place is what keeps the two callers in agreement
+/// — the cap especially must reject at dispatch, not after the user clicks.
+pub fn resolve_offerable(path: &Path, roots: &RootSet) -> Result<OfferCandidate, String> {
+    let (canonical, _out_of_root) = security::canonicalize_allow_external(path, roots)
+        // Same no-existence-leak wording as the share module.
+        .map_err(|_| "path not found or out of root".to_string())?;
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|_| "path not found or out of root".to_string())?;
     if !meta.is_file() {
         return Err("only files can be beamed".to_string());
     }
@@ -243,7 +266,21 @@ pub async fn offer(node: &RemoteNode, canonical: &Path) -> Result<OfferInfo, Str
             human_bytes(HARD_CAP_BYTES)
         ));
     }
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_string());
+    Ok(OfferCandidate { canonical, name, size })
+}
 
+/// Stage a resolved candidate into the store and register an offer.
+/// Re-beaming the same content refreshes the offer (same hash ⇒ same id)
+/// with a fresh TTL.
+pub async fn offer(
+    node: &RemoteNode,
+    cand: &OfferCandidate,
+    ttl_hours: u32,
+) -> Result<OfferInfo, String> {
     // Housekeeping: drop expired offers and their tags while we have the
     // store at hand.
     for tag in node.offers.take_expired(now_unix()) {
@@ -253,7 +290,7 @@ pub async fn offer(node: &RemoteNode, canonical: &Path) -> Result<OfferInfo, Str
     let tag = node
         .store
         .blobs()
-        .add_path(canonical)
+        .add_path(&cand.canonical)
         .await
         .map_err(|e| format!("cannot stage file: {e}"))?;
 
@@ -263,20 +300,16 @@ pub async fn offer(node: &RemoteNode, canonical: &Path) -> Result<OfferInfo, Str
     let _ = tokio::time::timeout(Duration::from_secs(10), node.endpoint.online()).await;
 
     let ticket = BlobTicket::new(node.endpoint.addr(), tag.hash, tag.format).to_string();
-    let name = canonical
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "artifact".to_string());
     let created_at = now_unix();
     let info = OfferInfo {
         id: tag.hash.to_string(),
-        path: canonical.to_path_buf(),
-        name: name.clone(),
-        size,
-        link: build_link(&ticket, &name, size),
+        path: cand.canonical.clone(),
+        name: cand.name.clone(),
+        size: cand.size,
+        link: build_link(&ticket, &cand.name, cand.size),
         ticket,
         created_at,
-        expires_at: created_at + u64::from(ttl_hours()) * 3600,
+        expires_at: created_at + u64::from(ttl_hours.max(1)) * 3600,
         fetches: 0,
     };
     node.offers.insert(tag.hash, OfferEntry { info: info.clone(), tag: tag.name });
@@ -295,22 +328,21 @@ pub async fn stop(node: &RemoteNode, offer_id: &str) {
 }
 
 /// Dial a ticket and stream the blob into `received_root`, verified chunk by
-/// chunk. `on_progress(hash, received, total_hint)` fires about once per MiB.
+/// chunk. `on_progress(hash_hex, received, total_hint)` fires about once
+/// per MiB.
 pub async fn receive(
     node: &RemoteNode,
     ticket_str: &str,
     name_hint: Option<&str>,
     size_hint: Option<u64>,
     received_root: &Path,
-    mut on_progress: impl FnMut(&Hash, u64, Option<u64>),
+    mut on_progress: impl FnMut(&str, u64, Option<u64>),
 ) -> Result<ReceivedFile, String> {
-    let ticket: BlobTicket = ticket_str
-        .parse()
-        .map_err(|e| format!("invalid beam ticket: {e}"))?;
-    if ticket.format() != BlobFormat::Raw {
-        return Err("beam v1 supports single-file tickets only".to_string());
-    }
+    let ticket = parse_raw_ticket(ticket_str)?;
     let hash = ticket.hash();
+    // Rendered once — the progress callback fires per MiB and the hex form
+    // never changes during a transfer.
+    let hash_hex = hash.to_string();
 
     let connection = tokio::time::timeout(
         Duration::from_secs(30),
@@ -321,70 +353,80 @@ pub async fn receive(
     .map_err(|e| format!("sender offline — could not reach the sender ({e})"))?;
 
     // Stream into a partial file next to the final location (same volume ⇒
-    // atomic rename). The bao stream yields leaves in ascending offset order
-    // for a full-blob request; the offset check guards that invariant.
+    // atomic rename).
     let partials_dir = received_root.join(".partial");
     std::fs::create_dir_all(&partials_dir).map_err(|e| e.to_string())?;
     // Unique per attempt: two concurrent receives of the same hash must not
     // interleave writes into one partial file.
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let partial_path = partials_dir.join(format!("{hash}.{attempt}"));
-    let mut file = std::io::BufWriter::new(
-        std::fs::File::create(&partial_path).map_err(|e| e.to_string())?,
-    );
+    let partial_path = partials_dir.join(format!("{hash_hex}.{attempt}"));
 
-    let mut written: u64 = 0;
-    let mut last_emitted: u64 = 0;
-    let mut progress = get_blob(connection, hash);
-    let finish = |file: std::io::BufWriter<std::fs::File>| -> Result<(), String> {
-        file.into_inner().map_err(|e| e.to_string())?.sync_all().map_err(|e| e.to_string())
-    };
-    loop {
-        match progress.next().await {
-            Some(GetBlobItem::Item(BaoContentItem::Leaf(leaf))) => {
-                if leaf.offset != written {
-                    drop(progress);
-                    let _ = std::fs::remove_file(&partial_path);
-                    return Err("transfer aborted: non-contiguous stream".to_string());
+    // The stream loop lives in an inner future so every early exit funnels
+    // through ONE partial-file cleanup below (a per-arm cleanup ritual had
+    // already drifted once — the write error path forgot it).
+    let stream_result: Result<u64, String> = async {
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&partial_path).map_err(|e| e.to_string())?,
+        );
+        let mut written: u64 = 0;
+        let mut last_emitted: u64 = 0;
+        // The bao stream yields leaves in ascending offset order for a
+        // full-blob request; the offset check guards that invariant.
+        let mut progress = get_blob(connection, hash);
+        loop {
+            match progress.next().await {
+                Some(GetBlobItem::Item(BaoContentItem::Leaf(leaf))) => {
+                    if leaf.offset != written {
+                        return Err("transfer aborted: non-contiguous stream".to_string());
+                    }
+                    written += leaf.data.len() as u64;
+                    if written > HARD_CAP_BYTES {
+                        return Err(format!(
+                            "transfer aborted: content exceeds the {} cap",
+                            human_bytes(HARD_CAP_BYTES)
+                        ));
+                    }
+                    file.write_all(&leaf.data).map_err(|e| e.to_string())?;
+                    if written - last_emitted >= PROGRESS_STRIDE_BYTES {
+                        last_emitted = written;
+                        on_progress(&hash_hex, written, size_hint);
+                    }
                 }
-                written += leaf.data.len() as u64;
-                if written > HARD_CAP_BYTES {
-                    drop(progress);
-                    let _ = std::fs::remove_file(&partial_path);
-                    return Err(format!(
-                        "transfer aborted: content exceeds the {} cap",
-                        human_bytes(HARD_CAP_BYTES)
-                    ));
+                Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
+                Some(GetBlobItem::Done(_stats)) => break,
+                Some(GetBlobItem::Error(e)) => {
+                    return Err(format!("transfer failed: {e}"));
                 }
-                file.write_all(&leaf.data).map_err(|e| e.to_string())?;
-                if written - last_emitted >= PROGRESS_STRIDE_BYTES {
-                    last_emitted = written;
-                    on_progress(&hash, written, size_hint);
+                None => {
+                    return Err("transfer failed: stream ended unexpectedly".to_string());
                 }
-            }
-            Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
-            Some(GetBlobItem::Done(_stats)) => break,
-            Some(GetBlobItem::Error(e)) => {
-                let _ = std::fs::remove_file(&partial_path);
-                return Err(format!("transfer failed: {e}"));
-            }
-            None => {
-                let _ = std::fs::remove_file(&partial_path);
-                return Err("transfer failed: stream ended unexpectedly".to_string());
             }
         }
+        file.into_inner()
+            .map_err(|e| e.to_string())?
+            .sync_all()
+            .map_err(|e| e.to_string())?;
+        Ok(written)
     }
-    finish(file)?;
-    on_progress(&hash, written, size_hint);
+    .await;
 
-    let name = sanitize_beam_name(name_hint, &hash.to_string());
+    let written = match stream_result {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial_path);
+            return Err(e);
+        }
+    };
+    on_progress(&hash_hex, written, size_hint);
+
+    let name = sanitize_beam_name(name_hint, &hash_hex);
     let day_dir = received_root.join(civil_date_string(now_unix()));
     std::fs::create_dir_all(&day_dir).map_err(|e| e.to_string())?;
     let target = unique_target_path(&day_dir, &name);
     std::fs::rename(&partial_path, &target).map_err(|e| e.to_string())?;
 
-    Ok(ReceivedFile { path: target, name, size: written, hash: hash.to_string() })
+    Ok(ReceivedFile { path: target, name, size: written, hash: hash_hex })
 }
 
 /// Reduce an attacker-controlled name hint to a safe bare filename. The hint
@@ -398,7 +440,7 @@ pub fn sanitize_beam_name(hint: Option<&str>, hash_hex: &str) -> String {
     let base = hint.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && *c != '\0')
+        .filter(|c| !c.is_control())
         .take(128)
         .collect();
     let trimmed = cleaned.trim().trim_start_matches('.').trim();
@@ -427,15 +469,23 @@ fn unique_target_path(dir: &Path, name: &str) -> PathBuf {
     unreachable!("counter exhausted");
 }
 
-/// Past beams, newest first, capped at 100 entries.
+/// Past beams, newest first, capped at 100 entries. Day directories are
+/// named `YYYY-MM-DD`, so lexicographic order IS chronological — walking
+/// newest-day-first and stopping at the cap bounds the stat count no matter
+/// how large the received/ tree grows.
 pub fn list_received(received_root: &Path) -> Vec<ReceivedEntry> {
+    const CAP: usize = 100;
     let mut entries = Vec::new();
     let Ok(days) = std::fs::read_dir(received_root) else { return entries };
-    for day in days.flatten() {
-        if day.file_name().to_string_lossy().starts_with('.') {
-            continue; // .partial
-        }
-        let Ok(files) = std::fs::read_dir(day.path()) else { continue };
+    let mut day_dirs: Vec<PathBuf> = days
+        .flatten()
+        .filter(|d| !d.file_name().to_string_lossy().starts_with('.')) // .partial
+        .map(|d| d.path())
+        .collect();
+    day_dirs.sort_unstable();
+    for day in day_dirs.into_iter().rev() {
+        let Ok(files) = std::fs::read_dir(day) else { continue };
+        let mut day_entries = Vec::new();
         for f in files.flatten() {
             let Ok(meta) = f.metadata() else { continue };
             if !meta.is_file() {
@@ -447,16 +497,20 @@ pub fn list_received(received_root: &Path) -> Vec<ReceivedEntry> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            entries.push(ReceivedEntry {
+            day_entries.push(ReceivedEntry {
                 path: f.path(),
                 name: f.file_name().to_string_lossy().into_owned(),
                 size: meta.len(),
                 received_at,
             });
         }
+        day_entries.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        entries.extend(day_entries);
+        if entries.len() >= CAP {
+            break;
+        }
     }
-    entries.sort_by(|a, b| b.received_at.cmp(&a.received_at));
-    entries.truncate(100);
+    entries.truncate(CAP);
     entries
 }
 
@@ -581,10 +635,12 @@ mod tests {
 
     // ── offers registry: admit / expiry / revocation ────────────────────────
 
-    fn dummy_offer(expires_at: u64) -> OfferEntry {
+    fn dummy_offer(hash: Hash, expires_at: u64) -> OfferEntry {
         OfferEntry {
             info: OfferInfo {
-                id: "id".into(),
+                // Invariant: an offer id is the blob hash in hex (`remove`
+                // relies on it).
+                id: hash.to_string(),
                 path: PathBuf::from("/tmp/x"),
                 name: "x".into(),
                 size: 1,
@@ -602,7 +658,7 @@ mod tests {
     fn admit_counts_active_offers_and_denies_unknown() {
         let offers = Offers::new();
         let hash = Hash::new(b"content");
-        offers.insert(hash, dummy_offer(now_unix() + 3600));
+        offers.insert(hash, dummy_offer(hash, now_unix() + 3600));
 
         assert!(offers.admit(&hash, true).is_ok());
         assert!(offers.admit(&hash, true).is_ok());
@@ -616,7 +672,7 @@ mod tests {
     fn admit_denies_hashseq_requests_even_for_active_offers() {
         let offers = Offers::new();
         let hash = Hash::new(b"content");
-        offers.insert(hash, dummy_offer(now_unix() + 3600));
+        offers.insert(hash, dummy_offer(hash, now_unix() + 3600));
         assert!(offers.admit(&hash, false).is_err());
     }
 
@@ -624,7 +680,7 @@ mod tests {
     fn expired_offers_deny_and_disappear_from_list() {
         let offers = Offers::new();
         let hash = Hash::new(b"content");
-        offers.insert(hash, dummy_offer(now_unix().saturating_sub(10)));
+        offers.insert(hash, dummy_offer(hash, now_unix().saturating_sub(10)));
         assert!(offers.admit(&hash, true).is_err(), "stale link must be useless");
         assert!(offers.list().is_empty());
         assert_eq!(offers.take_expired(now_unix()).len(), 1);
@@ -634,9 +690,36 @@ mod tests {
     fn remove_by_id_revokes() {
         let offers = Offers::new();
         let hash = Hash::new(b"content");
-        offers.insert(hash, dummy_offer(now_unix() + 3600));
-        assert!(offers.remove("id").is_some());
+        offers.insert(hash, dummy_offer(hash, now_unix() + 3600));
+        assert!(offers.remove(&hash.to_string()).is_some());
         assert!(offers.admit(&hash, true).is_err());
+        assert!(offers.remove(&hash.to_string()).is_none());
+        // Garbage ids (not a hash) can never remove anything.
         assert!(offers.remove("id").is_none());
+    }
+
+    // ── resolve_offerable — the shared offer-path policy ────────────────────
+
+    #[test]
+    fn resolve_offerable_enforces_gate_file_and_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.html");
+        std::fs::write(&file, "x").unwrap();
+        let roots = RootSet::new(vec![dir.path().to_path_buf()]);
+
+        let cand = resolve_offerable(&file, &roots).expect("in-root file");
+        assert_eq!(cand.name, "a.html");
+        assert_eq!(cand.size, 1);
+
+        // Conservative on empty roots (beam exports data off the machine).
+        assert_eq!(
+            resolve_offerable(&file, &RootSet::empty()).unwrap_err(),
+            "path not found or out of root"
+        );
+        // Directories are not beamable.
+        assert_eq!(
+            resolve_offerable(dir.path(), &roots).unwrap_err(),
+            "only files can be beamed"
+        );
     }
 }

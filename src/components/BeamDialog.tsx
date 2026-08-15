@@ -3,33 +3,22 @@
 // renders it.
 import * as React from "react";
 import { Check, Copy, X, Zap } from "lucide-react";
-import { useBeam } from "../state/beam";
-import { BEAM_WARN_BYTES, expiresIn, humanBytes } from "../utils/beam-format";
+import { useBeamActions, useBeamState } from "../state/beam";
+import { useCopyFeedback } from "../hooks/useCopyFeedback";
+import { expiresIn, humanBytes } from "../utils/beam-format";
 
 function nowSecs(): number {
   return Math.floor(Date.now() / 1000);
 }
 
 function CopyLinkButton({ link }: { link: string }): React.ReactElement {
-  const [copied, setCopied] = React.useState(false);
-  const resetTimer = React.useRef<number | null>(null);
-  React.useEffect(() => {
-    return () => {
-      if (resetTimer.current) window.clearTimeout(resetTimer.current);
-    };
-  }, []);
+  const { copied, copy } = useCopyFeedback();
   return (
     <button
       type="button"
       className="button"
       data-testid="beam-copy-link"
-      onClick={() => {
-        void navigator.clipboard?.writeText(link).then(() => {
-          setCopied(true);
-          if (resetTimer.current) window.clearTimeout(resetTimer.current);
-          resetTimer.current = window.setTimeout(() => setCopied(false), 1200);
-        }).catch(() => {});
-      }}
+      onClick={() => copy(link)}
     >
       {copied ? <Check size={13} strokeWidth={2.5} /> : <Copy size={13} strokeWidth={2} />}
       {copied ? "Copied" : "Copy link"}
@@ -52,7 +41,8 @@ function useEscape(onEscape: () => void): void {
 }
 
 function SendFace(): React.ReactElement {
-  const { send, confirmSend, closeSend } = useBeam();
+  const { send } = useBeamState();
+  const { confirmSend, closeSend } = useBeamActions();
   useEscape(closeSend);
   if (!send) return <></>;
 
@@ -131,7 +121,8 @@ function SendFace(): React.ReactElement {
 }
 
 function ReceiveFace(): React.ReactElement {
-  const { receive, acceptReceive, declineReceive } = useBeam();
+  const { receive } = useBeamState();
+  const { acceptReceive, declineReceive } = useBeamActions();
   useEscape(declineReceive);
   if (!receive) return <></>;
   const { req } = receive;
@@ -161,7 +152,7 @@ function ReceiveFace(): React.ReactElement {
           from sender{" "}
           <code className="beam-fingerprint" title={req.sender_id}>{req.sender_id_short}</code>
         </div>
-        {req.size != null && req.size > BEAM_WARN_BYTES ? (
+        {req.warn ? (
           <p className="beam-warn">Large file — the transfer may take a while.</p>
         ) : null}
 
@@ -221,7 +212,7 @@ function ReceiveFace(): React.ReactElement {
 /** Modal host: renders whichever face is active. Receive wins if both are
  * somehow up — an incoming request is the more time-sensitive of the two. */
 export default function BeamDialog(): React.ReactElement | null {
-  const { send, receive } = useBeam();
+  const { send, receive } = useBeamState();
   if (!send && !receive) return null;
   return (
     <div className="beam-backdrop" data-testid="beam-backdrop">
@@ -231,9 +222,11 @@ export default function BeamDialog(): React.ReactElement | null {
 }
 
 /** Toolbar pill: visible only while offers are active. Click for the list
- * (fetch counts, expiry, Stop) plus recent received files. */
+ * (fetch counts, expiry, Stop) plus recent received files (fetched lazily
+ * on open — the popover is the only place the list renders). */
 export function BeamIndicator(): React.ReactElement | null {
-  const { offers, received, stopOffer, openReceived } = useBeam();
+  const { offers, received } = useBeamState();
+  const { stopOffer, openReceived, refreshReceived } = useBeamActions();
   const [open, setOpen] = React.useState(false);
   React.useEffect(() => {
     if (offers.length === 0) setOpen(false);
@@ -248,7 +241,12 @@ export function BeamIndicator(): React.ReactElement | null {
         data-testid="beam-indicator"
         title={`Beaming ${offers.length} ${offers.length === 1 ? "offer" : "offers"}`}
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => {
+            if (!v) refreshReceived();
+            return !v;
+          });
+        }}
       >
         <Zap size={12} strokeWidth={2.25} />
         {offers.length}

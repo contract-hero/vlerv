@@ -2,6 +2,12 @@
 // prefix for the "beamed" badge. All networking lives in the Rust core; this
 // provider only sequences IPC commands and `vlerv://beam-*` events.
 //
+// Two contexts, deliberately: actions (identity-stable callbacks plus the
+// set-once receivedDir) and state (offers/dialog/progress). Chrome-wide
+// consumers — Toolbar, every context menu via useFileMenu — subscribe only
+// to actions, so per-MiB progress events re-render just the dialog and the
+// indicator, not the whole app.
+//
 // Two entry points create a send dialog: the toolbar button (user already
 // acted — offer immediately) and the `vlerv://beam` deep link (a link is
 // hostile until proven otherwise — show a confirm face first; nothing is
@@ -10,6 +16,7 @@
 import * as React from "react";
 import type { BeamOffer, BeamReceivedEntry, IpcSurface } from "../ipc";
 import { useTauriEvent } from "../hooks/useTauriEvent";
+import { basename } from "../utils/path";
 import { useTabsDispatch } from "./TabsProvider";
 
 /** Payload of `vlerv://beam-send-request` (CLI / deep-link initiated). */
@@ -20,11 +27,14 @@ interface BeamSendRequestPayload {
 }
 
 /** Payload of `vlerv://beam-receive-request`. `name` arrives pre-sanitized
- * by the backend; `sender_id_short` is the fingerprint the user verifies. */
+ * by the backend; `warn` is the backend's large-file judgment (the size
+ * limits live in one place, in Rust); `sender_id_short` is the fingerprint
+ * the user verifies. */
 export interface BeamReceiveRequestPayload {
   ticket: string;
   name: string;
   size: number | null;
+  warn: boolean;
   sender_id: string;
   sender_id_short: string;
   hash: string;
@@ -53,17 +63,21 @@ export interface BeamReceiveState {
   error?: string;
 }
 
-export interface BeamContextValue {
+export interface BeamStateValue {
   offers: BeamOffer[];
   received: BeamReceivedEntry[];
-  receivedDir: string | null;
   send: BeamSendState | null;
   receive: BeamReceiveState | null;
+}
+
+export interface BeamActionsValue {
+  receivedDir: string | null;
   /** Toolbar path: stage + mint immediately. */
   beginSend(path: string): void;
-  /** Deep-link path: the user confirmed the send dialog. */
+  /** Deep-link confirm face, and "Try again" after a send error. */
   confirmSend(): void;
   closeSend(): void;
+  /** Receive confirm, and "Try again" after sender-offline. */
   acceptReceive(): void;
   declineReceive(): void;
   stopOffer(id: string): void;
@@ -71,16 +85,19 @@ export interface BeamContextValue {
   refreshReceived(): void;
 }
 
-const BeamContext = React.createContext<BeamContextValue | null>(null);
+const BeamStateContext = React.createContext<BeamStateValue | null>(null);
+const BeamActionsContext = React.createContext<BeamActionsValue | null>(null);
 
-export function useBeam(): BeamContextValue {
-  const ctx = React.useContext(BeamContext);
-  if (!ctx) throw new Error("useBeam must be used within BeamProvider");
+export function useBeamState(): BeamStateValue {
+  const ctx = React.useContext(BeamStateContext);
+  if (!ctx) throw new Error("useBeamState must be used within BeamProvider");
   return ctx;
 }
 
-function basename(path: string): string {
-  return path.split("/").pop() ?? path;
+export function useBeamActions(): BeamActionsValue {
+  const ctx = React.useContext(BeamActionsContext);
+  if (!ctx) throw new Error("useBeamActions must be used within BeamProvider");
+  return ctx;
 }
 
 export function BeamProvider({
@@ -97,6 +114,17 @@ export function BeamProvider({
   const [send, setSend] = React.useState<BeamSendState | null>(null);
   const [receive, setReceive] = React.useState<BeamReceiveState | null>(null);
 
+  // Latest dialog state for the stable action callbacks — reading it via a
+  // ref keeps the actions context identity-stable across progress events.
+  const sendRef = React.useRef(send);
+  sendRef.current = send;
+  const receiveRef = React.useRef(receive);
+  receiveRef.current = receive;
+
+  // Mount: only the badge prefix and any pre-existing offers. The received
+  // list is fetched lazily (popover open / after a receive) — scanning the
+  // whole received/ tree on every app launch paid for a list that cannot
+  // be visible yet.
   React.useEffect(() => {
     let cancelled = false;
     ipc.beamReceivedDir?.().then((dir) => {
@@ -104,9 +132,6 @@ export function BeamProvider({
     }).catch(() => {});
     ipc.beamListOffers?.().then((list) => {
       if (!cancelled) setOffers(list);
-    }).catch(() => {});
-    ipc.beamListReceived?.().then((list) => {
-      if (!cancelled) setReceived(list);
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [ipc]);
@@ -156,14 +181,12 @@ export function BeamProvider({
     [runOffer],
   );
 
-  // Also the "Try again" action from the error face. Reads closure state —
-  // side effects must stay out of setState updaters (StrictMode
-  // double-invokes them, which would double-stage the offer).
   const confirmSend = React.useCallback(() => {
-    if (send && (send.phase === "confirm" || send.phase === "error")) {
-      runOffer(send.path, send.name, send.size);
+    const s = sendRef.current;
+    if (s && (s.phase === "confirm" || s.phase === "error")) {
+      runOffer(s.path, s.name, s.size);
     }
-  }, [send, runOffer]);
+  }, [runOffer]);
 
   const closeSend = React.useCallback(() => setSend(null), []);
 
@@ -171,11 +194,10 @@ export function BeamProvider({
     ipc.beamListReceived?.().then(setReceived).catch(() => {});
   }, [ipc]);
 
-  // Also the "Try again" action after a sender-offline error. Same closure-
-  // state rule as confirmSend: one click, one fetch.
   const acceptReceive = React.useCallback(() => {
-    if (!receive || receive.phase === "fetching") return;
-    const { req } = receive;
+    const r = receiveRef.current;
+    if (!r || r.phase === "fetching") return;
+    const { req } = r;
     setReceive({ req, phase: "fetching", received: 0 });
     ipc.beamReceive?.(req.ticket, req.name, req.size ?? undefined)
       .then((file) => {
@@ -190,7 +212,7 @@ export function BeamProvider({
             : cur,
         );
       });
-  }, [receive, dispatch, ipc, refreshReceived]);
+  }, [dispatch, ipc, refreshReceived]);
 
   const declineReceive = React.useCallback(() => setReceive(null), []);
 
@@ -211,13 +233,14 @@ export function BeamProvider({
     [dispatch],
   );
 
-  const value = React.useMemo(
-    (): BeamContextValue => ({
-      offers,
-      received,
+  const stateValue = React.useMemo(
+    (): BeamStateValue => ({ offers, received, send, receive }),
+    [offers, received, send, receive],
+  );
+
+  const actionsValue = React.useMemo(
+    (): BeamActionsValue => ({
       receivedDir,
-      send,
-      receive,
       beginSend,
       confirmSend,
       closeSend,
@@ -228,11 +251,17 @@ export function BeamProvider({
       refreshReceived,
     }),
     [
-      offers, received, receivedDir, send, receive,
+      receivedDir,
       beginSend, confirmSend, closeSend, acceptReceive, declineReceive,
       stopOffer, openReceived, refreshReceived,
     ],
   );
 
-  return <BeamContext.Provider value={value}>{children}</BeamContext.Provider>;
+  return (
+    <BeamActionsContext.Provider value={actionsValue}>
+      <BeamStateContext.Provider value={stateValue}>
+        {children}
+      </BeamStateContext.Provider>
+    </BeamActionsContext.Provider>
+  );
 }

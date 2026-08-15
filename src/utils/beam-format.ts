@@ -1,10 +1,9 @@
-// Pure display helpers for Beam UI (dialog + offers indicator).
+// Pure display helpers for Beam UI (dialog + offers indicator). Size
+// *limits* live in the backend (src-tauri/src/remote/beam.rs) — the
+// receive dialog gets a pre-computed `warn` flag instead of mirroring the
+// threshold here.
 
-/** Bytes above which the receive dialog shows the large-file warning —
- * mirrors WARN_BYTES in src-tauri/src/remote/beam.rs. */
-export const BEAM_WARN_BYTES = 20 * 1024 * 1024;
-
-/** "482 KB", "1.2 MB" — decimal-ish, one decimal only when it matters. */
+/** "482 KB", "1.2 MB" — coarse on purpose, one decimal only when it matters. */
 export function humanBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return "?";
   if (n < 1024) return `${n} B`;
@@ -24,11 +23,4 @@ export function expiresIn(expiresAt: number, nowSecs: number): string {
   if (left < 60) return "<1 min";
   if (left < 3600) return `${Math.round(left / 60)} min`;
   return `${Math.round(left / 3600)} h`;
-}
-
-/** True when `path` sits under the received/ tree (the "beamed" badge). */
-export function isBeamedPath(path: string, receivedDir: string | null): boolean {
-  if (!receivedDir) return false;
-  const dir = receivedDir.endsWith("/") ? receivedDir : `${receivedDir}/`;
-  return path.startsWith(dir);
 }

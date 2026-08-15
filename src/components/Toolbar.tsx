@@ -20,11 +20,11 @@ import { useActiveTab, useTabsDispatch } from "../state/TabsProvider";
 import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { useWorkspace } from "../state/workspace";
-import { useBeam } from "../state/beam";
+import { useBeamActions } from "../state/beam";
 import { BeamIndicator } from "./BeamDialog";
-import { displayPath, normalizePathBarInput } from "../utils/path";
-import { isBeamedPath } from "../utils/beam-format";
+import { displayPath, isUnderRoot, normalizePathBarInput } from "../utils/path";
 import { slackUrlFromTarget } from "../utils/slack";
+import { useCopyFeedback } from "../hooks/useCopyFeedback";
 import { useSettings } from "../hooks/useSettings";
 import { tauriIpc } from "../ipc";
 
@@ -96,7 +96,7 @@ function OpenInSlackButton({ url }: { url: string }): React.ReactElement {
 
 /** Beam v1: stage this file and mint a shareable `vlerv://receive` link. */
 function BeamButton({ path }: { path: string }): React.ReactElement {
-  const { beginSend } = useBeam();
+  const { beginSend } = useBeamActions();
   return (
     <button
       type="button"
@@ -137,15 +137,7 @@ function IconButton({
 }
 
 function CopyPathButton({ path }: { path: string }): React.ReactElement {
-  const [copied, setCopied] = React.useState(false);
-  const resetTimer = React.useRef<number | null>(null);
-
-  React.useEffect(() => {
-    return () => {
-      if (resetTimer.current) window.clearTimeout(resetTimer.current);
-    };
-  }, []);
-
+  const { copied, copy } = useCopyFeedback();
   return (
     <button
       type="button"
@@ -153,16 +145,7 @@ function CopyPathButton({ path }: { path: string }): React.ReactElement {
       data-testid="preview-copy-path"
       title={copied ? "Copied!" : "Copy path"}
       aria-label="Copy file path"
-      onClick={() => {
-        void navigator.clipboard
-          ?.writeText(path)
-          .then(() => {
-            setCopied(true);
-            if (resetTimer.current) window.clearTimeout(resetTimer.current);
-            resetTimer.current = window.setTimeout(() => setCopied(false), 1200);
-          })
-          .catch(() => {});
-      }}
+      onClick={() => copy(path)}
     >
       {copied ? <Check size={13} strokeWidth={2.5} /> : <Copy size={13} strokeWidth={2} />}
     </button>
@@ -179,7 +162,7 @@ export default function Toolbar({
   const tab = useActiveTab();
   const dispatch = useTabsDispatch();
   const { root } = useWorkspace();
-  const { receivedDir } = useBeam();
+  const { receivedDir } = useBeamActions();
   const { isBookmarked, toggle } = useBookmarksContext();
   // One settings subscription for the toolbar; the Slack affordance stays
   // hidden until a target is configured.
@@ -296,24 +279,26 @@ export default function Toolbar({
             {error}
           </span>
         ) : null}
-        {entry?.external && isBeamedPath(entry.path, receivedDir) ? (
-          // Beamed files are technically external (they live in the app's
-          // state dir), but their provenance is the interesting fact.
-          <span
-            className="preview-badge-external"
-            data-testid="preview-beamed-badge"
-            title="Received via Beam from another Vlervcode"
-          >
-            beamed
-          </span>
-        ) : entry?.external ? (
-          <span
-            className="preview-badge-external"
-            data-testid="preview-external-badge"
-            title="This file is outside the workspace root"
-          >
-            external
-          </span>
+        {entry?.external ? (
+          // One badge span; beamed files are technically external (they
+          // live in the app's state dir), but their provenance is the
+          // interesting fact, so it wins the label.
+          (() => {
+            const beamed = receivedDir != null && isUnderRoot(entry.path, receivedDir);
+            return (
+              <span
+                className="preview-badge-external"
+                data-testid={beamed ? "preview-beamed-badge" : "preview-external-badge"}
+                title={
+                  beamed
+                    ? "Received via Beam from another Vlervcode"
+                    : "This file is outside the workspace root"
+                }
+              >
+                {beamed ? "beamed" : "external"}
+              </span>
+            );
+          })()
         ) : null}
         {/* The zoom chip lives INSIDE the address bar so that showing it
             shrinks the input instead of pushing the whole action cluster

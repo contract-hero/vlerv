@@ -14,6 +14,7 @@ use std::sync::Arc;
 use iroh::{EndpointAddr, TransportAddr};
 use iroh_blobs::ticket::BlobTicket;
 use src_tauri::remote::{beam, endpoint};
+use src_tauri::security::RootSet;
 
 /// Re-mint `ticket` so its only transport addr is `127.0.0.1:<sender port>`.
 fn loopback_ticket(ticket: &str) -> String {
@@ -37,14 +38,17 @@ async fn beam_round_trip_then_stop_revokes() {
     let receiver_dir = tempfile::TempDir::new().unwrap();
     let received_root = tempfile::TempDir::new().unwrap();
 
-    let sender = endpoint::boot_in(sender_dir.path(), || {}).await.expect("sender boot");
-    let receiver = endpoint::boot_in(receiver_dir.path(), || {}).await.expect("receiver boot");
+    let sender = endpoint::boot_in(sender_dir.path(), |_| {}).await.expect("sender boot");
+    let receiver = endpoint::boot_in(receiver_dir.path(), |_| {}).await.expect("receiver boot");
 
-    // Stage + offer on the sender.
+    // Stage + offer on the sender, through the same path policy the
+    // commands use.
     let artifact = sender_dir.path().join("report.html");
     let body = "<!doctype html><h1>beamed</h1>".repeat(64);
     std::fs::write(&artifact, &body).unwrap();
-    let offer = beam::offer(&sender, &artifact.canonicalize().unwrap())
+    let roots = RootSet::new(vec![sender_dir.path().to_path_buf()]);
+    let cand = beam::resolve_offerable(&artifact, &roots).expect("offerable");
+    let offer = beam::offer(&sender, &cand, beam::DEFAULT_TTL_HOURS)
         .await
         .expect("offer");
     assert_eq!(offer.name, "report.html");

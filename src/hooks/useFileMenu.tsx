@@ -18,14 +18,14 @@ import {
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MenuSection } from "../components/ContextMenu";
 import { useBookmarksContext } from "../state/bookmarks-context";
-import { useBeam } from "../state/beam";
+import { useBeamActions } from "../state/beam";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
 export function useFileMenu(
   onOpenFile?: (path: string, opts?: OpenFileOptions) => void,
 ): (path: string) => MenuSection[] {
   const { isBookmarked, toggle } = useBookmarksContext();
-  const { beginSend } = useBeam();
+  const { beginSend } = useBeamActions();
 
   return React.useCallback(
     (path: string): MenuSection[] => {
