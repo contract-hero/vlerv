@@ -43,31 +43,31 @@ export interface BeamReceiveRequestPayload {
 interface BeamProgressPayload {
   hash: string;
   received: number;
-  total: number | null;
 }
 
-export interface BeamSendState {
-  path: string;
-  name: string;
-  /** Null when initiated from the toolbar (size shown once the offer exists). */
-  size: number | null;
-  phase: "confirm" | "creating" | "ready" | "error";
-  offer?: BeamOffer;
-  error?: string;
-}
+// Discriminated unions: the fields a phase needs travel WITH the phase, so
+// "ready without an offer" or "error without a message" cannot be
+// constructed — the dialog's `phase === "ready" && send.offer` guards used to
+// paper over exactly those illegal states.
+export type BeamSendState = { path: string; name: string } & (
+  | { phase: "confirm" | "creating"; size: number | null }
+  | { phase: "ready"; size: number; offer: BeamOffer }
+  | { phase: "error"; size: number | null; error: string }
+);
 
-export interface BeamReceiveState {
-  req: BeamReceiveRequestPayload;
-  phase: "confirm" | "fetching" | "error";
-  received: number;
-  error?: string;
-}
+export type BeamReceiveState = { req: BeamReceiveRequestPayload } & (
+  | { phase: "confirm" }
+  | { phase: "fetching"; received: number }
+  | { phase: "error"; error: string }
+);
 
 export interface BeamStateValue {
   offers: BeamOffer[];
   received: BeamReceivedEntry[];
   send: BeamSendState | null;
   receive: BeamReceiveState | null;
+  /** Set when a revocation failed — the offer may still be served. */
+  stopError: string | null;
 }
 
 export interface BeamActionsValue {
@@ -113,6 +113,7 @@ export function BeamProvider({
   const [receivedDir, setReceivedDir] = React.useState<string | null>(null);
   const [send, setSend] = React.useState<BeamSendState | null>(null);
   const [receive, setReceive] = React.useState<BeamReceiveState | null>(null);
+  const [stopError, setStopError] = React.useState<string | null>(null);
 
   // Latest dialog state for the stable action callbacks — reading it via a
   // ref keeps the actions context identity-stable across progress events.
@@ -141,12 +142,15 @@ export function BeamProvider({
   });
 
   useTauriEvent<BeamReceiveRequestPayload>("vlerv://beam-receive-request", (req) => {
-    setReceive({ req, phase: "confirm", received: 0 });
+    // A transfer in flight owns the dialog — a second link must not replace
+    // the fetching face out from under the user (and orphan its progress).
+    if (receiveRef.current?.phase === "fetching") return;
+    setReceive({ req, phase: "confirm" });
   });
 
   useTauriEvent<BeamProgressPayload>("vlerv://beam-progress", (p) => {
     setReceive((r) =>
-      r && r.req.hash === p.hash && r.phase === "fetching"
+      r && r.phase === "fetching" && r.req.hash === p.hash
         ? { ...r, received: p.received }
         : r,
     );
@@ -159,17 +163,22 @@ export function BeamProvider({
   const runOffer = React.useCallback(
     (path: string, name: string, size: number | null) => {
       setSend({ path, name, size, phase: "creating" });
-      ipc.beamOffer?.(path)
+      // Optional-chaining a missing method yields undefined and would strand
+      // the dialog on "creating" forever with no .catch — surface it instead.
+      const pending = ipc.beamOffer?.(path);
+      if (!pending) {
+        setSend({ path, name, size, phase: "error", error: "Beam is not available in this build." });
+        return;
+      }
+      pending
         .then((offer) => {
           setSend((s) =>
-            s && s.path === path
-              ? { ...s, size: offer.size, phase: "ready", offer }
-              : s,
+            s && s.path === path ? { path, name, size: offer.size, phase: "ready", offer } : s,
           );
         })
         .catch((e: unknown) => {
           setSend((s) =>
-            s && s.path === path ? { ...s, phase: "error", error: String(e) } : s,
+            s && s.path === path ? { path, name, size, phase: "error", error: String(e) } : s,
           );
         });
     },
@@ -199,16 +208,28 @@ export function BeamProvider({
     if (!r || r.phase === "fetching") return;
     const { req } = r;
     setReceive({ req, phase: "fetching", received: 0 });
-    ipc.beamReceive?.(req.ticket, req.name, req.size ?? undefined)
+    const pending = ipc.beamReceive?.(req.ticket, req.name);
+    if (!pending) {
+      setReceive({ req, phase: "error", error: "Beam is not available in this build." });
+      return;
+    }
+    pending
       .then((file) => {
-        setReceive(null);
-        dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
+        // Only steal focus / open the tab if THIS transfer still owns the
+        // dialog — a declined or superseded fetch must not surface a file the
+        // user dismissed (the receive has no backend cancel, so it still
+        // lands on disk; refreshReceived surfaces it in the list instead).
+        const owns = receiveRef.current?.req.ticket === req.ticket;
+        setReceive((cur) => (cur && cur.req.ticket === req.ticket ? null : cur));
+        if (owns) {
+          dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
+        }
         refreshReceived();
       })
       .catch((e: unknown) => {
         setReceive((cur) =>
           cur && cur.req.ticket === req.ticket
-            ? { ...cur, phase: "error", error: String(e) }
+            ? { req: cur.req, phase: "error", error: String(e) }
             : cur,
         );
       });
@@ -218,10 +239,18 @@ export function BeamProvider({
 
   const stopOffer = React.useCallback(
     (id: string) => {
-      // The offers-updated event refreshes the list; the local filter just
-      // makes the row vanish without waiting for the round-trip.
+      // Optimistically hide the row, but a FAILED stop leaves the offer still
+      // served (revocation is a security action). Only success re-emits
+      // beam-offers-updated, so on failure re-fetch the true list ourselves
+      // and surface it — otherwise the offer is live but invisible until the
+      // app quits.
       setOffers((list) => list.filter((o) => o.id !== id));
-      ipc.beamStop?.(id).catch(() => {});
+      setStopError(null);
+      ipc.beamStop?.(id).catch((e: unknown) => {
+        console.error("vlerv: beam stop failed", id, e);
+        ipc.beamListOffers?.().then(setOffers).catch(() => {});
+        setStopError("Could not stop this beam — it may still be shared.");
+      });
     },
     [ipc],
   );
@@ -234,8 +263,8 @@ export function BeamProvider({
   );
 
   const stateValue = React.useMemo(
-    (): BeamStateValue => ({ offers, received, send, receive }),
-    [offers, received, send, receive],
+    (): BeamStateValue => ({ offers, received, send, receive, stopError }),
+    [offers, received, send, receive, stopError],
   );
 
   const actionsValue = React.useMemo(

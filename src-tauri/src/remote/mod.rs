@@ -111,7 +111,6 @@ pub async fn beam_receive(
     state: tauri::State<'_, RemoteState>,
     ticket: String,
     name: Option<String>,
-    size: Option<u64>,
 ) -> Result<beam::ReceivedFile, String> {
     let node = boot_node(&app, &state).await?;
     let progress_app = app.clone();
@@ -119,12 +118,11 @@ pub async fn beam_receive(
         &node,
         &ticket,
         name.as_deref(),
-        size,
         &endpoint::received_dir(),
-        move |hash_hex, received, total| {
+        move |hash_hex, received| {
             let _ = progress_app.emit(
                 "vlerv://beam-progress",
-                beam::ProgressEvent { hash: hash_hex.to_string(), received, total },
+                beam::ProgressEvent { hash: hash_hex.to_string(), received },
             );
         },
     )
@@ -150,7 +148,8 @@ async fn boot_node(
 ) -> Result<Arc<endpoint::RemoteNode>, String> {
     let app = app.clone();
     // The gate hands the fresh offers list straight to the callback — one
-    // emit path, no locks touched from the gate loop.
+    // emit path that never re-locks the RemoteState.node tokio mutex (the
+    // gate loop still takes the Offers mutex to admit + list; that's fine).
     state
         .node(move |offers| {
             let _ = app.emit("vlerv://beam-offers-updated", offers);

@@ -66,9 +66,9 @@ function SendFace(): React.ReactElement {
         {send.phase === "confirm" ? (
           <>
             <p className="beam-hint">
-              Creates a one-shot link another Vlervcode instance can fetch this
-              file with — peer-to-peer, end-to-end encrypted. Anyone holding
-              the link can fetch while the offer is active.
+              Creates a link another Vlervcode instance can fetch this file
+              with — peer-to-peer, end-to-end encrypted. Anyone holding the
+              link can fetch while the offer is active.
             </p>
             <div className="beam-actions">
               <button type="button" className="button" autoFocus onClick={confirmSend}>
@@ -164,10 +164,13 @@ function ReceiveFace(): React.ReactElement {
               opens it in a tab. The size shown is the sender&apos;s claim.
             </p>
             <div className="beam-actions">
-              <button type="button" className="button" autoFocus onClick={acceptReceive}>
+              <button type="button" className="button" onClick={acceptReceive}>
                 Receive &amp; open
               </button>
-              <button type="button" className="button button-secondary" onClick={declineReceive}>Decline</button>
+              {/* autoFocus on Decline, not Accept: the receive dialog can pop
+                  from a drive-by link that raises the window, and a stray
+                  Space/Enter must not accept a transfer. */}
+              <button type="button" className="button button-secondary" autoFocus onClick={declineReceive}>Decline</button>
             </div>
           </>
         ) : null}
@@ -225,7 +228,7 @@ export default function BeamDialog(): React.ReactElement | null {
  * (fetch counts, expiry, Stop) plus recent received files (fetched lazily
  * on open — the popover is the only place the list renders). */
 export function BeamIndicator(): React.ReactElement | null {
-  const { offers, received } = useBeamState();
+  const { offers, received, stopError } = useBeamState();
   const { stopOffer, openReceived, refreshReceived } = useBeamActions();
   const [open, setOpen] = React.useState(false);
   React.useEffect(() => {
@@ -255,6 +258,9 @@ export function BeamIndicator(): React.ReactElement | null {
         <>
           <div className="beam-popover-scrim" onMouseDown={() => setOpen(false)} />
           <div className="beam-popover" role="menu">
+            {stopError ? (
+              <p className="beam-error" role="alert">{stopError}</p>
+            ) : null}
             <div className="beam-popover-title">Beaming</div>
             {offers.map((o) => (
               <div key={o.id} className="beam-popover-row">
