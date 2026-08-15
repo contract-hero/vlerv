@@ -133,7 +133,7 @@ export interface IpcSurface {
   /** Active offers. Never boots the endpoint. */
   beamListOffers?(): Promise<BeamOffer[]>;
   /** Post-confirm fetch; progress arrives as `vlerv://beam-progress`. */
-  beamReceive?(ticket: string, name?: string, size?: number): Promise<BeamReceivedFile>;
+  beamReceive?(ticket: string, name?: string): Promise<BeamReceivedFile>;
   /** Where received artifacts land (badge prefix check). */
   beamReceivedDir?(): Promise<string>;
   /** Past beams, newest first. */
@@ -263,8 +263,8 @@ class TauriIpc implements IpcSurface {
     return await invoke<BeamOffer[]>("beam_list_offers");
   }
 
-  async beamReceive(ticket: string, name?: string, size?: number): Promise<BeamReceivedFile> {
-    return await invoke<BeamReceivedFile>("beam_receive", { ticket, name, size });
+  async beamReceive(ticket: string, name?: string): Promise<BeamReceivedFile> {
+    return await invoke<BeamReceivedFile>("beam_receive", { ticket, name });
   }
 
   async beamReceivedDir(): Promise<string> {

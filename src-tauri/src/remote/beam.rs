@@ -63,11 +63,13 @@ pub struct OfferInfo {
 }
 
 /// Payload for `vlerv://beam-progress`.
+/// `received` is real measured bytes. No `total`: the only size we have is
+/// the sender's unverified hint, and the dialog already holds it — echoing
+/// it here beside real bytes only invites a bogus `received / total`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProgressEvent {
     pub hash: String,
     pub received: u64,
-    pub total: Option<u64>,
 }
 
 /// A completed receive, returned by `beam_receive`.
@@ -115,8 +117,16 @@ impl Offers {
         Self::default()
     }
 
-    fn insert(&self, hash: Hash, entry: OfferEntry) {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).insert(hash, entry);
+    /// Register an offer, returning the store tag of any entry it displaced
+    /// (same hash, re-beamed) so the caller can delete it — the displaced tag
+    /// is a fresh `add_path` tag that would otherwise pin the blob forever,
+    /// unreachable by `stop`/`take_expired`.
+    fn insert(&self, hash: Hash, entry: OfferEntry) -> Option<iroh_blobs::api::Tag> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(hash, entry)
+            .map(|old| old.tag)
     }
 
     fn remove(&self, id: &str) -> Option<iroh_blobs::api::Tag> {
@@ -174,25 +184,51 @@ impl Offers {
         }
     }
 
-    /// Build the provider-event gate for BlobsProtocol. Every get request is
-    /// intercepted and admitted against the registry — this is what makes
-    /// Stop an *instant* revocation instead of a GC eventually. `on_change`
-    /// receives the fresh offers list (fetch counts moved), ready to emit.
+    /// Build the provider-event gate for BlobsProtocol. Beam v1 serves
+    /// exactly one request shape — a plain full-blob GET whose hash is an
+    /// active, unexpired offer. Everything else is refused *explicitly* here.
+    ///
+    /// In iroh-blobs 0.103 the provider's generic `request<Req>` consults
+    /// `mask.get` for every request kind, so `get: Intercept` routes get /
+    /// get-many / push / observe all through this loop; the deny arms below
+    /// are what refuse the non-GET kinds, not the drop of an unmatched
+    /// message. The `Disabled` mask fields are belt-and-suspenders: should a
+    /// future (pinned, deliberate) upgrade start honoring per-kind masks,
+    /// those kinds are rejected before they ever reach this loop. This is
+    /// what makes Stop an *instant* revocation instead of a GC eventually.
+    /// `on_change` receives the fresh offers list (fetch counts moved).
     pub fn gate(
         self: Arc<Self>,
         on_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
     ) -> EventSender {
-        let mask = EventMask { get: RequestMode::Intercept, ..EventMask::DEFAULT };
+        let mask = EventMask {
+            get: RequestMode::Intercept,
+            get_many: RequestMode::Disabled,
+            push: RequestMode::Disabled,
+            ..EventMask::DEFAULT
+        };
         let (tx, mut rx) = EventSender::channel(32, mask);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let ProviderMessage::GetRequestReceived(msg) = msg {
-                    let res = self.admit(&msg.request.hash, msg.request.ranges.is_blob());
-                    let admitted = res.is_ok();
-                    msg.tx.send(res).await.ok();
-                    if admitted {
-                        on_change(self.list());
+                match msg {
+                    ProviderMessage::GetRequestReceived(msg) => {
+                        let res = self.admit(&msg.request.hash, msg.request.ranges.is_blob());
+                        let admitted = res.is_ok();
+                        msg.tx.send(res).await.ok();
+                        if admitted {
+                            on_change(self.list());
+                        }
                     }
+                    ProviderMessage::GetManyRequestReceived(msg) => {
+                        msg.tx.send(Err(AbortReason::Permission)).await.ok();
+                    }
+                    ProviderMessage::PushRequestReceived(msg) => {
+                        msg.tx.send(Err(AbortReason::Permission)).await.ok();
+                    }
+                    ProviderMessage::ObserveRequestReceived(msg) => {
+                        msg.tx.send(Err(AbortReason::Permission)).await.ok();
+                    }
+                    _ => {}
                 }
             }
         });
@@ -283,9 +319,7 @@ pub async fn offer(
 ) -> Result<OfferInfo, String> {
     // Housekeeping: drop expired offers and their tags while we have the
     // store at hand.
-    for tag in node.offers.take_expired(now_unix()) {
-        let _ = node.store.tags().delete(tag).await;
-    }
+    delete_tags(node, node.offers.take_expired(now_unix())).await;
 
     let tag = node
         .store
@@ -309,10 +343,18 @@ pub async fn offer(
         link: build_link(&ticket, &cand.name, cand.size),
         ticket,
         created_at,
-        expires_at: created_at + u64::from(ttl_hours.max(1)) * 3600,
+        // Clamp both ends: a state.json 0 must not mint a dead ticket, and a
+        // u32::MAX must not mint a ~490,000-year fetch grant.
+        expires_at: created_at + u64::from(ttl_hours.clamp(1, 24 * 30)) * 3600,
         fetches: 0,
     };
-    node.offers.insert(tag.hash, OfferEntry { info: info.clone(), tag: tag.name });
+    if let Some(old_tag) = node.offers.insert(tag.hash, OfferEntry { info: info.clone(), tag: tag.name }) {
+        // Re-beam of the same content: drop the previous staging tag so its
+        // copy of the bytes becomes collectable.
+        if let Err(e) = node.store.tags().delete(old_tag.clone()).await {
+            eprintln!("vlerv: beam: could not delete superseded blob tag {old_tag:?}: {e}");
+        }
+    }
     Ok(info)
 }
 
@@ -320,23 +362,31 @@ pub async fn offer(
 /// tag is deleted so the staged bytes become garbage-collectable.
 pub async fn stop(node: &RemoteNode, offer_id: &str) {
     if let Some(tag) = node.offers.remove(offer_id) {
-        let _ = node.store.tags().delete(tag).await;
+        delete_tags(node, vec![tag]).await;
     }
-    for tag in node.offers.take_expired(now_unix()) {
-        let _ = node.store.tags().delete(tag).await;
+    delete_tags(node, node.offers.take_expired(now_unix())).await;
+}
+
+/// Delete staging tags, logging failures rather than discarding them — a
+/// failed delete leaves a private copy of a beamed file pinned on disk after
+/// the user revoked it, and that should be diagnosable.
+async fn delete_tags(node: &RemoteNode, tags: Vec<iroh_blobs::api::Tag>) {
+    for tag in tags {
+        if let Err(e) = node.store.tags().delete(tag.clone()).await {
+            eprintln!("vlerv: beam: could not delete blob tag {tag:?}: {e}");
+        }
     }
 }
 
 /// Dial a ticket and stream the blob into `received_root`, verified chunk by
-/// chunk. `on_progress(hash_hex, received, total_hint)` fires about once
-/// per MiB.
+/// chunk. `on_progress(hash_hex, received)` fires about once per MiB with the
+/// real measured byte count.
 pub async fn receive(
     node: &RemoteNode,
     ticket_str: &str,
     name_hint: Option<&str>,
-    size_hint: Option<u64>,
     received_root: &Path,
-    mut on_progress: impl FnMut(&str, u64, Option<u64>),
+    mut on_progress: impl FnMut(&str, u64),
 ) -> Result<ReceivedFile, String> {
     let ticket = parse_raw_ticket(ticket_str)?;
     let hash = ticket.hash();
@@ -353,21 +403,26 @@ pub async fn receive(
     .map_err(|e| format!("sender offline — could not reach the sender ({e})"))?;
 
     // Stream into a partial file next to the final location (same volume ⇒
-    // atomic rename).
+    // atomic rename). Errors carry the operation + path, matching the
+    // module's own "cannot …: {e}" style, so the receive dialog never shows
+    // a bare "No such file or directory (os error 2)".
     let partials_dir = received_root.join(".partial");
-    std::fs::create_dir_all(&partials_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&partials_dir)
+        .map_err(|e| format!("cannot prepare the received folder {}: {e}", partials_dir.display()))?;
     // Unique per attempt: two concurrent receives of the same hash must not
     // interleave writes into one partial file.
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let partial_path = partials_dir.join(format!("{hash_hex}.{attempt}"));
 
-    // The stream loop lives in an inner future so every early exit funnels
-    // through ONE partial-file cleanup below (a per-arm cleanup ritual had
-    // already drifted once — the write error path forgot it).
-    let stream_result: Result<u64, String> = async {
+    // The stream loop AND the finalize live in an inner future so every early
+    // exit — stream error or a failed rename — funnels through ONE
+    // partial-file cleanup below (a per-arm cleanup ritual had already drifted
+    // once, and the finalize used to sit past the cleanup entirely).
+    let stream_result: Result<(u64, PathBuf, String), String> = async {
         let mut file = std::io::BufWriter::new(
-            std::fs::File::create(&partial_path).map_err(|e| e.to_string())?,
+            std::fs::File::create(&partial_path)
+                .map_err(|e| format!("cannot open the incoming file {}: {e}", partial_path.display()))?,
         );
         let mut written: u64 = 0;
         let mut last_emitted: u64 = 0;
@@ -387,10 +442,11 @@ pub async fn receive(
                             human_bytes(HARD_CAP_BYTES)
                         ));
                     }
-                    file.write_all(&leaf.data).map_err(|e| e.to_string())?;
+                    file.write_all(&leaf.data)
+                        .map_err(|e| format!("cannot write the incoming file: {e}"))?;
                     if written - last_emitted >= PROGRESS_STRIDE_BYTES {
                         last_emitted = written;
-                        on_progress(&hash_hex, written, size_hint);
+                        on_progress(&hash_hex, written);
                     }
                 }
                 Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
@@ -404,27 +460,33 @@ pub async fn receive(
             }
         }
         file.into_inner()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("cannot flush the incoming file: {e}"))?
             .sync_all()
-            .map_err(|e| e.to_string())?;
-        Ok(written)
+            .map_err(|e| format!("cannot flush the incoming file: {e}"))?;
+
+        // Finalize INSIDE the guarded block so a create_dir/rename failure
+        // funnels through the same one cleanup as any stream error — a fully
+        // downloaded blob must not be orphaned in .partial/ (list_received
+        // hides dot-dirs and nothing else prunes them).
+        let name = sanitize_beam_name(name_hint, &hash_hex);
+        let day_dir = received_root.join(civil_date_string(now_unix()));
+        std::fs::create_dir_all(&day_dir)
+            .map_err(|e| format!("cannot create {}: {e}", day_dir.display()))?;
+        let target = unique_target_path(&day_dir, &name);
+        std::fs::rename(&partial_path, &target)
+            .map_err(|e| format!("cannot move the received file into place: {e}"))?;
+        Ok((written, target, name))
     }
     .await;
 
-    let written = match stream_result {
-        Ok(n) => n,
+    let (written, target, name) = match stream_result {
+        Ok(t) => t,
         Err(e) => {
             let _ = std::fs::remove_file(&partial_path);
             return Err(e);
         }
     };
-    on_progress(&hash_hex, written, size_hint);
-
-    let name = sanitize_beam_name(name_hint, &hash_hex);
-    let day_dir = received_root.join(civil_date_string(now_unix()));
-    std::fs::create_dir_all(&day_dir).map_err(|e| e.to_string())?;
-    let target = unique_target_path(&day_dir, &name);
-    std::fs::rename(&partial_path, &target).map_err(|e| e.to_string())?;
+    on_progress(&hash_hex, written);
 
     Ok(ReceivedFile { path: target, name, size: written, hash: hash_hex })
 }
@@ -440,7 +502,18 @@ pub fn sanitize_beam_name(hint: Option<&str>, hash_hex: &str) -> String {
     let base = hint.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control())
+        // Cc control chars AND the Cf bidi / zero-width set: the hint is the
+        // display string in the confirm dialog and the on-disk filename, so a
+        // U+202E extension-spoof (report<RLO>gnp.html → reporthtml.png) is the
+        // whole risk.
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c,
+                    '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}')
+        })
         .take(128)
         .collect();
     let trimmed = cleaned.trim().trim_start_matches('.').trim();
@@ -584,6 +657,16 @@ mod tests {
         assert_eq!(sanitize_beam_name(Some("informe-año.html"), H), "informe-año.html");
     }
 
+    #[test]
+    fn bidi_and_zero_width_format_chars_are_stripped() {
+        // U+202E (RLO) is the classic extension-spoof: "report<RLO>gnp.html"
+        // renders as "reporthtml.png". It must not survive to the dialog or
+        // the on-disk name.
+        assert_eq!(sanitize_beam_name(Some("report\u{202E}gnp.html"), H), "reportgnp.html");
+        assert_eq!(sanitize_beam_name(Some("a\u{200B}b\u{FEFF}c.html"), H), "abc.html");
+        assert_eq!(sanitize_beam_name(Some("\u{2066}\u{2069}"), H), "beam-abcdef01");
+    }
+
     // ── unique_target_path ──────────────────────────────────────────────────
 
     #[test]
@@ -721,5 +804,31 @@ mod tests {
             resolve_offerable(dir.path(), &roots).unwrap_err(),
             "only files can be beamed"
         );
+    }
+
+    #[test]
+    fn resolve_offerable_rejects_over_the_hard_cap() {
+        // Sparse file — set_len is instant and allocates no bytes, so this
+        // costs nothing on disk yet exercises the dispatch-time cap that
+        // stops add_path from copying an oversized file into the store.
+        let dir = tempfile::TempDir::new().unwrap();
+        let big = dir.path().join("big.bin");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(HARD_CAP_BYTES + 1).unwrap();
+        drop(f);
+        let roots = RootSet::new(vec![dir.path().to_path_buf()]);
+
+        let err = resolve_offerable(&big, &roots).unwrap_err();
+        assert!(err.starts_with("file is "), "cap error, got: {err}");
+    }
+
+    #[test]
+    fn ttl_clamp_bounds_both_ends() {
+        // The clamp lives inline in `offer` (needs a node), but the arithmetic
+        // is what matters: 0 → 1 h, huge → 30 days.
+        let clamp = |h: u32| u64::from(h.clamp(1, 24 * 30)) * 3600;
+        assert_eq!(clamp(0), 3600);
+        assert_eq!(clamp(24), 24 * 3600);
+        assert_eq!(clamp(u32::MAX), 24 * 30 * 3600);
     }
 }

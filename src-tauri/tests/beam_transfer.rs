@@ -2,11 +2,13 @@
 // file, a receiver node dials the minted ticket and lands the verified blob
 // under received/<date>/; Stop revokes the offer for subsequent fetches.
 //
-// Hermetic by construction: the receiver dials a loopback re-mint of the
-// offer's ticket (same node id, same hash, 127.0.0.1 + the sender's real
-// UDP port). The endpoint binds 0.0.0.0, so loopback always reaches it —
-// no relay, no discovery, no external network in the loop. Cross-network
-// traversal is the M0 spike's territory, on real machines.
+// The DATA PATH is loopback: the receiver dials a re-mint of the offer's
+// ticket (same node id, same hash, sole transport addr 127.0.0.1 + the
+// sender's real UDP port). The endpoint binds 0.0.0.0, so loopback always
+// reaches it — no relay hop and no discovery lookup carry the bytes. The
+// endpoints still boot the n0 preset, so bind publishes to n0 DNS and
+// `offer()` waits up to 10 s on `online()` when relays are unreachable.
+// Cross-network NAT traversal is the M0 spike's territory, on real machines.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,6 +57,21 @@ async fn beam_round_trip_then_stop_revokes() {
     assert_eq!(offer.size, body.len() as u64);
     assert!(offer.link.starts_with("vlerv://receive?ticket="));
     assert_eq!(sender.offers.list().len(), 1);
+    // Default TTL (24 h) is applied.
+    assert_eq!(offer.expires_at - offer.created_at, 24 * 3600);
+
+    // The product loop: the minted link must survive the app's OWN parser —
+    // ticket, sanitized name, and size all round-trip. A charset drift
+    // between build_link and the receive arm would break this before it broke
+    // on a real two-machine paste.
+    match src_tauri::deeplink::parse(&offer.link).expect("own link re-parses") {
+        src_tauri::deeplink::DeepLinkIntent::Receive { ticket, name, size } => {
+            assert_eq!(ticket, offer.ticket);
+            assert_eq!(name.as_deref(), Some("report.html"));
+            assert_eq!(size, Some(offer.size));
+        }
+        other => panic!("expected Receive, got {other:?}"),
+    }
 
     let dial_ticket = loopback_ticket(&offer.ticket);
 
@@ -65,9 +82,8 @@ async fn beam_round_trip_then_stop_revokes() {
         &receiver,
         &dial_ticket,
         Some(&offer.name),
-        Some(offer.size),
         received_root.path(),
-        move |_hash, _received, _total| {
+        move |_hash, _received| {
             calls.fetch_add(1, Ordering::SeqCst);
         },
     )
@@ -90,9 +106,8 @@ async fn beam_round_trip_then_stop_revokes() {
         &receiver,
         &dial_ticket,
         Some(&offer.name),
-        Some(offer.size),
         received_root.path(),
-        |_, _, _| {},
+        |_, _| {},
     )
     .await
     .expect("second receive");
@@ -111,12 +126,20 @@ async fn beam_round_trip_then_stop_revokes() {
         &receiver,
         &dial_ticket,
         None,
-        None,
         received_root.path(),
-        |_, _, _| {},
+        |_, _| {},
     )
     .await;
     assert!(denied.is_err(), "revoked offer must not be fetchable");
+
+    // The revoked receive left no orphan in .partial/ (finding: post-abort
+    // cleanup). The gate denies before any file is created, but assert the
+    // dir is clean regardless.
+    let partial = received_root.path().join(".partial");
+    let leftover = std::fs::read_dir(&partial)
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "no partial files left after a denied receive");
 
     receiver.router.shutdown().await.ok();
     sender.router.shutdown().await.ok();

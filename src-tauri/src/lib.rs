@@ -182,7 +182,9 @@ pub fn handle_deep_link(url: &str) {
         deeplink::DeepLinkIntent::Beam { path } => path,
         deeplink::DeepLinkIntent::Receive { ticket, .. } => {
             // No local path to echo — the ticket names remote content.
-            eprintln!("vlerv: deep-link: receive ticket {}…", &ticket[..16.min(ticket.len())]);
+            // chars().take, not a byte slice: panic-free even if the ticket
+            // charset ever admits multibyte input.
+            eprintln!("vlerv: deep-link: receive ticket {}…", ticket.chars().take(16).collect::<String>());
             return;
         }
     };

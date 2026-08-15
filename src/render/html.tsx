@@ -24,6 +24,14 @@ export interface HtmlRendererProps {
   /// Scroll-memory key; when set, scroll position survives reloads and
   /// tab switches.
   scrollKey?: string;
+  /// Untrusted provenance (a beamed / received artifact — authored by
+  /// whoever minted the ticket, not the local user). When true the frame is
+  /// hardened: the sandbox drops `allow-same-origin` so the content runs in
+  /// an opaque origin it cannot escape into the host webview (and thus Tauri
+  /// IPC), and no `<base href="file://…">` is injected — remote v1 artifacts
+  /// are single-file and have no local resources to resolve. The postMessage
+  /// host bridge works unchanged from an opaque origin.
+  isolate?: boolean;
 }
 
 // Small theme stylesheet injected into the iframe so the iframe's own root
@@ -140,11 +148,18 @@ const HOST_BRIDGE_SCRIPT = `
 })();
 </script>`;
 
-function injectBase(html: string, basePath: string, theme: "dark" | "light"): string {
+function injectBase(
+  html: string,
+  basePath: string,
+  theme: "dark" | "light",
+  includeBase = true,
+): string {
   // Strip filename → directory path. Trailing slash matters for <base href>.
   const lastSlash = basePath.lastIndexOf("/");
   const dir = lastSlash >= 0 ? basePath.slice(0, lastSlash + 1) : "";
-  const baseTag = `<base href="file://${dir}">`;
+  // Isolated (remote) content gets NO base tag: an opaque-origin frame cannot
+  // load file:// subresources anyway, and v1 beams are single-file.
+  const baseTag = includeBase ? `<base href="file://${dir}">` : "";
   const style = themeStyle(theme);
   // Order matters: <base> first (so relative URLs resolve), then theme style
   // (low-specificity background fallback), then the host-bridge script.
@@ -152,7 +167,7 @@ function injectBase(html: string, basePath: string, theme: "dark" | "light"): st
   const headPreludeNoBase = `${style}\n${HOST_BRIDGE_SCRIPT}`;
 
   if (/<head[^>]*>/i.test(html)) {
-    const inj = /<base\b/i.test(html) ? headPreludeNoBase : headPrelude;
+    const inj = !includeBase || /<base\b/i.test(html) ? headPreludeNoBase : headPrelude;
     return html.replace(/(<head[^>]*>)/i, `$1\n${inj}`);
   }
   if (/<html[^>]*>/i.test(html)) {
@@ -166,11 +181,12 @@ export default function HtmlRenderer({
   path,
   zoom = 1,
   scrollKey,
+  isolate = false,
 }: HtmlRendererProps): React.ReactElement {
   const theme = useTheme();
   const memory = useScrollMemory();
   const iframeRef = React.useRef<HTMLIFrameElement | null>(null);
-  const srcdoc = injectBase(source, path, theme);
+  const srcdoc = injectBase(source, path, theme, !isolate);
 
   // Track the latest zoom/scrollKey without re-running the load listener.
   const zoomRef = React.useRef(zoom);
@@ -214,15 +230,16 @@ export default function HtmlRenderer({
     iframeRef.current?.contentWindow?.postMessage({ type: "vlerv:setZoom", zoom }, "*");
   }, [zoom]);
 
-  // Browser-like sandbox: scripts, popups, forms, modals, same-origin so the
-  // page sees a "normal" environment. NOTE: `allow-same-origin` on a srcdoc
-  // frame keeps the PARENT's origin rather than forcing an opaque one, so the
-  // frame is NOT isolated from the host webview — a hostile artifact can
-  // reach the parent's globals (and via them, Tauri IPC). Acceptable only
-  // because content here is the user's own local artifacts; tracked as a
-  // follow-up to re-evaluate dropping allow-same-origin.
-  const sandbox =
-    "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads allow-same-origin";
+  // Browser-like sandbox: scripts, popups, forms, modals. `allow-same-origin`
+  // on a srcdoc frame keeps the PARENT's origin rather than forcing an opaque
+  // one, so the frame is NOT isolated from the host webview — a hostile
+  // artifact can reach the parent's globals (and via them, Tauri IPC). That
+  // is acceptable for the user's OWN local artifacts, but NOT for untrusted
+  // remote content: an isolated frame drops it, running the content in an
+  // opaque origin it cannot escape. The postMessage bridge works either way.
+  const BASE_SANDBOX =
+    "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads";
+  const sandbox = isolate ? BASE_SANDBOX : `${BASE_SANDBOX} allow-same-origin`;
 
   return (
     <div data-testid="html-renderer">
