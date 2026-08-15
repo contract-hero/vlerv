@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expiresIn, humanBytes, isBeamedPath } from "./beam-format";
+import { expiresIn, humanBytes } from "./beam-format";
 
 describe("humanBytes", () => {
   it("scales through the units", () => {
@@ -24,16 +24,5 @@ describe("expiresIn", () => {
     expect(expiresIn(now + 30, now)).toBe("<1 min");
     expect(expiresIn(now, now)).toBe("expired");
     expect(expiresIn(now - 5, now)).toBe("expired");
-  });
-});
-
-describe("isBeamedPath", () => {
-  const dir = "/Users/x/Library/Application Support/Vlerv/received";
-  it("matches only true children of received/", () => {
-    expect(isBeamedPath(`${dir}/2026-08-15/report.html`, dir)).toBe(true);
-    expect(isBeamedPath("/Users/x/workspace/report.html", dir)).toBe(false);
-    // Sibling with the prefix as a substring must not match.
-    expect(isBeamedPath(`${dir}-other/x.html`, dir)).toBe(false);
-    expect(isBeamedPath(`${dir}/2026/x.html`, null)).toBe(false);
   });
 });

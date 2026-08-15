@@ -58,6 +58,9 @@ pub struct BeamReceiveRequest {
     /// Size hint in bytes. Display only — the cap is enforced on the actual
     /// stream.
     pub size: Option<u64>,
+    /// True when the size hint crosses the backend's warn threshold. The
+    /// backend owns the limits; the dialog never mirrors the constant.
+    pub warn: bool,
     /// The sender's NodeId (full and short fingerprint), straight from the
     /// ticket. What the user verifies before accepting.
     pub sender_id: String,
@@ -117,6 +120,7 @@ pub fn dispatch_deep_link(
             return Ok(DeepLinkAction::BeamReceive(BeamReceiveRequest {
                 ticket,
                 name,
+                warn: size.is_some_and(|s| s > remote::beam::WARN_BYTES),
                 size,
                 sender_id: info.node_id,
                 sender_id_short: info.node_id_short,
@@ -124,24 +128,15 @@ pub fn dispatch_deep_link(
             }));
         }
         deeplink::DeepLinkIntent::Beam { path } => {
-            // Beam sends data OFF the machine, so the conservative share
-            // policy applies (empty root set rejects; existing external
-            // files are beamable on purpose, same as the share sheet).
-            let (canonical, _out_of_root) = security::canonicalize_allow_external(&path, roots)
-                .map_err(|_| make_err("path not found or out of root".to_string()))?;
-            let meta = std::fs::metadata(&canonical)
-                .map_err(|_| make_err("path not found or out of root".to_string()))?;
-            if !meta.is_file() {
-                return Err(make_err("only files can be beamed".to_string()));
-            }
-            let name = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "artifact".to_string());
+            // One offer-path policy, shared with beam_offer: conservative
+            // share gate (beam sends data OFF the machine), files only,
+            // hard cap — an oversized file dies here, not after the user
+            // clicks through the dialog.
+            let cand = remote::beam::resolve_offerable(&path, roots).map_err(&make_err)?;
             return Ok(DeepLinkAction::BeamSend(BeamSendRequest {
-                path: canonical,
-                name,
-                size: meta.len(),
+                path: cand.canonical,
+                name: cand.name,
+                size: cand.size,
             }));
         }
     };

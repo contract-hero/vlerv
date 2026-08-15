@@ -90,6 +90,79 @@ fn parse_query_strict(query: &str) -> Result<Vec<(String, String)>, String> {
     Ok(result)
 }
 
+// ── Per-verb building blocks ────────────────────────────────────────────────
+// Every verb arm is composed from these, so a new verb cannot silently lose
+// a validation step — exactly what happened once when `reveal` was copied
+// from `open` without the absolute-path/NUL checks.
+
+/// Parse the verb's query string, treating a missing query as a missing
+/// `param` (the parameter the verb cannot exist without).
+fn parse_query_for(
+    input: &str,
+    query_opt: Option<&str>,
+    param: &str,
+) -> Result<Vec<(String, String)>, DeepLinkError> {
+    let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
+        input: input.to_string(),
+        param: param.to_string(),
+    })?;
+    parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
+        input: input.to_string(),
+        reason,
+    })
+}
+
+/// Find a required, non-empty parameter value.
+fn require_param<'a>(
+    input: &str,
+    params: &'a [(String, String)],
+    param: &str,
+) -> Result<&'a str, DeepLinkError> {
+    params
+        .iter()
+        .find(|(k, _)| k == param)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| DeepLinkError::MissingParameter {
+            input: input.to_string(),
+            param: param.to_string(),
+        })
+}
+
+/// Find an optional, non-empty parameter value.
+fn optional_param(params: &[(String, String)], param: &str) -> Option<String> {
+    params
+        .iter()
+        .find(|(k, _)| k == param)
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+}
+
+/// The required `path` parameter with the shared validation every path verb
+/// gets: absolute, no NUL bytes (T-017).
+fn require_abs_path(
+    input: &str,
+    params: &[(String, String)],
+) -> Result<PathBuf, DeepLinkError> {
+    let path_val = require_param(input, params, "path")?;
+
+    if !path_val.starts_with('/') {
+        return Err(DeepLinkError::Malformed {
+            input: input.to_string(),
+            reason: "path must be absolute (start with '/')".to_string(),
+        });
+    }
+
+    if path_val.contains('\0') {
+        return Err(DeepLinkError::Malformed {
+            input: input.to_string(),
+            reason: "path must not contain NUL bytes".to_string(),
+        });
+    }
+
+    Ok(PathBuf::from(path_val))
+}
+
 /// Parse a `vlerv://` URL string into a typed intent.
 pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
     let input = url.to_string();
@@ -121,125 +194,22 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
 
     match verb_part {
         "open" => {
-            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
-                input: input.clone(),
-                param: "path".to_string(),
-            })?;
-
-            // Use strict decoding to catch invalid percent-encoding (e.g. %ZZ).
-            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
-                input: input.clone(),
-                reason,
-            })?;
-
-            let path_val = params
-                .iter()
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| v.as_str())
-                .ok_or_else(|| DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "path".to_string(),
-                })?;
-
-            if path_val.is_empty() {
-                return Err(DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "path".to_string(),
-                });
-            }
-
-            // Reject non-absolute paths (T-017).
-            if !path_val.starts_with('/') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must be absolute (start with '/')".to_string(),
-                });
-            }
-
-            // Reject paths containing NUL bytes (T-017).
-            if path_val.contains('\0') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must not contain NUL bytes".to_string(),
-                });
-            }
-
+            let params = parse_query_for(&input, query_opt, "path")?;
+            let path = require_abs_path(&input, &params)?;
             let line = params
                 .iter()
                 .find(|(k, _)| k == "line")
                 .and_then(|(_, v)| v.parse::<u32>().ok());
-
-            Ok(DeepLinkIntent::Open {
-                path: PathBuf::from(path_val),
-                line,
-            })
+            Ok(DeepLinkIntent::Open { path, line })
         }
         "reveal" => {
-            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
-                input: input.clone(),
-                param: "path".to_string(),
-            })?;
-
-            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
-                input: input.clone(),
-                reason,
-            })?;
-
-            let path_val = params
-                .iter()
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| v.as_str())
-                .ok_or_else(|| DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "path".to_string(),
-                })?;
-
-            if path_val.is_empty() {
-                return Err(DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "path".to_string(),
-                });
-            }
-
-            // Same validation as the `open` arm (previously asymmetric).
-            if !path_val.starts_with('/') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must be absolute (start with '/')".to_string(),
-                });
-            }
-
-            if path_val.contains('\0') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must not contain NUL bytes".to_string(),
-                });
-            }
-
-            Ok(DeepLinkIntent::Reveal {
-                path: PathBuf::from(path_val),
-            })
+            let params = parse_query_for(&input, query_opt, "path")?;
+            let path = require_abs_path(&input, &params)?;
+            Ok(DeepLinkIntent::Reveal { path })
         }
         "receive" => {
-            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
-                input: input.clone(),
-                param: "ticket".to_string(),
-            })?;
-
-            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
-                input: input.clone(),
-                reason,
-            })?;
-
-            let ticket = params
-                .iter()
-                .find(|(k, _)| k == "ticket")
-                .map(|(_, v)| v.as_str())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "ticket".to_string(),
-                })?;
+            let params = parse_query_for(&input, query_opt, "ticket")?;
+            let ticket = require_param(&input, &params, "ticket")?;
 
             // Tickets are base32 strings. Alphanumeric-only is a strict
             // superset that rejects NUL, separators, and quoting tricks
@@ -251,62 +221,16 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
                 });
             }
 
-            let name = params
-                .iter()
-                .find(|(k, _)| k == "name")
-                .map(|(_, v)| v.clone())
-                .filter(|v| !v.is_empty());
-
-            let size = params
-                .iter()
-                .find(|(k, _)| k == "size")
-                .and_then(|(_, v)| v.parse::<u64>().ok());
-
             Ok(DeepLinkIntent::Receive {
                 ticket: ticket.to_string(),
-                name,
-                size,
+                name: optional_param(&params, "name"),
+                size: optional_param(&params, "size").and_then(|v| v.parse::<u64>().ok()),
             })
         }
         "beam" => {
-            let query = query_opt.ok_or_else(|| DeepLinkError::MissingParameter {
-                input: input.clone(),
-                param: "path".to_string(),
-            })?;
-
-            let params = parse_query_strict(query).map_err(|reason| DeepLinkError::Malformed {
-                input: input.clone(),
-                reason,
-            })?;
-
-            let path_val = params
-                .iter()
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| v.as_str())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| DeepLinkError::MissingParameter {
-                    input: input.clone(),
-                    param: "path".to_string(),
-                })?;
-
-            // Same validation as `open`/`reveal`.
-            if !path_val.starts_with('/') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must be absolute (start with '/')".to_string(),
-                });
-            }
-
-            if path_val.contains('\0') {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "path must not contain NUL bytes".to_string(),
-                });
-            }
-
-            Ok(DeepLinkIntent::Beam {
-                path: PathBuf::from(path_val),
-            })
+            let params = parse_query_for(&input, query_opt, "path")?;
+            let path = require_abs_path(&input, &params)?;
+            Ok(DeepLinkIntent::Beam { path })
         }
         other => Err(DeepLinkError::UnknownVerb {
             input: input.clone(),

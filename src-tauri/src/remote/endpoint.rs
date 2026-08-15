@@ -11,7 +11,7 @@ use iroh::{Endpoint, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 
-use super::beam::Offers;
+use super::beam::{OfferInfo, Offers};
 use crate::state_store;
 
 /// Backing state for one booted remote node: identity, endpoint, protocol
@@ -77,7 +77,11 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
 /// Boot the node: identity, endpoint (n0 preset: hole-punching + encrypted
 /// relay fallback + address discovery), blob store, and the gated blobs
 /// protocol behind an iroh Router. Called lazily — never at app launch.
-pub async fn boot(on_offers_change: impl Fn() + Send + Sync + 'static) -> Result<RemoteNode, String> {
+/// `on_offers_change` receives the fresh offers list whenever the request
+/// gate mutates the registry (fetch counts).
+pub async fn boot(
+    on_offers_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
+) -> Result<RemoteNode, String> {
     boot_in(&remote_dir(), on_offers_change).await
 }
 
@@ -85,7 +89,7 @@ pub async fn boot(on_offers_change: impl Fn() + Send + Sync + 'static) -> Result
 /// runs a sender and a receiver node side by side in one process.
 pub async fn boot_in(
     dir: &std::path::Path,
-    on_offers_change: impl Fn() + Send + Sync + 'static,
+    on_offers_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
 ) -> Result<RemoteNode, String> {
     let secret = load_or_create_identity(dir)?;
 
