@@ -23,6 +23,15 @@
 - Context menus everywhere (custom, no dep): Open in New Tab, Reveal in Finder, Copy Path, Bookmark toggle.
 - **Share** (merged from #22): native macOS share sheet + Open-in-Slack live in the Toolbar next to the star/copy buttons (they were in the removed Preview header). ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
 
+### Beam (remote-control-design.html — v1)
+- **P2P artifact transfer between Vlervcode instances** over [iroh](https://iroh.computer) (QUIC, hole-punched, encrypted relay fallback; exact-version pinned, all iroh types quarantined in `src-tauri/src/remote/`). Lazy boot: zero sockets until the first beam action.
+- **Send**: toolbar ⚡ button (or `vlerv beam <path>`, or a `vlerv://beam?path=…` link — link-initiated sends show a confirm face first). Stages the file into a content-addressed store (`ImportMode::Copy` — the ticket pins bytes at mint time), mints a `vlerv://receive?ticket=…&name=…&size=…` link. Path policy = the share module's (`canonicalize_allow_external`, conservative on empty roots).
+- **Serve**: a per-request gate (`iroh-blobs` provider events, `RequestMode::Intercept`) admits only active, unexpired offers — **Stop and TTL expiry revoke instantly**, no GC race. Fetch counts come from the same gate. Offers live in the toolbar ⚡ indicator (name, fetches, expiry, Stop) with a Received section.
+- **Receive**: deep link → confirm dialog (sanitized name, size claim, sender NodeId fingerprint) → BLAKE3-verified stream (256 MiB hard cap enforced on actual bytes, 20 MiB warn) → lands under `Application Support/Vlerv/received/<date>/`, opens in a tab with a **beamed** badge. "Sender offline" is retryable from the dialog.
+- **Identity**: ed25519 keypair persisted 0600 at `remote/identity.key`; corrupt key = hard error (silent regen would orphan shared tickets).
+- Preferences: `preferences.beam_ttl_hours` (default 24, settable via state.json until Settings mounts).
+- **Binary-size impact (measured, per design §8)**: release `vlerv-app` 12 MB → 28 MB with `iroh` + `iroh-blobs`. Larger than the design's "several-MB" guess; accepted for a local .app, revisit only if it starts to hurt.
+
 ### Rendering
 - HTML: sandboxed iframe, scripts on, `<base href>` injection, host-bridge script (link intercept with modifiers, scroll report/restore, zoom, chord forwarding).
 - Markdown: marked + KaTeX (`marked-katex-extension`, wired for real now) + shiki + mermaid, theme-aware.
@@ -41,8 +50,8 @@
 - Production `.app` build via `./scripts/build-app.sh` (~13 MB `Vlervtifacts.app`).
 
 ### Tests
-- Rust: 39 (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace/delete-kind/dedup, reader image + serde wire-shape matrix, recursive walk incl. BFS-truncation invariant, RootSet sharing, deep-link dispatch + recents side-effect matrix, bookmarks.
-- Frontend: 59 (`pnpm test`) — tabs reducer (history semantics incl. replace/LOAD_ERROR, tab lifecycle, watcher actions, zoom clamp+quantize), keyboard chord matching/dispatch, address-bar input normalization, click-modifier convention, fuzzy scorer, `ancestorsWithin`.
+- Rust: 74 unit + 1 integration (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace/delete-kind/dedup, reader image + serde wire-shape matrix, recursive walk incl. BFS-truncation invariant, RootSet sharing, deep-link dispatch + recents side-effect matrix (now incl. beam/receive verbs, hostile name-hint sanitization, ticket rejection), bookmarks, offers registry admit/expiry/revocation, identity persistence. The integration test is a **hermetic in-process two-endpoint Beam round trip** (offer → gated fetch → verified landing → collision naming → Stop → denial) dialing a loopback re-mint of the ticket, so no external network is in the loop.
+- Frontend: 90 (`pnpm test`) — tabs reducer (history semantics incl. replace/LOAD_ERROR, tab lifecycle, watcher actions, zoom clamp+quantize), keyboard chord matching/dispatch, address-bar input normalization, click-modifier convention, fuzzy scorer, `ancestorsWithin`, beam formatting helpers.
 
 ## Deliberately unchanged (display-only rebrand)
 
@@ -50,6 +59,7 @@
 
 ## Open items
 
+- **Beam follow-ups** (remote-control-design.html M6 + v2): blob-store GC for stopped/expired offers (tags are deleted; bytes linger in `remote/blobs/` until a GC pass exists), single-fetch mode, lock-to-peer beams, native share sheet / Open-in-Slack for the beam *link* (Copy link ships), Settings UI for `beam_ttl_hours`, macOS application-firewall prompt doc for unnotarized inbound. Scope (v2 pairing/drawer) not started. `endpoint.online()` waits up to 10 s before minting when relays are unreachable (e.g. behind some VPNs) — the ticket still carries direct addrs.
 - Deep-link `line=N` reaches the frontend but no renderer scrolls to a line yet.
 - Recents list is push-only from opens; no backend broadcast event (StartPage refreshes on mount).
 - `preferences.ignore_globs` / `drag_out_mode` still unwired (the hardcoded `DEFAULT_IGNORED` covers the real use). `Settings.tsx` exists and holds the Slack-target field but is still not mounted anywhere — set `preferences.slack_target` via state.json until it is (product decision deferred in #22).

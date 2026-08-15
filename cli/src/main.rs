@@ -42,8 +42,10 @@ const PATH_SET: &AsciiSet = &CONTROLS
 fn print_usage() {
     eprintln!("Usage: vlerv open <path>");
     eprintln!("       vlerv reveal <path>");
+    eprintln!("       vlerv beam <path>");
+    eprintln!("       vlerv receive <ticket | vlerv://receive?... link>");
     eprintln!();
-    eprintln!("Supported verbs: open, reveal");
+    eprintln!("Supported verbs: open, reveal, beam, receive");
 }
 
 fn resolve_path(raw_path: &str) -> std::path::PathBuf {
@@ -108,6 +110,44 @@ fn main() -> ExitCode {
             let path_str = canonical.to_string_lossy();
             let encoded = utf8_percent_encode(&path_str, PATH_SET).to_string();
             let url = format!("vlerv://reveal?path={encoded}");
+            open_url(&url)
+        }
+
+        // Beam v1 (remote-control-design.html §5): both verbs only hand an
+        // intent to the app — the send dialog / confirm dialog gate any
+        // actual staging or fetching.
+        "beam" => {
+            if args.len() < 3 {
+                eprintln!("Usage: vlerv beam <path>");
+                eprintln!("Error: missing path argument for 'beam' verb");
+                return ExitCode::from(1);
+            }
+
+            let canonical = resolve_path(&args[2]);
+            let path_str = canonical.to_string_lossy();
+            let encoded = utf8_percent_encode(&path_str, PATH_SET).to_string();
+            let url = format!("vlerv://beam?path={encoded}");
+            open_url(&url)
+        }
+
+        "receive" => {
+            if args.len() < 3 {
+                eprintln!("Usage: vlerv receive <ticket | vlerv://receive?... link>");
+                eprintln!("Error: missing ticket argument for 'receive' verb");
+                return ExitCode::from(1);
+            }
+
+            let arg = args[2].as_str();
+            // A pasted full beam link passes through untouched; a bare
+            // ticket gets wrapped. Tickets are plain base32, so no encoding.
+            if arg.starts_with("vlerv://receive?") {
+                return open_url(arg);
+            }
+            if arg.is_empty() || !arg.chars().all(|c| c.is_ascii_alphanumeric()) {
+                eprintln!("vlerv: ticket must be alphanumeric (or a full vlerv://receive link)");
+                return ExitCode::from(1);
+            }
+            let url = format!("vlerv://receive?ticket={arg}");
             open_url(&url)
         }
 

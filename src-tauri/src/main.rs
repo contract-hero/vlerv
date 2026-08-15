@@ -244,6 +244,7 @@ fn main() {
             external_watcher: Mutex::new(None),
         })
         .manage(roots)
+        .manage(src_tauri::remote::RemoteState::default())
         .invoke_handler(tauri::generate_handler![
             list_dir,
             list_workspace_roots,
@@ -260,6 +261,12 @@ fn main() {
             remove_bookmark,
             reorder_bookmarks,
             src_tauri::share::share_file,
+            src_tauri::remote::beam_offer,
+            src_tauri::remote::beam_stop,
+            src_tauri::remote::beam_list_offers,
+            src_tauri::remote::beam_receive,
+            src_tauri::remote::beam_received_dir,
+            src_tauri::remote::beam_list_received,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -281,8 +288,14 @@ fn main() {
                     let url_str = url.to_string();
                     src_tauri::handle_deep_link(&url_str);
                     match src_tauri::dispatch_deep_link(&url_str, &roots) {
-                        Ok(open_event) => {
+                        Ok(src_tauri::DeepLinkAction::OpenFile(open_event)) => {
                             let _ = app_handle.emit("vlerv://open-file", open_event);
+                        }
+                        Ok(src_tauri::DeepLinkAction::BeamReceive(req)) => {
+                            let _ = app_handle.emit("vlerv://beam-receive-request", req);
+                        }
+                        Ok(src_tauri::DeepLinkAction::BeamSend(req)) => {
+                            let _ = app_handle.emit("vlerv://beam-send-request", req);
                         }
                         Err(err_event) => {
                             eprintln!(

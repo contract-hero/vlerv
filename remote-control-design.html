@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Control — Beam &amp; Scope design for Vlervtifacts</title>
+<style>
+/* ★ TWEAKABLE — palette aligns with Vlervcode tokens so artifacts opened
+   inside Vlervcode feel visually coherent with the app chrome. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1f1f1f;
+  --fg-muted: #6e6e6e;
+  --heading-fg: #1a1a1a;
+  --accent: #1976d2;
+  --border: #e0e0e0;
+  --code-bg: #f0f0f0;
+  --code-fg: #6e3700;
+  --pre-bg: #fafafa;
+  --aside-bg: #f5f5f5;
+  --success: #2e7d32;
+  --warning: #9a5b00;
+  --error: #d32f2f;
+  --success-bg: #f3f8f4;
+  --warning-bg: #fbf7f0;
+  --error-bg: #fdf5f5;
+  --diagram-node-bg: #f7f9fc;
+  --diagram-node-accent-bg: #eef4fb;
+  --diagram-edge: #6e6e6e;
+  --diagram-relay: #9a5b00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --fg: #cccccc;
+    --fg-muted: #9e9e9e;
+    --heading-fg: #e8e8e8;
+    --accent: #4dabf7;
+    --border: #2a2a2a;
+    --code-bg: #2a2a2a;
+    --code-fg: #f0e8d8;
+    --pre-bg: #161616;
+    --aside-bg: #242424;
+    --success: #66bb6a;
+    --warning: #f0c674;
+    --error: #ff7676;
+    --success-bg: #1e251f;
+    --warning-bg: #29241a;
+    --error-bg: #2a1f1f;
+    --diagram-node-bg: #242830;
+    --diagram-node-accent-bg: #22303f;
+    --diagram-edge: #9e9e9e;
+    --diagram-relay: #f0c674;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.55;
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+}
+header, nav, main, footer { max-width: 960px; margin-left: auto; margin-right: auto; }
+main section { margin-top: 3rem; }
+
+h1 { font-size: 2rem; margin: .2rem 0 .3rem; }
+h2 { font-size: 1.3rem; margin: 0 0 .8rem; border-bottom: 1px solid var(--border); padding-bottom: .35rem; }
+h3 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; margin: 1.6rem 0 .5rem; }
+h4 { font-size: 1rem; font-weight: 600; margin: 1.2rem 0 .4rem; }
+h1, h2, h3, h4 { color: var(--heading-fg); }
+a { color: var(--accent); }
+small, figcaption, th { color: var(--fg-muted); }
+p, li { max-width: 78ch; }
+
+code { background: var(--code-bg); color: var(--code-fg); padding: .1em .35em; border-radius: 3px; font-size: .9em; }
+pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 6px; padding: .8rem 1rem; overflow-x: auto; font-size: .9em; line-height: 1.5; }
+pre code { background: none; color: var(--fg); padding: 0; font-size: 1em; }
+
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95em; }
+th, td { border: 1px solid var(--border); padding: .45rem .65rem; text-align: left; vertical-align: top; }
+th { font-size: .9em; font-weight: 600; }
+td { max-width: 42ch; }
+
+aside { background: var(--aside-bg); border: 1px solid var(--border); border-radius: 4px; padding: .7rem 1rem; margin: 1rem 0; max-width: 78ch; }
+aside.success { background: var(--success-bg); }
+aside.warning { background: var(--warning-bg); }
+aside.error   { background: var(--error-bg); }
+aside p:first-child { margin-top: 0; }
+aside p:last-child  { margin-bottom: 0; }
+aside :is(strong, b):first-child         { color: var(--heading-fg); }
+aside.success :is(strong, b):first-child { color: var(--success); }
+aside.warning :is(strong, b):first-child { color: var(--warning); }
+aside.error   :is(strong, b):first-child { color: var(--error); }
+
+figure { margin: 1.4rem 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font-size: .9em; margin-top: .4rem; }
+
+nav.toc { border: 1px solid var(--border); border-radius: 6px; padding: .8rem 1.2rem; margin-top: 1.4rem; }
+nav.toc ol { margin: .3rem 0; padding-left: 1.4rem; columns: 2; column-gap: 2.5rem; }
+nav.toc li { margin: .15rem 0; break-inside: avoid; }
+
+details { border: 1px solid var(--border); border-radius: 6px; padding: .6rem 1rem; margin: 1rem 0; }
+details summary { cursor: pointer; font-weight: 600; color: var(--heading-fg); }
+details[open] summary { margin-bottom: .6rem; }
+
+.meta { color: var(--fg-muted); font-size: .9em; }
+.pill { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: .05em .7em; font-size: .8em; color: var(--fg-muted); margin-right: .4rem; }
+
+footer { margin-top: 4rem; border-top: 1px solid var(--border); padding-top: 1rem; color: var(--fg-muted); font-size: .9em; }
+
+@media (max-width: 720px) {
+  body { padding: 1.2rem .8rem 3rem; }
+  nav.toc ol { columns: 1; }
+  td { max-width: none; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <p class="meta">Vlervtifacts · design doc · draft for review · 2026-08-15</p>
+  <h1>Remote Control</h1>
+  <p><strong>Beam</strong> (v1): send an artifact from one Vlervcode instance to another with one link — peer-to-peer, end-to-end encrypted, no VPN, no hosting.<br>
+  <strong>Scope</strong> (v2): a persistent paired session — browse and live-follow the artifacts open on another machine's Vlervcode, and drive it remotely.</p>
+  <p>
+    <span class="pill">status: proposal</span>
+    <span class="pill">transport: iroh (QUIC, hole-punched)</span>
+    <span class="pill">scope: macOS, Tauri 2 backend</span>
+  </p>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#summary">Summary</a></li>
+    <li><a href="#constraints">Problem &amp; constraints</a></li>
+    <li><a href="#approach">Approach: why iroh</a></li>
+    <li><a href="#foundation">Shared foundation</a></li>
+    <li><a href="#beam">v1 — Beam</a></li>
+    <li><a href="#scope">v2 — Scope</a></li>
+    <li><a href="#security">Security &amp; threat model</a></li>
+    <li><a href="#surfaces">New surface inventory</a></li>
+    <li><a href="#plan">Implementation plan</a></li>
+    <li><a href="#risks">Risks &amp; open questions</a></li>
+    <li><a href="#beyond">Beyond v2</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="summary">
+  <h2>1 · Summary</h2>
+  <p>Vlervtifacts is deep-link addressable, live-reloading, and read-only — on <em>one</em> machine. This design extends all three properties across machines. The transport is <a href="https://iroh.computer">iroh</a>, a Rust P2P library that gives every app instance a cryptographic identity (an ed25519 <code>NodeId</code>) and dials direct, end-to-end-encrypted QUIC connections between instances by hole-punching through NATs, with encrypted public relays as fallback. No VPN to configure, no server that stores content, no public URL that exists.</p>
+  <p>Two features ship on that foundation, in order:</p>
+  <ul>
+    <li><strong>Beam (v1)</strong> — a one-shot, content-addressed artifact transfer. The sender's share popover produces a ticket wrapped in a <code>vlerv://receive?ticket=…</code> deep link. It travels over any channel you already use (Slack, iMessage, AirDrop of a text snippet). The receiver clicks it, confirms, and the artifact streams in — integrity-verified by its BLAKE3 hash — and opens in a tab.</li>
+    <li><strong>Scope (v2)</strong> — a durable pairing between two instances. A paired peer shows up as a sidebar drawer: its open tabs, bookmarks and recents, fetchable on demand, with live reload bridged across the wire. A <code>control</code>-scoped peer can also push: open an artifact on the remote instance — the literal "remote control".</li>
+  </ul>
+  <p>Everything reuses the app's existing load-bearing machinery: the <code>security.rs</code> <code>RootSet</code> gate guards every remote read, the watcher bus drives cross-machine live reload, the sandboxed-iframe pipeline renders remote content exactly as untrusted as it renders local content, and <code>deeplink.rs</code> grows new verbs it was already structured to receive.</p>
+</section>
+
+<section id="constraints">
+  <h2>2 · Problem &amp; constraints</h2>
+  <p>The user runs Vlervcode on more than one Mac, and occasionally wants a colleague to see an artifact. Today the options are bad: a VPN or Tailscale-style overlay (setup, a system-level agent, an ongoing trust decision), or uploading the artifact to a hosting service (the artifact becomes a public-ish URL on someone else's infrastructure). Both violate the product's nature — local files, private by default, zero services.</p>
+  <h3>Hard constraints</h3>
+  <table>
+    <thead><tr><th>Constraint</th><th>Consequence for the design</th></tr></thead>
+    <tbody>
+      <tr><td><strong>No VPN / overlay network setup</strong></td><td>Connectivity must be application-level: NAT traversal built into the app itself.</td></tr>
+      <tr><td><strong>No public hosting</strong></td><td>Content never rests on a server. Any intermediary may carry only ciphertext, transiently.</td></tr>
+      <tr><td><strong>End-to-end private</strong></td><td>Encryption keys live only in the two app instances. Relay operators see connection metadata, never content.</td></tr>
+      <tr><td><strong>Read-only product</strong> (PRODUCT.md principle 4)</td><td>The remote API exposes reads only. The one write the app performs — persisting a received artifact — stays inside its own state directory, <code>~/Library/Application Support/Vlerv/</code>.</td></tr>
+      <tr><td><strong>The webview is privileged; artifact content is untrusted</strong></td><td>All networking lives in the Rust core. The webview gains IPC commands, never network capability. Received content enters the existing sandboxed render pipeline.</td></tr>
+      <tr><td><strong>No telemetry, local-first</strong></td><td>The networking stack boots lazily — the app makes zero network connections until the user invokes a remote feature.</td></tr>
+    </tbody>
+  </table>
+  <aside class="warning"><p><strong>Posture change.</strong> This is the app's first networked feature. Today Vlervcode dials nothing. The lazy-boot rule above is not an optimization — it is the contract that keeps "local-first" true: no beam, no scope, no sockets.</p></aside>
+</section>
+
+<section id="approach">
+  <h2>3 · Approach: why iroh</h2>
+  <p>Candidates evaluated against the constraints:</p>
+  <table>
+    <thead><tr><th>Option</th><th>No VPN</th><th>No hosting</th><th>E2E private</th><th>Fits the stack</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td><strong>iroh</strong> (embedded Rust library: QUIC + hole-punching + encrypted relay fallback)</td><td>✔</td><td>✔ relays carry ciphertext transiently</td><td>✔ keys are the two NodeIds</td><td>✔ native Rust, embeds in the Tauri core</td><td><strong>Chosen</strong></td></tr>
+      <tr><td>Tailscale / WireGuard overlay</td><td>✘ it <em>is</em> the VPN</td><td>✔</td><td>✔</td><td>system-level agent, per-machine onboarding</td><td>Excluded by constraint</td></tr>
+      <tr><td>Cloudflare Tunnel / ngrok + auth</td><td>✔</td><td>✘ traffic terminates at the provider; a public URL exists</td><td>✘ TLS terminates at the edge</td><td>external daemon</td><td>Rejected</td></tr>
+      <tr><td>WebRTC data channels</td><td>✔</td><td>✔ (STUN/TURN)</td><td>✔ (DTLS)</td><td>heavy C/C++ deps or immature Rust bindings; signaling server to build and run ourselves</td><td>Workable but more moving parts than iroh for the same result</td></tr>
+      <tr><td>Syncthing-style folder sync</td><td>✔</td><td>✔</td><td>✔</td><td>syncs directories, not sessions — solves replication, not "what is open over there"</td><td>Different feature; revisit for workspace mirroring someday</td></tr>
+      <tr><td>Custom relay server + E2E crypto</td><td>✔</td><td>△ we'd run the relay</td><td>✔ if we build it right</td><td>we own NAT traversal, framing, crypto review</td><td>Reinventing iroh, worse</td></tr>
+    </tbody>
+  </table>
+  <p>iroh wins on fit: it is a Rust library, so it compiles into the existing Tauri binary; identity, encryption, NAT traversal, connection lifecycle and content-addressed blob transfer (<code>iroh-blobs</code>) are all solved layers; and its <code>sendme</code> tool is a working reference implementation of exactly Beam's shape. n0 operates free public relays; the relay URL is a config field, so a self-hosted <code>iroh-relay</code> remains an escape hatch if the trust calculus ever changes.</p>
+  <aside class="note"><p><strong>Version pin.</strong> iroh is on its 1.0 release line but the API churned significantly through 0.x. Pin an exact version in <code>Cargo.toml</code>, wrap all iroh types behind our own <code>remote::endpoint</code> module boundary, and treat upgrades as deliberate migrations.</p></aside>
+
+  <figure>
+    <svg viewBox="0 0 900 380" role="img" aria-label="Network topology: two Vlervcode instances connect directly via hole-punched QUIC; an encrypted relay is the fallback path; the ticket travels out-of-band over Slack or iMessage">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--diagram-edge)"/>
+        </marker>
+        <marker id="arrowRelay" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--diagram-relay)"/>
+        </marker>
+      </defs>
+
+      <!-- Relay -->
+      <rect x="360" y="20" width="180" height="64" rx="8" fill="var(--diagram-node-bg)" stroke="var(--diagram-relay)" stroke-dasharray="5 4"/>
+      <text x="450" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">iroh relay</text>
+      <text x="450" y="66" text-anchor="middle" fill="var(--fg-muted)" font-size="11">fallback only · sees ciphertext</text>
+
+      <!-- Machine A -->
+      <rect x="30" y="130" width="300" height="130" rx="10" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="180" y="156" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">Mac Studio — Vlervcode</text>
+      <rect x="55" y="172" width="250" height="34" rx="6" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="180" y="194" text-anchor="middle" fill="currentColor" font-size="12">iroh Endpoint · NodeId A (ed25519)</text>
+      <text x="180" y="236" text-anchor="middle" fill="var(--fg-muted)" font-size="11">artifacts on disk · watcher · tabs</text>
+
+      <!-- Machine B -->
+      <rect x="570" y="130" width="300" height="130" rx="10" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="720" y="156" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">MacBook — Vlervcode</text>
+      <rect x="595" y="172" width="250" height="34" rx="6" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="720" y="194" text-anchor="middle" fill="currentColor" font-size="12">iroh Endpoint · NodeId B (ed25519)</text>
+      <text x="720" y="236" text-anchor="middle" fill="var(--fg-muted)" font-size="11">remote drawer · received artifacts</text>
+
+      <!-- Direct path -->
+      <line x1="330" y1="195" x2="570" y2="195" stroke="var(--diagram-edge)" stroke-width="2.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+      <text x="450" y="184" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">direct QUIC — hole-punched, E2E encrypted</text>
+
+      <!-- Relay fallback paths -->
+      <line x1="220" y1="130" x2="372" y2="84" stroke="var(--diagram-relay)" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowRelay)"/>
+      <line x1="680" y1="130" x2="528" y2="84" stroke="var(--diagram-relay)" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowRelay)"/>
+
+      <!-- Side channel -->
+      <rect x="300" y="300" width="300" height="52" rx="8" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)" stroke-dasharray="2 3"/>
+      <text x="450" y="322" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">any messaging channel (Slack, iMessage…)</text>
+      <text x="450" y="340" text-anchor="middle" fill="var(--fg-muted)" font-size="11">carries only the vlerv://receive?ticket=… link</text>
+      <line x1="180" y1="260" x2="308" y2="300" stroke="var(--diagram-edge)" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrow)"/>
+      <line x1="592" y1="300" x2="720" y2="260" stroke="var(--diagram-edge)" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Fig. 1 — Topology. Content moves only on the solid edge (or its dashed encrypted fallback). The ticket link is the only thing that ever touches a third-party service, and it is a capability string, not the content.</figcaption>
+  </figure>
+</section>
+
+<section id="foundation">
+  <h2>4 · Shared foundation</h2>
+  <p>Both features stand on one new backend subsystem, <code>src-tauri/src/remote/</code>:</p>
+  <pre><code>src-tauri/src/remote/
+├── mod.rs        // feature façade; lazy boot; Tauri command handlers
+├── endpoint.rs   // iroh Endpoint + Router lifecycle; identity persistence
+├── beam.rs       // v1: stage / serve / fetch one artifact (iroh-blobs)
+├── scope.rs      // v2: session protocol server + client
+├── peers.rs      // v2: trusted-peer store, pairing, scopes, revocation
+└── proto.rs      // wire types (serde + postcard), protocol version consts</code></pre>
+  <h3>Identity</h3>
+  <p>On first use of any remote feature, the app generates an ed25519 keypair and persists the secret key at <code>~/Library/Application Support/Vlerv/remote/identity.key</code> (mode 0600). The public half is the instance's <code>NodeId</code> — its stable, dialable address. Each install gets its own identity; a human-readable device name (default: the Mac's hostname) travels in every handshake.</p>
+  <h3>Endpoint lifecycle</h3>
+  <ul>
+    <li><strong>Lazy boot.</strong> The endpoint starts on the first beam/scope action, or at launch <em>only if</em> the peer store is non-empty and the (new) <code>preferences.remote_listen</code> flag is on. Otherwise: zero sockets.</li>
+    <li><strong>One endpoint, two protocols.</strong> An iroh <code>Router</code> multiplexes by ALPN: <code>iroh-blobs</code>' own ALPN for content transfer, and <code>vlerv/scope/0</code> for the v2 session protocol. Bumping the trailing integer is the protocol-break mechanism.</li>
+    <li><strong>Firewall reality.</strong> An unnotarized app accepting inbound connections triggers the macOS application-firewall prompt on some setups. Document it; outbound-initiated (dial-out) flows — which is all of Beam from the receiver's side — do not.</li>
+  </ul>
+  <h3>One security gate, reused</h3>
+  <p>Every path that a remote peer can cause this app to read flows through the same <code>security::canonicalize_and_check_root</code> gate that local IPC already uses. Remote access never widens the readable set — it can only see what the local UI could see, filtered further by per-peer scope (§6). This is the single most important line in the design.</p>
+</section>
+
+<section id="beam">
+  <h2>5 · v1 — Beam</h2>
+  <p><em>One artifact, one link, one click.</em> Beam is deliberately session-free: no pairing, no persistent state on either side beyond the received file. It exists to make "send this report to my laptop / to a colleague" cost three seconds.</p>
+
+  <h3>Sender flow</h3>
+  <ol>
+    <li>The share popover (next to the existing share-sheet and Open-in-Slack buttons in <code>Toolbar.tsx</code>) gains <strong>"Beam to Vlervcode…"</strong>. Also available from file-row context menus and as <code>vlerv beam &lt;path&gt;</code> in the CLI.</li>
+    <li>The backend canonicalizes the path through the share module's existing <code>resolve_paths</code> policy (external files shareable on purpose, same as the share sheet), stages the file into an <code>iroh-blobs</code> store, and computes its BLAKE3 hash.</li>
+    <li>It boots the endpoint if needed and mints a <strong>blob ticket</strong>: node address info + hash + format, serialized as one URL-safe string.</li>
+    <li>The frontend receives <code>{ ticket, link }</code> where <code>link</code> is
+      <pre><code>vlerv://receive?ticket=&lt;blob-ticket&gt;&amp;name=report.html&amp;size=482133</code></pre>
+      and offers: copy link, native share sheet, Open in Slack. <code>name</code>/<code>size</code> are display hints for the receiver's confirm dialog — the ticket's hash, not the hints, is the truth.</li>
+    <li>The sender keeps serving while the app runs. A small "beaming" indicator lists active offers with fetch counts and a <strong>Stop</strong> action (instant revocation — the ticket dies with the offer).</li>
+  </ol>
+
+  <h3>Receiver flow</h3>
+  <ol>
+    <li>The deep link arrives through the existing LaunchServices → <code>deeplink.rs</code> route. A new <code>Receive { ticket, name, size }</code> intent joins <code>Open</code>/<code>Reveal</code> (the parser's <code>UnknownVerb</code>/<code>NotYetImplemented</code> errors were built for this day).</li>
+    <li>A confirm dialog shows: file name, size, the sender's NodeId fingerprint (and device name once connected), and where the file will land. Nothing transfers before confirmation — a hostile link can't make the app fetch.</li>
+    <li>On accept, the app dials the ticket, streams the blob with verified chunks (BLAKE3 — a corrupted or substituted stream fails, it cannot render), and writes it to
+      <pre><code>~/Library/Application Support/Vlerv/received/2026-08-15/report.html</code></pre></li>
+    <li>The file opens in a tab through the normal pipeline, marked with a <strong>beamed</strong> badge (sibling of the existing <em>external</em> badge). A "Received" entry point lists past beams. The read-only principle holds: the app wrote inside its own state dir, never in the user's tree.</li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 900 330" role="img" aria-label="Beam sequence: sender stages and mints a ticket, the link travels over Slack, receiver confirms and fetches a verified stream">
+      <defs>
+        <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--diagram-edge)"/>
+        </marker>
+      </defs>
+      <!-- lanes -->
+      <rect x="40" y="20" width="240" height="40" rx="8" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="160" y="45" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Sender</text>
+      <rect x="620" y="20" width="240" height="40" rx="8" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="740" y="45" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">Receiver</text>
+      <line x1="160" y1="60" x2="160" y2="310" stroke="var(--diagram-edge)" stroke-width="1" stroke-dasharray="3 4"/>
+      <line x1="740" y1="60" x2="740" y2="310" stroke="var(--diagram-edge)" stroke-width="1" stroke-dasharray="3 4"/>
+
+      <!-- step 1 -->
+      <rect x="52" y="82" width="216" height="34" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="160" y="104" text-anchor="middle" fill="currentColor" font-size="12">stage blob · mint ticket</text>
+
+      <!-- link over side channel -->
+      <line x1="270" y1="140" x2="628" y2="140" stroke="var(--diagram-edge)" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrow2)"/>
+      <text x="450" y="130" text-anchor="middle" fill="currentColor" font-size="12">vlerv://receive?ticket=… via Slack / share sheet</text>
+
+      <!-- step: confirm -->
+      <rect x="632" y="158" width="216" height="34" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="740" y="180" text-anchor="middle" fill="currentColor" font-size="12">confirm dialog · user accepts</text>
+
+      <!-- dial back -->
+      <line x1="628" y1="218" x2="272" y2="218" stroke="var(--diagram-edge)" stroke-width="2.5" marker-end="url(#arrow2)"/>
+      <text x="450" y="208" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">dial ticket — direct QUIC (relay fallback)</text>
+
+      <!-- stream -->
+      <line x1="272" y1="252" x2="628" y2="252" stroke="var(--diagram-edge)" stroke-width="2.5" marker-end="url(#arrow2)"/>
+      <text x="450" y="242" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">BLAKE3-verified blob stream</text>
+
+      <!-- step: open -->
+      <rect x="632" y="272" width="216" height="34" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="740" y="294" text-anchor="middle" fill="currentColor" font-size="12">save to received/ · open in tab</text>
+    </svg>
+    <figcaption>Fig. 2 — Beam, end to end. The side channel carries a capability string; content moves only on the encrypted P2P edge.</figcaption>
+  </figure>
+
+  <h3>Semantics &amp; edge cases</h3>
+  <table>
+    <thead><tr><th>Case</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>Sender quits before fetch</td><td>Fetch fails with a clear "sender offline" state; the receiver can retry from the same dialog when the sender is back. A ticket is an offer, not an escrow.</td></tr>
+      <tr><td>File changes after staging</td><td>The ticket pins the hash at mint time — the receiver gets exactly what the sender saw. Re-beam to send the new version (cheap: re-hash + new ticket).</td></tr>
+      <tr><td>Ticket forwarded to a third party</td><td>Capability semantics: possession grants fetch, like a secret link. Mitigations: offers default to a 24 h TTL and an optional single-fetch mode; Stop revokes instantly; v2 adds lock-to-peer beams.</td></tr>
+      <tr><td>Artifact with relative assets</td><td>v1 ships single-file only (the self-contained-HTML convention makes this the common case). A follow-up uses iroh-blobs collections to beam a file set as one ticket.</td></tr>
+      <tr><td>Oversized content</td><td>Reuse the reader's existing size-cap philosophy: warn above 20 MiB, hard-cap at 256 MiB for v1.</td></tr>
+      <tr><td>No Vlervcode on the receiving end</td><td>Out of scope, deliberately: the feature's charm is instance-to-instance. The ticket string still works with <code>sendme receive</code> for emergencies, since the blob protocol is standard.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="scope">
+  <h2>6 · v2 — Scope</h2>
+  <p><em>A periscope into your other machine's reading room.</em> Scope turns the one-shot trick into a relationship: two instances pair once, then either can browse what the other has open, follow along live, and — with permission — drive it.</p>
+
+  <h3>Pairing</h3>
+  <ol>
+    <li>On the host: <strong>Settings → Remote → "Pair a device…"</strong> shows a pairing ticket (node address + one-time pairing token) as a QR code and a copyable <code>vlerv://pair?ticket=…</code> link. This is finally a concrete reason to mount the Settings surface that PRODUCT.md lists as an open decision.</li>
+    <li>The other instance opens the link (or scans the QR with the Mac's camera — nice-to-have). Both machines display the same <strong>six-word fingerprint</strong> derived from a hash of both NodeIds; the user confirms it matches on both screens. This kills man-in-the-middle at pairing time in a way a human can actually verify.</li>
+    <li>Each side persists the other in <code>~/Library/Application Support/Vlerv/remote/peers.json</code>: NodeId, device name, granted scope, paired-at, last-seen. Revocation is deleting the entry — the scope server rejects non-peer NodeIds at the handshake, so revocation is immediate.</li>
+  </ol>
+
+  <h3>Scopes — what a peer may do</h3>
+  <table>
+    <thead><tr><th>Scope</th><th>Grants</th><th>Default for</th></tr></thead>
+    <tbody>
+      <tr><td><code>view-open</code></td><td>List open tabs, bookmarks, recents; fetch exactly those artifacts; subscribe to their change events.</td><td>A colleague's paired instance</td></tr>
+      <tr><td><code>browse</code></td><td><code>view-open</code> + walk the workspace tree and fetch any file the <code>RootSet</code> admits (same ignore/hidden/symlink policy as ⌘P's <code>list_files_recursive</code>).</td><td>Your own second machine</td></tr>
+      <tr><td><code>control</code></td><td><code>browse</code> + push: open/focus an artifact on the host, toggle its reader mode. The literal remote control — drive the Studio's big screen from the sofa laptop.</td><td>Opt-in, own machines only</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Wire protocol</h3>
+  <p>One QUIC bi-stream per session under ALPN <code>vlerv/scope/0</code>, length-prefixed <a href="https://docs.rs/postcard">postcard</a> frames of a versioned serde enum. Content never rides the control stream: <code>GetArtifact</code> answers with a BLAKE3 hash, and the bytes move over the iroh-blobs protocol — verified, resumable, deduplicated (an artifact fetched twice, or beamed earlier, costs nothing the second time).</p>
+  <pre><code>// proto.rs (sketch)
+enum Req  { Hello { proto: u32, device: String },
+            ListTabs, ListBookmarks, ListRecents, ListTree { path: String },
+            GetArtifact { path: String },        // → ArtifactMeta { hash, size, mtime }
+            Subscribe,                           // → server starts pushing Event frames
+            OpenOnHost { path: String, reader_mode: bool } }  // control scope only
+
+enum Event { TabOpened { path }, TabClosed { path }, TabActivated { path },
+             FileChanged { path, hash },         // re-render trigger + new content addr
+             FileRemoved { path } }</code></pre>
+
+  <h3>Host side: bridging app state to the wire</h3>
+  <p>Two sources feed the scope server, one per direction of the existing architecture:</p>
+  <ul>
+    <li><strong>Filesystem truth (already in Rust).</strong> The watcher's events — the same stream that becomes <code>vlerv://file-changed</code> — additionally fan out to subscribed peers as <code>Event::FileChanged</code>, with the file re-hashed so the event carries the new content address.</li>
+    <li><strong>Session truth (lives in React).</strong> The tabs reducer (<code>src/state/tabs.ts</code>) is the authority on what is open. A thin effect publishes the open-tab list to the backend (<code>remote_publish_tabs</code> command) on every commit — the same shape the app already persists into <code>panes.tabs</code>. The backend caches it for <code>ListTabs</code> and diffs it into <code>TabOpened/Closed/Activated</code> events.</li>
+  </ul>
+  <p>Every <code>GetArtifact</code> and <code>ListTree</code> passes through <code>security::canonicalize_and_check_root</code> plus the peer's scope filter before a single byte is read.</p>
+
+  <h3>Client side: the remote drawer</h3>
+  <p>A paired peer that is online appears as a fourth sidebar drawer — <strong>"Remote: Mac Studio"</strong> — alongside Bookmarks / Recent / Files, built from the same <code>SidebarSection</code> shape. It lists the peer's open tabs (live), and under <code>browse</code> scope, a lazy tree. Presence (online/offline, connecting) shows in the drawer header.</p>
+  <p>Opening a remote entry creates a tab whose address is <code>vlerv-remote://&lt;peer-id&gt;/abs/path</code>. The fetch lands in a content-addressed cache (<code>remote/cache/&lt;hash&gt;</code>), and the render pipeline consumes it exactly like a local <code>FilePayload</code> — sandboxed iframe, injected <code>&lt;base href&gt;</code> disabled for remote (no relative-asset resolution against a machine that isn't there), zoom, scroll memory keyed by <code>tabId::address</code>, all for free.</p>
+  <p><strong>Live reload crosses the wire.</strong> An incoming <code>FileChanged</code> re-fetches by new hash and injects a synthetic event into the watcher bus (<code>src/state/watcher-bus.tsx</code>) — the debounce, tab-reload and scroll-restoration machinery downstream doesn't know or care that the file lives on another Mac. Watching Claude rewrite a report <em>on the other machine</em>, live, with scroll position held: that is the demo.</p>
+  <p><strong>Follow mode.</strong> One toggle on the drawer: the local instance mirrors the host's active tab, switching as it switches — a presentation mode for pair-reading a review with a colleague, or for using the laptop as a teleprompter of the Studio.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 430" role="img" aria-label="Scope architecture: on the host, tabs state and the file watcher feed a scope server behind the RootSet gate; on the client, a scope client feeds the remote drawer, blob cache and watcher bus; control and blob streams connect them">
+      <defs>
+        <marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--diagram-edge)"/>
+        </marker>
+      </defs>
+
+      <!-- Host box -->
+      <rect x="20" y="20" width="390" height="390" rx="10" fill="none" stroke="var(--diagram-edge)"/>
+      <text x="215" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">Host (serves)</text>
+
+      <rect x="45" y="70" width="160" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="125" y="88" text-anchor="middle" fill="currentColor" font-size="11.5">tabs reducer (React)</text>
+      <text x="125" y="104" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">remote_publish_tabs →</text>
+
+      <rect x="45" y="140" width="160" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="125" y="158" text-anchor="middle" fill="currentColor" font-size="11.5">watcher.rs</text>
+      <text x="125" y="174" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">fs events + re-hash</text>
+
+      <rect x="240" y="95" width="150" height="60" rx="6" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="315" y="120" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">scope server</text>
+      <text x="315" y="138" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">peers.json allowlist</text>
+
+      <rect x="240" y="190" width="150" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--warning)"/>
+      <text x="315" y="208" text-anchor="middle" fill="currentColor" font-size="11.5">security.rs RootSet</text>
+      <text x="315" y="224" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">+ per-peer scope filter</text>
+
+      <rect x="240" y="260" width="150" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="315" y="278" text-anchor="middle" fill="currentColor" font-size="11.5">iroh-blobs store</text>
+      <text x="315" y="294" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">content-addressed</text>
+
+      <line x1="205" y1="92" x2="238" y2="108" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="205" y1="162" x2="238" y2="140" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="315" y1="155" x2="315" y2="188" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="315" y1="234" x2="315" y2="258" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+
+      <!-- Client box -->
+      <rect x="490" y="20" width="390" height="390" rx="10" fill="none" stroke="var(--diagram-edge)"/>
+      <text x="685" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">Client (views)</text>
+
+      <rect x="510" y="95" width="150" height="60" rx="6" fill="var(--diagram-node-accent-bg)" stroke="var(--diagram-edge)"/>
+      <text x="585" y="120" text-anchor="middle" fill="currentColor" font-size="12" font-weight="600">scope client</text>
+      <text x="585" y="138" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">presence · subscribe</text>
+
+      <rect x="705" y="70" width="155" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="782" y="88" text-anchor="middle" fill="currentColor" font-size="11.5">Remote drawer</text>
+      <text x="782" y="104" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">SidebarSection shape</text>
+
+      <rect x="705" y="140" width="155" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="782" y="158" text-anchor="middle" fill="currentColor" font-size="11.5">blob cache</text>
+      <text x="782" y="174" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">remote/cache/&lt;hash&gt;</text>
+
+      <rect x="705" y="210" width="155" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="782" y="228" text-anchor="middle" fill="currentColor" font-size="11.5">watcher bus</text>
+      <text x="782" y="244" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">synthetic file-changed</text>
+
+      <rect x="705" y="280" width="155" height="44" rx="6" fill="var(--diagram-node-bg)" stroke="var(--diagram-edge)"/>
+      <text x="782" y="298" text-anchor="middle" fill="currentColor" font-size="11.5">render pipeline</text>
+      <text x="782" y="314" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">sandboxed iframe, as ever</text>
+
+      <line x1="660" y1="108" x2="703" y2="94" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="660" y1="135" x2="703" y2="155" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="782" y1="184" x2="782" y2="208" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+      <line x1="782" y1="254" x2="782" y2="278" stroke="var(--diagram-edge)" stroke-width="1.5" marker-end="url(#arrow3)"/>
+
+      <!-- streams between boxes -->
+      <line x1="410" y1="118" x2="508" y2="118" stroke="var(--diagram-edge)" stroke-width="2.5" marker-end="url(#arrow3)" marker-start="url(#arrow3)"/>
+      <text x="459" y="108" text-anchor="middle" fill="currentColor" font-size="11.5" font-weight="600">control stream</text>
+      <text x="459" y="134" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">vlerv/scope/0</text>
+
+      <line x1="410" y1="282" x2="703" y2="163" stroke="var(--diagram-edge)" stroke-width="2.5" marker-end="url(#arrow3)"/>
+      <text x="520" y="238" text-anchor="middle" fill="currentColor" font-size="11.5" font-weight="600">blob stream (by hash)</text>
+    </svg>
+    <figcaption>Fig. 3 — Scope data flow. Metadata rides the control stream; content rides the verified blob stream; the client's downstream machinery is untouched — remote files impersonate local ones at the watcher-bus boundary.</figcaption>
+  </figure>
+
+  <aside class="success"><p><strong>Why this is the "definitive feature".</strong> Each of the product's three positioning properties extends across machines: deep-link addressability (tickets and pair links are <code>vlerv://</code> URLs), live reload (FileChanged crosses the wire into the same bus), and the read-only tree (scopes + RootSet). Nothing new is bolted on; the existing identity of the app is what gets networked.</p></aside>
+</section>
+
+<section id="security">
+  <h2>7 · Security &amp; threat model</h2>
+  <table>
+    <thead><tr><th>Threat</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Relay operator (n0) reads content</td><td>Impossible by construction: QUIC session keys derive from the two endpoints' keys; relays forward ciphertext. Residual: connection metadata (who talked to whom, when, volume). Escape hatch: self-hosted <code>iroh-relay</code>, URL in preferences.</td></tr>
+      <tr><td>Beam ticket leaks (forwarded Slack message)</td><td>Capability semantics are the design, not a bug — but bounded: default 24 h TTL, optional single-fetch, instant Stop, and (post-pairing) lock-to-peer beams that check the fetcher's NodeId.</td></tr>
+      <tr><td>Hostile <code>vlerv://receive</code> link (drive-by fetch)</td><td>No fetch before an explicit confirm dialog showing sender fingerprint, name, size. Parser hardening (strict percent-decoding, null-byte rejection) already exists in <code>deeplink.rs</code>.</td></tr>
+      <tr><td>Malicious artifact content</td><td>Unchanged trust model: artifact content was always untrusted. Sandboxed iframe, SVG script-stripping, image caps — remote content enters the same pipeline with the same badge-level provenance UI.</td></tr>
+      <tr><td>Pairing man-in-the-middle</td><td>One-time pairing token in the ticket + mutual six-word fingerprint confirmation on both screens before the peer is persisted.</td></tr>
+      <tr><td>Stranger dials the scope port</td><td>Handshake rejects any NodeId not in <code>peers.json</code> before any request is parsed. QUIC itself already authenticated the NodeId — there is nothing to spoof.</td></tr>
+      <tr><td>Path traversal via <code>GetArtifact</code>/<code>ListTree</code></td><td>The same <code>canonicalize_and_check_root</code> gate as local IPC, then the scope filter. Symlink/hidden/ignore policy identical to ⌘P's walker. Error wording reuses the no-existence-leak convention from the share module.</td></tr>
+      <tr><td>Abuse of <code>control</code> scope</td><td><code>control</code> can only invoke the same intents a deep link can (open, reveal, reader mode) — it inherits the deep-link security posture, including RootSet classification. It cannot read results, write, or execute.</td></tr>
+      <tr><td>Resource exhaustion</td><td>Per-peer concurrent-stream and bandwidth caps; 20 MiB soft / 256 MiB hard size caps; subscription fan-out is bounded by the peer count, which is bounded by the human who paired them.</td></tr>
+      <tr><td>Identity key theft (disk read)</td><td>Key file mode 0600 inside the app's state dir. Future hardening: move the secret to the macOS Keychain. Revocation from the other side is deleting the peer entry.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="surfaces">
+  <h2>8 · New surface inventory</h2>
+  <h3>Tauri commands (webview → core)</h3>
+  <table>
+    <thead><tr><th>Command</th><th>Phase</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>beam_offer(path)</code> / <code>beam_stop(offer_id)</code> / <code>beam_list_offers()</code></td><td>v1</td><td>Stage + mint ticket; revoke; indicator state.</td></tr>
+      <tr><td><code>beam_receive(ticket)</code></td><td>v1</td><td>Post-confirm fetch; progress via events.</td></tr>
+      <tr><td><code>remote_list_peers()</code> / <code>remote_pair_begin()</code> / <code>remote_pair_complete(ticket)</code> / <code>remote_unpair(node_id)</code> / <code>remote_set_scope(node_id, scope)</code></td><td>v2</td><td>Peer lifecycle.</td></tr>
+      <tr><td><code>remote_publish_tabs(tabs)</code></td><td>v2</td><td>Host bridge from the tabs reducer.</td></tr>
+      <tr><td><code>remote_list_tabs(peer)</code> / <code>remote_list_tree(peer, path)</code> / <code>remote_get(peer, path)</code> / <code>remote_open_on_host(peer, path)</code></td><td>v2</td><td>Client-side session calls.</td></tr>
+    </tbody>
+  </table>
+  <h3>Events (core → webview)</h3>
+  <p><code>vlerv://beam-progress</code>, <code>vlerv://beam-received</code>, <code>vlerv://remote-presence</code>, <code>vlerv://remote-event</code> (the re-emitted <code>Event</code> frames). All join the frozen <code>vlerv://*</code> event namespace.</p>
+  <h3>Deep-link verbs</h3>
+  <p><code>vlerv://receive?ticket=…&amp;name=…&amp;size=…</code> (v1), <code>vlerv://pair?ticket=…</code> (v2). Both added to <code>DeepLinkIntent</code> with the same strict parsing and tests as <code>open</code>/<code>reveal</code>.</p>
+  <h3>State &amp; config</h3>
+  <p>New keys under the existing settings schema: <code>preferences.remote_listen: bool</code> (default false), <code>preferences.relay_url: string | null</code> (null = n0 defaults), <code>preferences.beam_ttl_hours</code>. New files under <code>Application Support/Vlerv/remote/</code>: <code>identity.key</code>, <code>peers.json</code>, <code>blobs/</code>, <code>cache/</code>, <code>received/</code>.</p>
+  <h3>Dependencies</h3>
+  <p><code>iroh</code>, <code>iroh-blobs</code>, <code>postcard</code> (plus existing <code>serde</code>). Binary-size impact expected in the several-MB range — acceptable for a local .app; measure at M1 and record in STATUS.md.</p>
+  <h3>Frontend</h3>
+  <p><code>src/state/remote.tsx</code> (peers, presence, offers), <code>src/components/RemoteDrawer.tsx</code>, <code>BeamDialog.tsx</code> (send + receive faces), a beamed badge in the toolbar, share-popover and context-menu entries, and the Settings → Remote pane. CLI grows <code>vlerv beam &lt;path&gt;</code> and <code>vlerv receive &lt;ticket&gt;</code>.</p>
+</section>
+
+<section id="plan">
+  <h2>9 · Implementation plan</h2>
+  <table>
+    <thead><tr><th>Milestone</th><th>Deliverable</th><th>Proof</th><th>Rough size</th></tr></thead>
+    <tbody>
+      <tr><td><strong>M0 — Spike</strong></td><td>Scratch binary: mint ticket on the Studio, fetch on the MacBook, across different networks (one on a phone hotspot).</td><td>NAT traversal validated on the user's real machines; direct-vs-relay path logged.</td><td>1–2 days</td></tr>
+      <tr><td><strong>M1 — Beam core</strong></td><td><code>remote/</code> module, lazy endpoint, <code>beam_offer</code>/<code>beam_receive</code>, <code>receive</code> deep-link verb, received/ storage.</td><td><code>cargo test</code>: ticket round-trip, verb parsing, RootSet interplay, in-process two-endpoint transfer test.</td><td>~1 week</td></tr>
+      <tr><td><strong>M2 — Beam UX</strong></td><td>Share-popover entry, confirm dialog, beamed badge, offers indicator with Stop, CLI verbs, TTL.</td><td>End-to-end demo: Studio → Slack link → MacBook renders the artifact.</td><td>~1 week</td></tr>
+      <tr><td><strong>M3 — Pairing</strong></td><td><code>peers.json</code>, pair verb + tickets, six-word fingerprint flow, Settings → Remote pane (Settings surface gets mounted).</td><td>Pair two machines; revoke; re-pair. Tests on peer-store and handshake rejection.</td><td>~1 week</td></tr>
+      <tr><td><strong>M4 — Scope read</strong></td><td><code>proto.rs</code>, scope server behind allowlist + RootSet + scope filter, tabs bridge, remote drawer, hash-addressed cache, remote tabs render.</td><td>Browse the Studio's open tabs from the MacBook; proto round-trip and traversal-refusal tests.</td><td>1–2 weeks</td></tr>
+      <tr><td><strong>M5 — Live &amp; control</strong></td><td>Subscriptions, cross-machine live reload through the watcher bus, follow mode, <code>OpenOnHost</code> under <code>control</code> scope, presence.</td><td>The demo: agent rewrites a report on the Studio, the MacBook's tab updates in place, scroll held.</td><td>~1 week</td></tr>
+      <tr><td><strong>M6 — Hardening</strong></td><td>Rate/size caps, single-fetch + lock-to-peer beams, self-hosted-relay config, firewall docs, README/STATUS updates.</td><td>Threat-model table walked check-by-check; each row has a test or a documented manual verification.</td><td>~1 week</td></tr>
+    </tbody>
+  </table>
+  <p>v1 is shippable and independently valuable at M2. Every later milestone is additive; nothing in Beam is throwaway (Scope reuses the endpoint, the blob store, and the ticket plumbing).</p>
+</section>
+
+<section id="risks">
+  <h2>10 · Risks &amp; open questions</h2>
+  <h3>Risks</h3>
+  <table>
+    <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>iroh API churn around its 1.0 line</td><td>Exact version pin; all iroh types quarantined behind <code>remote::endpoint</code>; upgrades are deliberate PRs.</td></tr>
+      <tr><td>Dependence on n0's public relay infrastructure</td><td>Direct connections are the common path; relay is fallback; <code>relay_url</code> preference enables self-hosting the day it matters.</td></tr>
+      <tr><td>Both instances must be running (no daemon)</td><td>Accepted for v1/v2 — the product is an app, not a service. A menu-bar residency mode is a possible v3 if "sender offline" stings in practice.</td></tr>
+      <tr><td>First networked feature enlarges the audit surface</td><td>Networking confined to the Rust core; webview gets commands, not sockets; scope server unreachable except from paired NodeIds; run the security-review skill over the <code>remote/</code> module before each merge.</td></tr>
+      <tr><td>Unnotarized app vs. macOS application firewall</td><td>Document the prompt; all Beam-receiver traffic is dial-out and unaffected.</td></tr>
+    </tbody>
+  </table>
+  <h3>Open questions</h3>
+  <ul>
+    <li><strong>Received-artifact visibility.</strong> Keep <code>received/</code> only behind the Received list, or also surface it as a pseudo-entry in the sidebar? (Leaning: a drawer entry appears only while received tabs exist.)</li>
+    <li><strong>Default TTL.</strong> 24 h proposed; the right number is whatever makes a forwarded stale link useless without making "fetch it tomorrow" annoying.</li>
+    <li><strong>Default scope for own-machine pairing.</strong> Should the pairing flow offer a "this is my own machine" toggle that grants <code>browse</code>+<code>control</code> in one step?</li>
+    <li><strong>Fingerprint wordlist.</strong> PGP word list vs. EFF short list vs. emoji. Bikeshed, but a fun one.</li>
+    <li><strong>Naming.</strong> "Beam" and "Scope" are working names; the <code>vlerv://</code> verbs (<code>receive</code>, <code>pair</code>) are the actual frozen API — chosen to stay meaningful if the feature names change.</li>
+  </ul>
+</section>
+
+<section id="beyond">
+  <h2>11 · Beyond v2</h2>
+  <p>Not designed here, but the foundation makes them cheap to imagine:</p>
+  <ul>
+    <li><strong>iOS companion — planned next.</strong> A read-only phone reader for artifacts whose entire data layer is this design: the phone owns no files, so it pairs as a <code>view-open</code>/<code>browse</code> Scope client and receives Beams. The stack carries over — Tauri 2 targets iOS from this same React + Rust codebase, and iroh compiles for iOS, so the <code>remote/</code> module ships to the phone unchanged. Distribution can stay personal (sideload or TestFlight; no App Store). Requires revising PRODUCT.md's macOS-only commitment — a deliberate product decision to record there, and a strong reason to build Beam/Scope first: the remote foundation is the iOS app's prerequisite.</li>
+    <li><strong>Co-reading.</strong> Scroll-position sharing over the session stream — a laser pointer for pair-reviewing an audit, two machines, one scroll.</li>
+    <li><strong>Collections.</strong> Beam a directory (an HTML report with assets, a whole learning module) as one ticket via blob collections.</li>
+    <li><strong>Locked beams by default.</strong> Once most beams flow between paired machines, flip the default from capability-link to peer-locked.</li>
+    <li><strong>Menu-bar residency.</strong> A headless serve mode so the Studio answers fetches without the window open.</li>
+    <li><strong>Agent-to-remote deep links.</strong> A Claude Code session on the Studio ends with a link that opens the artifact <em>on whichever paired machine you're holding</em> — <code>vlerv://open?path=…&amp;on=macbook</code>. The deep-link scheme becomes location-transparent.</li>
+  </ul>
+  <details>
+    <summary>Explicit non-goals</summary>
+    <ul>
+      <li><strong>Web viewer / browser fallback.</strong> Receiving requires Vlervcode. A web viewer means hosting, which is the thing this design exists to avoid.</li>
+      <li><strong>Multi-user collaboration / presence for strangers.</strong> The product has one user and their colleagues-of-the-moment; there is no roster, no accounts, no cloud identity — NodeIds and a peers file are the whole social graph.</li>
+      <li><strong>Remote editing.</strong> Read, do not edit — now over the network too.</li>
+    </ul>
+  </details>
+</section>
+
+</main>
+
+<footer>
+  <p>Remote Control — Beam &amp; Scope · Vlervtifacts design doc · draft 1 · 2026-08-15 · lives at <code>remote-control-design.html</code> beside <code>DESIGN.md</code> and <code>PRODUCT.md</code></p>
+</footer>
+
+</body>
+</html>

@@ -13,16 +13,19 @@ import {
   Folder,
   Star,
   StarOff,
+  Zap,
 } from "lucide-react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MenuSection } from "../components/ContextMenu";
 import { useBookmarksContext } from "../state/bookmarks-context";
+import { useBeam } from "../state/beam";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
 export function useFileMenu(
   onOpenFile?: (path: string, opts?: OpenFileOptions) => void,
 ): (path: string) => MenuSection[] {
   const { isBookmarked, toggle } = useBookmarksContext();
+  const { beginSend } = useBeam();
 
   return React.useCallback(
     (path: string): MenuSection[] => {
@@ -45,6 +48,11 @@ export function useFileMenu(
             label: "Copy Path",
             icon: <Copy size={13} strokeWidth={2} />,
             onSelect: () => void navigator.clipboard?.writeText(path).catch(() => {}),
+          },
+          {
+            label: "Beam to Vlervcode…",
+            icon: <Zap size={13} strokeWidth={2} />,
+            onSelect: () => beginSend(path),
           },
         ],
         [

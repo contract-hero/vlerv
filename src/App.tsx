@@ -10,6 +10,7 @@ import TabStrip from "./components/TabStrip";
 import Toolbar from "./components/Toolbar";
 import TabView from "./components/TabView";
 import QuickOpen from "./components/QuickOpen";
+import BeamDialog from "./components/BeamDialog";
 import { tauriIpc } from "./ipc";
 import type { IpcSurface } from "./ipc";
 import { useDeepLink } from "./hooks/useDeepLink";
@@ -21,6 +22,7 @@ import { BookmarksProvider } from "./state/bookmarks-context";
 import { RecentsProvider } from "./state/recents-context";
 import { ScrollMemoryProvider } from "./state/scroll-memory";
 import { ExplorerUiProvider, useExplorerUi } from "./state/explorer-ui";
+import { BeamProvider } from "./state/beam";
 import { ContextMenuProvider } from "./components/ContextMenu";
 import { isUnderRoot } from "./utils/path";
 import {
@@ -80,13 +82,15 @@ function ProviderShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       <BookmarksProvider ipc={ipc}>
         <RecentsProvider ipc={ipc}>
           <TabsProvider ipc={ipc}>
-            <ScrollMemoryProvider>
-              <ExplorerUiProvider>
-                <ContextMenuProvider>
-                  <AppShell ipc={ipc} />
-                </ContextMenuProvider>
-              </ExplorerUiProvider>
-            </ScrollMemoryProvider>
+            <BeamProvider ipc={ipc}>
+              <ScrollMemoryProvider>
+                <ExplorerUiProvider>
+                  <ContextMenuProvider>
+                    <AppShell ipc={ipc} />
+                  </ContextMenuProvider>
+                </ExplorerUiProvider>
+              </ScrollMemoryProvider>
+            </BeamProvider>
           </TabsProvider>
         </RecentsProvider>
       </BookmarksProvider>
@@ -434,6 +438,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
           onClose={() => setQuickOpenVisible(false)}
         />
       ) : null}
+      <BeamDialog />
     </div>
   );
 }

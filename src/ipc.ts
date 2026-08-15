@@ -70,6 +70,37 @@ export interface ShareAnchor {
   height: number;
 }
 
+/** One active Beam offer (this instance is serving the staged blob). */
+export interface BeamOffer {
+  /** Offer id == the blob's BLAKE3 hash (hex). */
+  id: string;
+  path: string;
+  name: string;
+  size: number;
+  ticket: string;
+  /** The shareable `vlerv://receive?…` deep link. */
+  link: string;
+  created_at: number;
+  expires_at: number;
+  fetches: number;
+}
+
+/** A completed receive: where the verified blob landed. */
+export interface BeamReceivedFile {
+  path: string;
+  name: string;
+  size: number;
+  hash: string;
+}
+
+/** One past beam in the received/ tree. */
+export interface BeamReceivedEntry {
+  path: string;
+  name: string;
+  size: number;
+  received_at: number;
+}
+
 export interface IpcSurface {
   listProjects(): Promise<ProjectEntry[] | string[]>;
   listDir(projectPath: string): Promise<TreeEntry[]>;
@@ -95,6 +126,18 @@ export interface IpcSurface {
    */
   watchExternalPaths?(paths: string[]): Promise<void>;
   shareFile?(paths: string[], anchor: ShareAnchor): Promise<void>;
+  /** Stage a file and mint its beam ticket (boots the endpoint lazily). */
+  beamOffer?(path: string): Promise<BeamOffer>;
+  /** Revoke an active offer — the ticket dies instantly. */
+  beamStop?(offerId: string): Promise<void>;
+  /** Active offers. Never boots the endpoint. */
+  beamListOffers?(): Promise<BeamOffer[]>;
+  /** Post-confirm fetch; progress arrives as `vlerv://beam-progress`. */
+  beamReceive?(ticket: string, name?: string, size?: number): Promise<BeamReceivedFile>;
+  /** Where received artifacts land (badge prefix check). */
+  beamReceivedDir?(): Promise<string>;
+  /** Past beams, newest first. */
+  beamListReceived?(): Promise<BeamReceivedEntry[]>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -206,6 +249,30 @@ class TauriIpc implements IpcSurface {
 
   async shareFile(paths: string[], anchor: ShareAnchor): Promise<void> {
     await invoke<void>("share_file", { paths, anchor });
+  }
+
+  async beamOffer(path: string): Promise<BeamOffer> {
+    return await invoke<BeamOffer>("beam_offer", { path });
+  }
+
+  async beamStop(offerId: string): Promise<void> {
+    await invoke<void>("beam_stop", { offerId });
+  }
+
+  async beamListOffers(): Promise<BeamOffer[]> {
+    return await invoke<BeamOffer[]>("beam_list_offers");
+  }
+
+  async beamReceive(ticket: string, name?: string, size?: number): Promise<BeamReceivedFile> {
+    return await invoke<BeamReceivedFile>("beam_receive", { ticket, name, size });
+  }
+
+  async beamReceivedDir(): Promise<string> {
+    return await invoke<string>("beam_received_dir");
+  }
+
+  async beamListReceived(): Promise<BeamReceivedEntry[]> {
+    return await invoke<BeamReceivedEntry[]>("beam_list_received");
   }
 }
 
