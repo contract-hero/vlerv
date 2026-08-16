@@ -1,6 +1,6 @@
 # Vlervtifacts
 
-A distraction-free macOS viewer for local HTML artifacts — a native reading room for the reports, plans and pages your tools generate. Browser-style tabs and history over a read-only workspace tree, full-fidelity HTML/Markdown rendering with live reload, native file drag-out, and a `vlerv://` URL scheme for deep-linking from Claude Code or any other tool.
+A distraction-free macOS viewer for local HTML artifacts — a native reading room for the reports, plans and pages your tools generate. Browser-style tabs and history over a read-only workspace tree, full-fidelity HTML/Markdown rendering with live reload, native file drag-out, one-link peer-to-peer sharing to another machine (**Beam**), and a `vlerv://` URL scheme for deep-linking from Claude Code or any other tool.
 
 Built with Tauri 2 + React + TypeScript. Ships as a small native `.app` (no Node runtime needed once built).
 
@@ -39,9 +39,20 @@ Files open in tabs **auto-reload when they change on disk** — edit an artifact
 - **Zoom**: `⌘+` / `⌘−` / `⌘0`, per tab.
 - **Share**: the toolbar Share button opens the native macOS share sheet (AirDrop, Messages, Mail…). With a Slack target configured, an Open-in-Slack button foregrounds that channel — drag the file in from the tree to send it.
 
+### Beam — send an artifact to another machine
+
+**Beam** sends one artifact from your Vlervcode to another — peer-to-peer, end-to-end encrypted, no VPN and no upload. It uses [iroh](https://iroh.computer) for a direct, hole-punched QUIC connection (an encrypted relay is the fallback; content only ever moves over the encrypted link).
+
+- **Send**: the toolbar ⚡ button (or right-click a file → **Beam to Vlervcode…**) stages the file and mints a `vlerv://receive?ticket=…` link. Copy it and send it over any channel you already use — Slack, iMessage, the share sheet. The link is a capability, not the content.
+- **Receive**: clicking the link on the other machine raises the app and shows a confirm dialog — file name, size, and the sender's identity fingerprint. **Nothing transfers until you accept**; the stream is integrity-verified (BLAKE3), lands in the app's own `received/` folder, and opens in a tab with a **beamed** badge. Received HTML renders in a hardened, origin-isolated iframe — an artifact authored by someone else can't reach the app.
+- **Serving & Stop**: while the app runs it serves the offer (default 24 h, then it expires). The ⚡ indicator lists active offers with fetch counts and a **Stop** button — Stop revokes the link instantly.
+- Zero network until you use it: the app opens no sockets until the first beam action.
+
+Both machines need Vlervcode running. First inbound connection may trigger the macOS firewall prompt on the sender; the receiver only dials out.
+
 ### Rendering
 
-- `.html` → full inline CSS/JS/SVG render (browser fidelity) in a sandboxed iframe; `<base href>` injected so relative resources resolve. Links to local files navigate in-app (with tab history); `http(s)` links open in the OS browser.
+- `.html` → full inline CSS/JS/SVG render (browser fidelity) in a sandboxed iframe; `<base href>` injected so relative resources resolve. Links to local files navigate in-app (with tab history); `http(s)` links open in the OS browser. **Beamed** (received) HTML renders in a hardened iframe — an opaque origin with no reach into the app and no `<base href>` — since its author is remote and untrusted.
 - `.md` → marked + shiki + mermaid + **KaTeX math**, centered, theme-aware.
 - Code/text → shiki-highlighted, theme-aware.
 - Images → PNG/JPEG/GIF/WebP/BMP/ICO/AVIF render natively (base64 pipeline, 20 MiB cap); SVG renders inline (scripts stripped).
@@ -62,19 +73,22 @@ cd cli && cargo build --release
 
 `vlerv open <path>` shells `open vlerv://open?path=<encoded>` — the running app catches the deep link and opens the file. `vlerv reveal <path>` expands + highlights it in the tree without switching the preview.
 
+`vlerv beam <path>` opens the send dialog for that file (mint a Beam link); `vlerv receive <ticket>` (or a full `vlerv://receive?…` link) opens the confirm-and-fetch dialog. Both only hand an intent to the app — nothing is staged or fetched without your click.
+
 ## Stack
 
 - Tauri 2 (Rust shell + WKWebView), React 18 + TS + Vite
 - Plugins: `tauri-plugin-deep-link`, `tauri-plugin-dialog`, `tauri-plugin-drag`, `tauri-plugin-opener`, `tauri-plugin-window-state`
 - Render libs: `marked` (+ `marked-katex-extension`), `shiki`, `mermaid`, `katex`
+- Beam (P2P transport): `iroh` + `iroh-blobs` (QUIC, hole-punched, content-addressed), exact-version pinned
 
 ## Develop
 
 ```bash
 pnpm install
 pnpm tauri dev     # app with hot reload
-pnpm test          # vitest (tabs reducer, fuzzy matcher, explorer utils)
-cd src-tauri && cargo test   # Rust (watcher, reader, deep links, walk, bookmarks)
+pnpm test          # vitest (tabs reducer, fuzzy matcher, explorer utils, beam formatting)
+cd src-tauri && cargo test   # Rust (watcher, reader, deep links, walk, bookmarks, beam offers/sanitization + a two-endpoint Beam transfer test)
 ```
 
 ## Status / next steps
