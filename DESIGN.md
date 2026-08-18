@@ -490,7 +490,10 @@ window — including straight through the chrome bands, where it broke the very
 rule those band heights exist to produce.
 
 There are no responsive breakpoints. This is a macOS window on one machine, not
-a page.
+a page. (The planned read-only iOS companion is a separate surface: it inherits
+the visual language — tokens, type, the artifact-as-protagonist stance — but
+will need its own touch-and-narrow layout rules, out of scope for this desktop
+system.)
 
 ### Reading measure
 
