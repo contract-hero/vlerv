@@ -127,8 +127,12 @@ pub async fn share_file(
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Total invoke surface: the command exists on every platform and
+        // answers with a clean error instead of a missing-command failure.
+        // The iOS companion is read-only and has no NSSharingServicePicker;
+        // a UIActivityViewController equivalent is a separate decision.
         let _ = (webview, anchor, resolved);
-        Err("share sheet is macOS-only".into())
+        Err("share sheet is not available on this platform".into())
     }
 }
 

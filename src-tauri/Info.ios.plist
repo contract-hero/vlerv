@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  iOS additions merged into gen/apple/src_tauri_iOS/Info.plist by the
+	  Tauri CLI (`Info.plist` + `Info.ios.plist` next to tauri.conf.json).
+
+	  The `vlerv` URL scheme is declared here, not in the deep-link plugin
+	  config: that plugin's `schemes` key is the DESKTOP registration
+	  (LaunchServices). On iOS the system reads CFBundleURLTypes, then hands
+	  the URL to the app, and the plugin's `on_open_url` callback fires.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>dev.vlerv.Vlervcode</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>vlerv</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+	  Beam and Scope dial peers directly over QUIC. On a LAN that is a local
+	  network connection, which iOS 14+ gates behind a user prompt; without
+	  this string the prompt cannot be shown and the connection is refused.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Vlervtifacts connects directly to your paired Macs to receive artifacts.</string>
+</dict>
+</plist>

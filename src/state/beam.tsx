@@ -45,6 +45,19 @@ interface BeamProgressPayload {
   received: number;
 }
 
+/** Payload of `vlerv://beam-received`: an artifact that landed WITHOUT this
+ * side driving a fetch — today, a control-scoped peer's push (Scope v2). The
+ * bytes went through the same verified receive path an accepted beam takes,
+ * so they are surfaced the same way: a tab, with the beamed badge. `peer` is
+ * absent for anything the local user accepted itself. */
+interface BeamReceivedPayload {
+  peer?: string;
+  path: string;
+  name: string;
+  size: number;
+  hash: string;
+}
+
 // Discriminated unions: the fields a phase needs travel WITH the phase, so
 // "ready without an offer" or "error without a message" cannot be
 // constructed — the dialog's `phase === "ready" && send.offer` guards used to
@@ -158,6 +171,14 @@ export function BeamProvider({
 
   useTauriEvent<BeamOffer[]>("vlerv://beam-offers-updated", (list) => {
     setOffers(list);
+  });
+
+  // A pushed artifact arrives already on disk and already verified — there is
+  // no dialog to gate (the host's control-scope grant IS the consent), so it
+  // opens exactly like an accepted receive does.
+  useTauriEvent<BeamReceivedPayload>("vlerv://beam-received", (file) => {
+    dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
+    ipc.beamListReceived?.().then(setReceived).catch(() => {});
   });
 
   const runOffer = React.useCallback(

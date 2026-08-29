@@ -13,9 +13,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use iroh::{EndpointAddr, TransportAddr};
 use iroh_blobs::ticket::BlobTicket;
-use src_tauri::remote::{beam, endpoint};
+use src_tauri::remote::{beam, endpoint, Dirs};
 use src_tauri::security::RootSet;
 
 /// Re-mint `ticket` so its only transport addr is `127.0.0.1:<sender port>`.
@@ -27,9 +26,9 @@ fn loopback_ticket(ticket: &str) -> String {
         .find(|a| a.is_ipv4())
         .expect("offer ticket carries an IPv4 direct addr")
         .port();
-    let addr = EndpointAddr::from_parts(
+    let addr = endpoint::addr_at_id(
         ticket.addr().id,
-        [TransportAddr::Ip((std::net::Ipv4Addr::LOCALHOST, port).into())],
+        (std::net::Ipv4Addr::LOCALHOST, port).into(),
     );
     BlobTicket::new(addr, ticket.hash(), ticket.format()).to_string()
 }
@@ -40,8 +39,16 @@ async fn beam_round_trip_then_stop_revokes() {
     let receiver_dir = tempfile::TempDir::new().unwrap();
     let received_root = tempfile::TempDir::new().unwrap();
 
-    let sender = endpoint::boot_in(sender_dir.path(), |_| {}).await.expect("sender boot");
-    let receiver = endpoint::boot_in(receiver_dir.path(), |_| {}).await.expect("receiver boot");
+    // `None` scope state: these two nodes speak Beam only, so the router
+    // answers the blobs ALPN and nothing else. Each node gets its own base
+    // dir — the crate derives identity, blobs and received/ from it and
+    // hardcodes nothing.
+    let sender = endpoint::boot(&Dirs::new(sender_dir.path()), None, |_| {})
+        .await
+        .expect("sender boot");
+    let receiver = endpoint::boot(&Dirs::new(receiver_dir.path()), None, |_| {})
+        .await
+        .expect("receiver boot");
 
     // Stage + offer on the sender, through the same path policy the
     // commands use.

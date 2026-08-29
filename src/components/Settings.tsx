@@ -1,10 +1,133 @@
-// Settings panel — workspace roots / ignore-set / drag-out / Slack share target.
+// Settings panel — workspace roots / ignore-set / drag-out / Slack share
+// target / Remote pairing (design §6: "finally a concrete reason to mount
+// the Settings surface").
 import * as React from "react";
 import { useSettings } from "../hooks/useSettings";
+import type { UseSettingsState } from "../hooks/useSettings";
 import { defaultIpc } from "../ipc";
+import type { RemoteScope } from "../ipc";
+import { useRemoteActions, useRemoteState } from "../state/remote";
+import CopyLinkButton from "./CopyLinkButton";
 
 export interface SettingsProps {
   ipc?: typeof defaultIpc;
+}
+
+const SCOPE_LABEL: Record<RemoteScope, string> = {
+  "view-open": "View open",
+  browse: "Browse",
+  control: "Control",
+};
+
+function RemoteSettings({
+  state,
+  setStateField,
+}: {
+  state: UseSettingsState | null;
+  setStateField: (key: string, value: unknown) => Promise<void>;
+}): React.ReactElement {
+  const { peers, presence, invite, pairingBusy, pairingError } = useRemoteState();
+  const { beginPairing, dismissInvite, unpair, setScope, subscribePeer } = useRemoteActions();
+  const listenOn = state?.preferences?.remote_listen ?? false;
+
+  return (
+    <section>
+      <h3>Remote</h3>
+      <p>
+        Pair with another Vlervtifacts instance to browse its open tabs, live,
+        and — with Control scope — open artifacts on it remotely. Transport is
+        peer-to-peer and end-to-end encrypted (no server ever sees content).
+      </p>
+      <label>
+        <input
+          type="checkbox"
+          checked={listenOn}
+          onChange={(e) => void setStateField("preferences.remote_listen", e.target.checked)}
+        />
+        {" "}Listen for paired devices at launch
+      </label>
+
+      <div style={{ marginTop: "var(--space-3)" }}>
+        {invite ? (
+          <>
+            <input
+              className="beam-link-input"
+              readOnly
+              value={invite.link}
+              onFocus={(e) => e.currentTarget.select()}
+              data-testid="remote-pair-link"
+            />
+            <p className="beam-hint">
+              Open this link on the other machine. Both screens will show the
+              same six words — confirm they match there before accepting.
+            </p>
+            <div className="beam-actions">
+              <CopyLinkButton link={invite.link} />
+              <button type="button" className="button button-secondary" onClick={dismissInvite}>
+                Done
+              </button>
+            </div>
+          </>
+        ) : (
+          <button type="button" className="button" disabled={pairingBusy} onClick={beginPairing}>
+            {pairingBusy ? "Starting…" : "Pair a device…"}
+          </button>
+        )}
+        {pairingError ? <p className="beam-error" role="alert">{pairingError}</p> : null}
+      </div>
+
+      <h4 style={{ marginTop: "var(--space-4)" }}>Paired devices</h4>
+      {peers.length === 0 ? (
+        <p className="section-empty-hint">No devices paired yet.</p>
+      ) : (
+        <ul>
+          {peers.map((peer) => {
+            const peerPresence = presence[peer.node_id]?.state ?? "offline";
+            return (
+              <li key={peer.node_id} className="remote-peer-row">
+                <span
+                  className={`remote-presence-dot remote-presence-${peerPresence}`}
+                  title={peerPresence}
+                  aria-hidden
+                />
+                <div className="remote-peer-info">
+                  <span className="remote-peer-name">{peer.device}</span>
+                  <span className="remote-peer-meta" title={peer.node_id}>
+                    {peer.node_id.slice(0, 12)}…
+                  </span>
+                </div>
+                <select
+                  aria-label={`Scope for ${peer.device}`}
+                  value={peer.scope}
+                  onChange={(e) => setScope(peer.node_id, e.target.value as RemoteScope)}
+                >
+                  {(Object.keys(SCOPE_LABEL) as RemoteScope[]).map((s) => (
+                    <option key={s} value={s}>{SCOPE_LABEL[s]}</option>
+                  ))}
+                </select>
+                {peerPresence === "offline" ? (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => subscribePeer(peer.node_id)}
+                  >
+                    Connect
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => unpair(peer.node_id)}
+                >
+                  Unpair
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
 }
 
 export default function Settings({ ipc = defaultIpc }: SettingsProps): React.ReactElement {
@@ -161,6 +284,8 @@ export default function Settings({ ipc = defaultIpc }: SettingsProps): React.Rea
           placeholder="T0123ABCD/C0456EFGH"
         />
       </section>
+
+      <RemoteSettings state={state} setStateField={setStateField} />
     </div>
   );
 }

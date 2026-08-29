@@ -2,13 +2,16 @@
 // address bar lives in the Toolbar above the preview; the resize handle is
 // rendered by App as a flex sibling so it isn't clipped by pane overflow.
 import * as React from "react";
-import { FilePlus2, FolderOpen, RotateCw } from "lucide-react";
+import { FilePlus2, FolderOpen, RotateCw, Settings as SettingsIcon } from "lucide-react";
 import type { IpcSurface } from "../ipc";
 import Explorer from "./Explorer";
 import Bookmarks from "./Bookmarks";
 import RecentFiles from "./RecentFiles";
+import RemoteDrawerList from "./RemoteDrawer";
+import ReceivedDrawer from "./ReceivedDrawer";
 import SidebarSection from "./SidebarSection";
 import { useWorkspace } from "../state/workspace";
+import { usePlatform } from "../state/platform";
 import { basename } from "../utils/path";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
@@ -28,6 +31,8 @@ export interface SidebarProps {
    * re-fetches every visible folder without collapsing expansion state.
    */
   refreshNonce: number;
+  /** Opens the Settings modal — its only mount point (STATUS.md open item). */
+  onOpenSettings: () => void;
 }
 
 export default function Sidebar({
@@ -38,8 +43,43 @@ export default function Sidebar({
   onPickWorkspace,
   onRefresh,
   refreshNonce,
+  onOpenSettings,
 }: SidebarProps): React.ReactElement {
   const { root: workspaceRoot, clearRoot } = useWorkspace();
+  const { isIos } = usePlatform();
+
+  // Settings is reachable from every sidebar state — iOS, empty workspace,
+  // and the loaded tree all end their header with the same gear (STATUS.md:
+  // the modal's only mount point).
+  const settingsButton = (
+    <button
+      className="sidebar-header-change"
+      onClick={onOpenSettings}
+      title="Settings"
+      aria-label="Settings"
+    >
+      <SettingsIcon size={13} strokeWidth={2} />
+    </button>
+  );
+
+  // iOS is a read-only companion with no local workspace (PRODUCT.md):
+  // no folder/file picker, no full-tree Files drawer, no drag-out. It
+  // centers on Remote (paired peers' tabs) and Received (Beam/PushArtifact
+  // landings) — both already exist as sidebar drawers.
+  if (isIos) {
+    return (
+      <div className="sidebar">
+        <div className="sidebar-header" data-tauri-drag-region>
+          <span className="sidebar-header-title">Vlervtifacts</span>
+          {settingsButton}
+        </div>
+        <div className="sidebar-drawers">
+          <RemoteDrawerList ipc={ipc} onOpenFile={onOpenFile} />
+          <ReceivedDrawer />
+        </div>
+      </div>
+    );
+  }
 
   if (!workspaceRoot) {
     return (
@@ -58,6 +98,7 @@ export default function Sidebar({
         >
           Open a single file…
         </button>
+        {settingsButton}
       </div>
     );
   }
@@ -95,12 +136,14 @@ export default function Sidebar({
         >
           <FolderOpen size={13} strokeWidth={2} />
         </button>
+        {settingsButton}
       </div>
       {/* Only the drawers scroll — the header above owns the traffic-light
           inset and the drag region, so it must stay pinned. */}
       <div className="sidebar-drawers">
         <Bookmarks onOpenFile={onOpenFile} />
         <RecentFiles onOpenFile={onOpenFile} />
+        <RemoteDrawerList ipc={ipc} onOpenFile={onOpenFile} />
         {/* The whole tree is one drawer, folded by default: a project root
             lists directories, not artifacts. Bookmarks, Recent and ⌘P are
             the primary paths to a file; the tree is for the

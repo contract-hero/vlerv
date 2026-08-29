@@ -84,7 +84,10 @@ Markdown viewer has no HTML fidelity.
 - **Companion surfaces.** A `vlerv` CLI (`vlerv open`, `vlerv reveal`,
   `vlerv beam`, `vlerv receive`), a Slack hand-off path (native share sheet
   plus an Open-in-Slack deep link), and Beam — one-link peer-to-peer artifact
-  transfer to another Vlervcode instance.
+  transfer to another Vlervcode instance. A stdio MCP server, `vlerv-mcp`,
+  is the agent-integration surface: it lets Claude Code and other agentic
+  tools beam an artifact, pair, and list or target a paired device without
+  shelling out to the CLI.
 - **Install shape.** macOS: a local, unnotarized `.app` built by
   `./scripts/build-app.sh` and copied to `/Applications`; first launch needs a
   right-click → Open past Gatekeeper. iOS (planned): personal distribution —

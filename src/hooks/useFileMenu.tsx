@@ -11,6 +11,7 @@ import {
   Copy,
   FilePlus2,
   Folder,
+  MonitorPlay,
   Star,
   StarOff,
   Zap,
@@ -19,6 +20,8 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MenuSection } from "../components/ContextMenu";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { useBeamActions } from "../state/beam";
+import { useRemoteActions, useRemoteState } from "../state/remote";
+import { usePlatform } from "../state/platform";
 import type { OpenFileOptions } from "../state/TabsProvider";
 
 export function useFileMenu(
@@ -26,10 +29,33 @@ export function useFileMenu(
 ): (path: string) => MenuSection[] {
   const { isBookmarked, toggle } = useBookmarksContext();
   const { beginSend } = useBeamActions();
+  const { presence } = useRemoteState();
+  const { openOnHost } = useRemoteActions();
+  // Finder and outbound Beam sends are macOS/desktop affordances — iOS is a
+  // read-only companion that owns no files to reveal or re-share
+  // (PRODUCT.md, Operating Context).
+  const { isMacos } = usePlatform();
+
+  // Control scope is what the OTHER machine granted US — carried on
+  // `RemotePresenceEvent.scope` once a session confirms it (design §6: "the
+  // literal remote control"). A peer we merely granted control TO is not
+  // eligible here; that's the opposite direction.
+  const controlPeers = React.useMemo(
+    () =>
+      Object.values(presence).filter(
+        (p) => p.state === "online" && p.scope === "control",
+      ),
+    [presence],
+  );
 
   return React.useCallback(
     (path: string): MenuSection[] => {
       const bookmarked = isBookmarked(path);
+      const remoteSection: MenuSection = controlPeers.map((p) => ({
+        label: `Open on ${p.device ?? p.peer}`,
+        icon: <MonitorPlay size={13} strokeWidth={2} />,
+        onSelect: () => openOnHost(p.peer, path, false),
+      }));
       return [
         [
           {
@@ -39,21 +65,29 @@ export function useFileMenu(
           },
         ],
         [
-          {
-            label: "Reveal in Finder",
-            icon: <Folder size={13} strokeWidth={2} />,
-            onSelect: () => void revealItemInDir(path).catch(() => {}),
-          },
+          ...(isMacos
+            ? [
+                {
+                  label: "Reveal in Finder",
+                  icon: <Folder size={13} strokeWidth={2} />,
+                  onSelect: () => void revealItemInDir(path).catch(() => {}),
+                },
+              ]
+            : []),
           {
             label: "Copy Path",
             icon: <Copy size={13} strokeWidth={2} />,
             onSelect: () => void navigator.clipboard?.writeText(path).catch(() => {}),
           },
-          {
-            label: "Beam to Vlervcode…",
-            icon: <Zap size={13} strokeWidth={2} />,
-            onSelect: () => beginSend(path),
-          },
+          ...(isMacos
+            ? [
+                {
+                  label: "Beam to Vlervcode…",
+                  icon: <Zap size={13} strokeWidth={2} />,
+                  onSelect: () => beginSend(path),
+                },
+              ]
+            : []),
         ],
         [
           bookmarked
@@ -68,8 +102,9 @@ export function useFileMenu(
                 onSelect: () => void toggle(path),
               },
         ],
+        remoteSection,
       ];
     },
-    [isBookmarked, toggle, onOpenFile],
+    [isBookmarked, toggle, onOpenFile, controlPeers, openOnHost],
   );
 }

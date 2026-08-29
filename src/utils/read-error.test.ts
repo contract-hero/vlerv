@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readErrorTitle } from "./read-error";
 
 // The strings below are the real `thiserror` Display output from
-// src-tauri/src/reader.rs and src-tauri/src/security.rs, not invented text.
+// src-tauri/src/reader.rs and crates/vlerv-remote/src/security.rs, not invented text.
 describe("readErrorTitle", () => {
   it("names the common failures", () => {
     expect(readErrorTitle("Io", 'not found: "/w/report.html"')).toBe("File not found");

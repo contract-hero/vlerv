@@ -1,7 +1,13 @@
 // Pure display helpers for Beam UI (dialog + offers indicator). Size
-// *limits* live in the backend (src-tauri/src/remote/beam.rs) — the
+// *limits* live in the backend (crates/vlerv-remote/src/beam.rs) — the
 // receive dialog gets a pre-computed `warn` flag instead of mirroring the
 // threshold here.
+
+/** Unix seconds — the unit every expiry and `created_at` on the wire uses.
+ * Shared so the dialog and the remote provider cannot drift on it. */
+export function nowSecs(): number {
+  return Math.floor(Date.now() / 1000);
+}
 
 /** "482 KB", "1.2 MB" — coarse on purpose, one decimal only when it matters. */
 export function humanBytes(n: number): string {

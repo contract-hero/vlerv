@@ -3,6 +3,8 @@ import * as React from "react";
 import { Clock, FolderOpen, FileUp, Star } from "lucide-react";
 import { useRecentsContext } from "../state/recents-context";
 import { useBookmarksContext } from "../state/bookmarks-context";
+import { usePlatform } from "../state/platform";
+import IosStartPage from "./IosStartPage";
 import { FileGlyph } from "./FileIcon";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { openOptsFromClick } from "../state/TabsProvider";
@@ -13,6 +15,9 @@ export interface StartPageProps {
   onPickFile: () => void;
   onPickWorkspace: () => void;
   workspaceRoot: string | null;
+  /** Opens the Settings modal — only used by the iOS variant's "Pair with a
+   * Mac" call to action. */
+  onOpenSettings?: () => void;
 }
 
 
@@ -60,7 +65,9 @@ export default function StartPage({
   onPickFile,
   onPickWorkspace,
   workspaceRoot,
+  onOpenSettings,
 }: StartPageProps): React.ReactElement {
+  const { isIos } = usePlatform();
   const { recents, refresh } = useRecentsContext();
   const { bookmarks } = useBookmarksContext();
 
@@ -68,6 +75,13 @@ export default function StartPage({
   React.useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // iOS owns no local files (PRODUCT.md: read-only companion) — the phone's
+  // empty-tab surface is pairing + what Beam/PushArtifact already delivered,
+  // not a workspace/file picker built for a local tree that doesn't exist.
+  if (isIos) {
+    return <IosStartPage onOpenSettings={onOpenSettings} />;
+  }
 
   return (
     <div className="start-page" data-testid="start-page">

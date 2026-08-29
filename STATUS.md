@@ -24,7 +24,7 @@
 - **Share** (merged from #22): native macOS share sheet + Open-in-Slack live in the Toolbar next to the star/copy buttons (they were in the removed Preview header). ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
 
 ### Beam (remote-control-design.html — v1)
-- **P2P artifact transfer between Vlervcode instances** over [iroh](https://iroh.computer) (QUIC, hole-punched, encrypted relay fallback; exact-version pinned, all iroh types quarantined in `src-tauri/src/remote/`). Lazy boot: zero sockets until the first beam action.
+- **P2P artifact transfer between Vlervcode instances** over [iroh](https://iroh.computer) (QUIC, hole-punched, encrypted relay fallback; exact-version pinned, all iroh types quarantined in `crates/vlerv-remote/`, behind the `src-tauri/src/remote.rs` facade). Lazy boot: zero sockets until the first beam action.
 - **Send**: toolbar ⚡ button (or `vlerv beam <path>`, or a `vlerv://beam?path=…` link — link-initiated sends show a confirm face first). Stages the file into a content-addressed store (`ImportMode::Copy` — the ticket pins bytes at mint time), mints a `vlerv://receive?ticket=…&name=…&size=…` link. Path policy = the share module's (`canonicalize_allow_external`, conservative on empty roots).
 - **Serve**: a per-request gate (`iroh-blobs` provider events) intercepts every request kind and admits only a plain full-blob GET whose hash is an active, unexpired offer — get-many / push / observe are refused explicitly. **Stop and TTL expiry revoke the in-memory offer instantly** (the staged bytes are unpinned but linger until blob GC lands — see Open items). Fetch counts come from the same gate. Offers live in the toolbar ⚡ indicator (name, fetches, expiry, Stop) with a Received section.
 - **Receive**: deep link → confirm dialog (sanitized name — bidi/format chars stripped, size claim, sender NodeId fingerprint) → BLAKE3-verified stream (256 MiB hard cap enforced on actual bytes, 20 MiB warn) → lands under `Application Support/Vlerv/received/<date>/`, opens in a tab with a **beamed** badge. "Sender offline" is retryable from the dialog.
@@ -33,6 +33,30 @@
 - Preferences: `preferences.beam_ttl_hours` (default 24, settable via state.json until Settings mounts).
 - **Binary-size impact (measured, per design §8)**: release `vlerv-app` 12 MB → 28 MB with `iroh` + `iroh-blobs`. Larger than the design's "several-MB" guess; accepted for a local .app, revisit only if it starts to hurt.
 
+### Scope (remote-control-design.html — v2)
+- **Pairing**: `vlerv://pair?ticket=…` deep link (or QR-scannable equivalent) mints a one-time pairing token; both sides confirm a **six-word fingerprint** derived from both NodeIds before the peer is persisted. Peers live in `remote/peers.json` (NodeId, device name, granted scope, paired-at, last-seen); revocation is deleting the entry.
+- **Scope server/client** under ALPN `vlerv/scope/0`, multiplexed on the same iroh endpoint as Beam's blob ALPN. Scopes: `view-open`, `browse`, `control`.
+- **Remote sidebar drawers**: a paired, online peer appears as a fourth drawer beside Bookmarks/Recent/Files — live tab list, lazy workspace tree under `browse`.
+- **Live-follow**: a drawer toggle mirrors the host's active tab as it switches.
+- **`control` scope / `OpenOnHost`**: a `control`-scoped peer can push-open an artifact on the host — the literal remote control.
+- Known gap: `remote_set_scope` narrowing an existing peer's scope does not revoke grants already minted under the wider scope — those stay valid for up to 1 h.
+
+### MCP server (crates/vlerv-mcp)
+- Stdio MCP server named `vlerv-mcp` (rmcp 3.1.4) that exposes Remote Control to external agents: `beam_artifact`, `list_devices`, `send_to_device`, `pair_device`, `pair_status`, `confirm_pairing`, `stop_beam`, `server_status`.
+- Configured via env: `VLERV_MCP_ROOTS`, `VLERV_MCP_STATE_DIR`, `VLERV_STATE_DIR`.
+- Built on the Tauri-free `crates/vlerv-remote` core, so the MCP binary carries no Tauri dependency.
+- Documented in `README-MCP.md`.
+- Known gap: no per-peer push quota on `send_to_device` / `beam_artifact`.
+
+### iOS companion
+- Tauri iOS target builds and runs on the iPhone simulator (`scripts/build-ios-sim.sh`).
+- Receive-focused UI: `IosStartPage` ("Pair with a Mac"), `ReceivedDrawer`, remote drawers; macOS-only code is cfg-gated out of the iOS build.
+- Debug-only `VLERV_TEST_AUTOPAIR` E2E hook in `src-tauri` (three arms) — confirmed absent from release builds by running `strings` on the release binary.
+- **Live E2E succeeded (2026-08-29)**: the MCP server paired with the simulator app via a `vlerv://pair` deep link and pushed an artifact that opened on the phone.
+- **Phone-adapted layout** (`PhoneShell.tsx`): on iOS the desktop panes never mount. One column — a 40px title band (active artifact's basename + a live-reload pulse dot in the accent), the artifact full-bleed, and a bottom bar at the thumb (Library, back/forward, tab count). Library (Remote + Received + Settings) and the open-tab list are bottom sheets over a scrim; safe-area insets respected, `100dvh` instead of `100vh` (WKWebView's vh overshoots the visible viewport and hid the bar). Same design tokens as the desktop — the phone changes the architecture, not the language.
+- Theme: Tauri's `window.theme()` reports "light" on iOS regardless of the trait collection, so `useTheme` skips the Tauri probe on iOS (UA check — the `platform-ios` body class arrives async and would race it) and trusts `prefers-color-scheme`, which WKWebView tracks correctly.
+- Known gap: device name shows the Mac hostname on the simulator, not a real iOS device name.
+
 ### Rendering
 - HTML: sandboxed iframe, scripts on, `<base href>` injection, host-bridge script (link intercept with modifiers, scroll report/restore, zoom, chord forwarding).
 - Markdown: marked + KaTeX (`marked-katex-extension`, wired for real now) + shiki + mermaid, theme-aware.
@@ -40,6 +64,7 @@
 - Images: PNG/JPEG/GIF/WebP/BMP/ICO/AVIF render via backend base64 (`FilePayload.encoding`, 20 MiB cap); SVG inline with scripts stripped.
 
 ### Backend (Rust)
+- Workspace reorganized: the shared Remote Control core — security `RootSet`, `proto`, `peers`, `endpoint`, `beam`, `scope` — moved into a Tauri-free crate, `crates/vlerv-remote`, with `EventSink`/`HostCatalog`/`Dirs` seams. Both `src-tauri` and the new `crates/vlerv-mcp` binary consume it; neither pulls in Tauri from the other.
 - Watcher pipeline refactored (`spawn_pipeline`): shutdown flag + channel-disconnect cascade — **the thread leak per workspace switch is fixed**.
 - `RootSet` is Arc-shared; `set_workspace_root` `add_root()`s the picked folder, so deep links into the real workspace classify in-root. `EmptyRoots` falls through to `out_of_root: true` for existing paths (fresh installs accept deep links). `line=N` plumbed into `OpenFileEvent`. `reveal` gets absolute/NUL validation.
 - `state_store::flush()` on `RunEvent::Exit` — no more lost writes on fast quit.
@@ -51,8 +76,8 @@
 - Production `.app` build via `./scripts/build-app.sh` (~28 MB `Vlervtifacts.app` since Beam pulled in iroh — was ~13 MB).
 
 ### Tests
-- Rust: 78 unit + 1 integration (`cargo test` in `src-tauri`) — watcher shutdown/delivery/exact-path/atomic-replace/delete-kind/dedup, reader image + serde wire-shape matrix, recursive walk incl. BFS-truncation invariant, RootSet sharing, deep-link dispatch + recents side-effect matrix (incl. beam/receive verbs, hostile name-hint sanitization incl. bidi/format chars, ticket rejection), bookmarks, offers registry admit/expiry/revocation, `resolve_offerable` gate/file/cap, TTL clamp, identity persistence. The integration test is a **two-endpoint in-process Beam round trip** (offer → link re-parse → gated fetch → verified landing → collision naming → Stop → denial → no orphaned partial); the data path is loopback (the receiver dials a 127.0.0.1 re-mint of the ticket), though the endpoints still boot the n0 preset, so `offer()` waits up to 10 s on `online()` when relays are unreachable.
-- Frontend: 89 (`pnpm test`) — tabs reducer (history semantics incl. replace/LOAD_ERROR, tab lifecycle, watcher actions, zoom clamp+quantize), keyboard chord matching/dispatch, address-bar input normalization, click-modifier convention, fuzzy scorer, `ancestorsWithin`, beam formatting helpers.
+- Rust: ~186 tests green across the cargo workspace (`src-tauri`, `crates/vlerv-remote`, `crates/vlerv-mcp`) — `src-tauri` covers watcher shutdown/delivery/exact-path/atomic-replace/delete-kind/dedup, reader image + serde wire-shape matrix, recursive walk incl. BFS-truncation invariant, RootSet sharing, deep-link dispatch + recents side-effect matrix (incl. beam/receive/pair verbs, hostile name-hint sanitization incl. bidi/format chars, ticket rejection), bookmarks, offers registry admit/expiry/revocation, `resolve_offerable` gate/file/cap, TTL clamp, identity persistence; `crates/vlerv-remote` covers security/peers/scope/beam/endpoint standalone from Tauri; `crates/vlerv-mcp` covers its tool handlers. `src-tauri` still carries the **two-endpoint in-process Beam round trip** integration test (offer → link re-parse → gated fetch → verified landing → collision naming → Stop → denial → no orphaned partial); the data path is loopback (the receiver dials a 127.0.0.1 re-mint of the ticket), though the endpoints still boot the n0 preset, so `offer()` waits up to 10 s on `online()` when relays are unreachable.
+- Frontend: 131 green (`pnpm test`) — tabs reducer (history semantics incl. replace/LOAD_ERROR, tab lifecycle, watcher actions, zoom clamp+quantize), keyboard chord matching/dispatch, address-bar input normalization, click-modifier convention, fuzzy scorer, `ancestorsWithin`, beam formatting helpers, Scope/remote-drawer state. `tsc` is clean.
 
 ## Deliberately unchanged (display-only rebrand)
 
@@ -60,7 +85,9 @@
 
 ## Open items
 
-- **Beam follow-ups** (remote-control-design.html M6 + v2): blob-store GC for stopped/expired offers (tags are deleted; bytes linger in `remote/blobs/` until a GC pass exists), single-fetch mode, lock-to-peer beams, native share sheet / Open-in-Slack for the beam *link* (Copy link ships), Settings UI for `beam_ttl_hours`, macOS application-firewall prompt doc for unnotarized inbound. Scope (v2 pairing/drawer) not started. `endpoint.online()` waits up to 10 s before minting when relays are unreachable (e.g. behind some VPNs) — the ticket still carries direct addrs.
+- **Beam follow-ups** (remote-control-design.html M6): blob-store GC for stopped/expired offers (tags are deleted; bytes linger in `remote/blobs/` until a GC pass exists), single-fetch mode, lock-to-peer beams, native share sheet / Open-in-Slack for the beam *link* (Copy link ships), Settings UI for `beam_ttl_hours`, macOS application-firewall prompt doc for unnotarized inbound. `endpoint.online()` waits up to 10 s before minting when relays are unreachable (e.g. behind some VPNs) — the ticket still carries direct addrs.
+- **Scope follow-ups**: `remote_set_scope` narrowing an existing peer's scope does not revoke grants already minted under the wider scope (valid up to 1 h after narrowing); no per-peer push quota on MCP/Scope pushes.
+- **iOS companion follow-ups**: device name shows the Mac hostname on the simulator instead of a real iOS device name. **Container-relative persistence**: received entries, tab history and `peers.json` paths persist as absolute container paths, but iOS moves the app container UUID on every app update — persisted tabs then 404 and pairing state is orphaned (observed on simulator reinstall). Persist paths relative to the Application Support root and re-resolve at load.
 - Deep-link `line=N` reaches the frontend but no renderer scrolls to a line yet.
 - Recents list is push-only from opens; no backend broadcast event (StartPage refreshes on mount).
 - `preferences.ignore_globs` / `drag_out_mode` still unwired (the hardcoded `DEFAULT_IGNORED` covers the real use). `Settings.tsx` exists and holds the Slack-target field but is still not mounted anywhere — set `preferences.slack_target` via state.json until it is (product decision deferred in #22).

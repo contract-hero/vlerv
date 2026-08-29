@@ -9,8 +9,11 @@ import SidebarResizer from "./components/SidebarResizer";
 import TabStrip from "./components/TabStrip";
 import Toolbar from "./components/Toolbar";
 import TabView from "./components/TabView";
+import PhoneShell from "./components/PhoneShell";
 import QuickOpen from "./components/QuickOpen";
 import BeamDialog from "./components/BeamDialog";
+import RemotePairDialog from "./components/RemotePairDialog";
+import SettingsModal from "./components/SettingsModal";
 import { tauriIpc } from "./ipc";
 import type { IpcSurface } from "./ipc";
 import { useDeepLink } from "./hooks/useDeepLink";
@@ -23,6 +26,8 @@ import { RecentsProvider } from "./state/recents-context";
 import { ScrollMemoryProvider } from "./state/scroll-memory";
 import { ExplorerUiProvider, useExplorerUi } from "./state/explorer-ui";
 import { BeamProvider } from "./state/beam";
+import { RemoteProvider } from "./state/remote";
+import { PlatformProvider, usePlatform } from "./state/platform";
 import { ContextMenuProvider } from "./components/ContextMenu";
 import { isUnderRoot } from "./utils/path";
 import {
@@ -63,15 +68,43 @@ function clampSidebarPx(px: number): number {
   return Math.max(MIN_SIDEBAR_PX, Math.min(MAX_SIDEBAR_PX, px));
 }
 
+/** The transient notice toast (a rejected deep link, so far). Identical on
+ *  both platforms — only where it mounts differs: over the phone shell, or
+ *  inside the desktop preview column under the toolbar. */
+function AppNotice({
+  text,
+  onDismiss,
+}: {
+  text: string;
+  onDismiss: () => void;
+}): React.ReactElement {
+  return (
+    <div className="app-notice" role="alert">
+      <span className="app-notice-text">{text}</span>
+      <button
+        type="button"
+        className="app-notice-dismiss"
+        title="Dismiss"
+        aria-label="Dismiss notice"
+        onClick={onDismiss}
+      >
+        <X size={13} strokeWidth={2} />
+      </button>
+    </div>
+  );
+}
+
 export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactElement {
   const ipc = injectedIpc ?? tauriIpc;
   // Drives <html data-theme="…"> via side-effect; must mount at the root.
   useTheme();
 
   return (
-    <WorkspaceProvider ipc={ipc}>
-      <ProviderShell ipc={ipc} />
-    </WorkspaceProvider>
+    <PlatformProvider ipc={ipc}>
+      <WorkspaceProvider ipc={ipc}>
+        <ProviderShell ipc={ipc} />
+      </WorkspaceProvider>
+    </PlatformProvider>
   );
 }
 
@@ -82,15 +115,17 @@ function ProviderShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
       <BookmarksProvider ipc={ipc}>
         <RecentsProvider ipc={ipc}>
           <TabsProvider ipc={ipc}>
-            <BeamProvider ipc={ipc}>
-              <ScrollMemoryProvider>
-                <ExplorerUiProvider>
-                  <ContextMenuProvider>
-                    <AppShell ipc={ipc} />
-                  </ContextMenuProvider>
-                </ExplorerUiProvider>
-              </ScrollMemoryProvider>
-            </BeamProvider>
+            <RemoteProvider ipc={ipc}>
+              <BeamProvider ipc={ipc}>
+                <ScrollMemoryProvider>
+                  <ExplorerUiProvider>
+                    <ContextMenuProvider>
+                      <AppShell ipc={ipc} />
+                    </ContextMenuProvider>
+                  </ExplorerUiProvider>
+                </ScrollMemoryProvider>
+              </BeamProvider>
+            </RemoteProvider>
           </TabsProvider>
         </RecentsProvider>
       </BookmarksProvider>
@@ -100,6 +135,7 @@ function ProviderShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
 
 function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   const { root, setRoot } = useWorkspace();
+  const { isMacos } = usePlatform();
   const dispatch = useTabsDispatch();
   const active = useActiveTab();
   const entry = currentEntry(active);
@@ -121,6 +157,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
   const [readerMode, setReaderMode] = React.useState<boolean>(false);
   const [refreshNonce, setRefreshNonce] = React.useState<number>(0);
   const [quickOpenVisible, setQuickOpenVisible] = React.useState(false);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const addressBarRef = React.useRef<HTMLInputElement | null>(null);
   const noticeTimer = React.useRef<number | null>(null);
@@ -220,9 +257,14 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
 
   // ── Deep links ─────────────────────────────────────────────────────────
   const handleDeepLinkIntent = React.useCallback(
-    ({ path, intent, out_of_root }: OpenFilePayload) => {
+    ({ path, intent, out_of_root, reader_mode }: OpenFilePayload) => {
       if (intent === "open") {
         dispatch({ type: "FOCUS_OR_OPEN", path, external: Boolean(out_of_root) });
+        // Only a control-scoped peer's `OpenOnHost` carries this field. It
+        // enters reader mode but never leaves it: `reader_mode: false` is
+        // "no opinion", so a remote open cannot yank a local reader session
+        // out from under the person sitting at this machine.
+        if (reader_mode) setReaderMode(true);
       } else {
         // Reveal: expand + scroll to the file in the tree WITHOUT switching
         // the preview (per the deeplink.rs contract).
@@ -270,8 +312,19 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
     { combo: "mod+bracketright", handler: () => dispatch({ type: "GO_FORWARD" }) },
     { combo: "mod+r", allowInInput: true, handler: handleRefreshActive },
     { combo: "mod+l", allowInInput: true, handler: focusAddressBar },
-    { combo: "mod+o", allowInInput: true, handler: handlePickFile },
-    { combo: "mod+p", allowInInput: true, handler: () => setQuickOpenVisible((v) => !v) },
+    // File picker (⌘O) and quick-open (⌘P) both act on a local workspace,
+    // which doesn't exist on iOS (PRODUCT.md: the phone owns no files) — the
+    // Sidebar and TabView hide their entry points there too.
+    ...(isMacos
+      ? [
+          { combo: "mod+o", allowInInput: true, handler: handlePickFile } satisfies Binding,
+          {
+            combo: "mod+p",
+            allowInInput: true,
+            handler: () => setQuickOpenVisible((v) => !v),
+          } satisfies Binding,
+        ]
+      : []),
     { combo: "mod+b", allowInInput: true, handler: toggleSidebar },
     { combo: "mod+shift+f", allowInInput: true, handler: toggleReaderMode },
     // Esc leaves reader mode. Registered only while the mode is on, so plain
@@ -355,6 +408,36 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
     return () => window.removeEventListener("message", onMessage);
   }, [openFile]);
 
+  // Dialogs are summoned by events (a beam arriving, a pair link) or by a
+  // gear button, never by the shell around them — so both architectures
+  // mount the same set, at the same depth.
+  const overlays = (
+    <>
+      <BeamDialog />
+      <RemotePairDialog />
+      {settingsOpen ? <SettingsModal ipc={ipc} onClose={() => setSettingsOpen(false)} /> : null}
+    </>
+  );
+
+  // The phone gets its own architecture (PhoneShell): one column, bottom
+  // bar, sheets. Overlays (dialogs, notice) mount the same either way.
+  if (!isMacos) {
+    return (
+      <div className="app-shell">
+        <PhoneShell
+          ipc={ipc}
+          onOpenFile={openFile}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onPickFile={handlePickFile}
+          onPickWorkspace={handlePickWorkspace}
+          workspaceRoot={root}
+        />
+        {notice ? <AppNotice text={notice} onDismiss={dismissNotice} /> : null}
+        {overlays}
+      </div>
+    );
+  }
+
   return (
     // The sidebar is a full-height column; the tab strip lives inside the
     // preview pane, aligned with the reading field. On the left the sidebar
@@ -379,6 +462,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
                 onPickWorkspace={handlePickWorkspace}
                 onRefresh={handleRefresh}
                 refreshNonce={refreshNonce}
+                onOpenSettings={() => setSettingsOpen(true)}
               />
             </aside>
             <SidebarResizer
@@ -401,20 +485,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
               onEnterReaderMode={toggleReaderMode}
             />
           )}
-          {notice ? (
-            <div className="app-notice" role="alert">
-              <span className="app-notice-text">{notice}</span>
-              <button
-                type="button"
-                className="app-notice-dismiss"
-                title="Dismiss"
-                aria-label="Dismiss notice"
-                onClick={dismissNotice}
-              >
-                <X size={13} strokeWidth={2} />
-              </button>
-            </div>
-          ) : null}
+          {notice ? <AppNotice text={notice} onDismiss={dismissNotice} /> : null}
           <div
             className="tab-view"
             id="tab-panel"
@@ -426,6 +497,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
               onPickFile={handlePickFile}
               onPickWorkspace={handlePickWorkspace}
               workspaceRoot={root}
+              onOpenSettings={() => setSettingsOpen(true)}
             />
           </div>
         </main>
@@ -438,7 +510,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
           onClose={() => setQuickOpenVisible(false)}
         />
       ) : null}
-      <BeamDialog />
+      {overlays}
     </div>
   );
 }

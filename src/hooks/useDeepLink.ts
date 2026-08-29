@@ -15,6 +15,12 @@ export interface OpenFilePayload {
    * optional and default to false.
    */
   out_of_root?: boolean;
+  /**
+   * Set only by a control-scoped remote peer's `OpenOnHost` (Scope v2, see
+   * `remote::host_signal_sink`): open the artifact in reader mode. Absent
+   * for every local deep link, so local behaviour is unchanged.
+   */
+  reader_mode?: boolean;
 }
 
 export interface DeepLinkErrorPayload {

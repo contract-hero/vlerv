@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { parseRemoteAddress } from "./utils/remote-address";
 
 export interface ProjectEntry {
   name: string;
@@ -23,6 +24,10 @@ export interface FilePayload {
   /** How `content` is encoded: UTF-8 text or base64 (raster images). */
   encoding?: "text" | "base64";
   content: string | null;
+  /** Authored by another machine (a beam/push landing or a Scope fetch under
+   * the app's received/ or cache/ dirs). The renderer isolates it. Set by the
+   * Rust reader, so the trust decision never races an async lookup. */
+  untrusted?: boolean;
 }
 
 /** Flat recursive file index returned by `list_files_recursive` (⌘P). */
@@ -59,6 +64,11 @@ export interface SettingsState {
     ignore_globs: string[];
     drag_out_mode: "file" | "url";
     slack_target?: string | null;
+    beam_ttl_hours?: number;
+    /** Boot the endpoint at launch when peers.json is non-empty (design §4). */
+    remote_listen?: boolean;
+    /** Reserved: a self-hosted iroh-relay override. Not yet read by the core. */
+    relay_url?: string | null;
   };
 }
 
@@ -101,6 +111,98 @@ export interface BeamReceivedEntry {
   received_at: number;
 }
 
+// ── Scope v2 (Remote Control §6) ────────────────────────────────────────────
+
+export type RemoteScope = "view-open" | "browse" | "control";
+
+/** One trusted, paired peer. */
+export interface RemotePeer {
+  node_id: string;
+  device: string;
+  scope: RemoteScope;
+  paired_at: number;
+  last_seen: number;
+}
+
+/** `remote_pair_begin` — the link + fingerprint material for the host face. */
+export interface RemotePairInvite {
+  ticket: string;
+  /** `vlerv://pair?ticket=…` */
+  link: string;
+  node_id: string;
+  device: string;
+  expires_at: number;
+}
+
+/** A pairing that reached the fingerprint step, on EITHER side. */
+export interface RemotePendingPair {
+  node_id: string;
+  device: string;
+  /** The six words both screens must show. */
+  fingerprint: string[];
+  role: "host" | "guest";
+  created_at: number;
+}
+
+export interface RemoteTabEntry {
+  path: string;
+  active: boolean;
+}
+
+export interface RemotePathEntry {
+  path: string;
+  name: string;
+}
+
+/** A verified artifact fetched from a peer, landed in the local
+ * content-addressed cache. `path` is the LOCAL file the render pipeline
+ * reads; `remote_path` is the identity on the host — what the drawer and the
+ * FileChanged/FileRemoved events use. */
+export interface RemoteArtifact {
+  peer: string;
+  remote_path: string;
+  path: string;
+  hash: string;
+  size: number;
+  mtime: number;
+  warn: boolean;
+}
+
+/** `vlerv://remote-presence`. */
+export interface RemotePresenceEvent {
+  peer: string;
+  state: "connecting" | "online" | "offline";
+  device: string | null;
+  scope: RemoteScope | null;
+  reason: string | null;
+}
+
+/** `vlerv://remote-event` — tagged on `kind`, fields stay snake_case (the
+ * wire shape the backend emits verbatim). */
+export type RemoteEvent =
+  | { kind: "tab-opened"; peer: string; path: string }
+  | { kind: "tab-closed"; peer: string; path: string }
+  | { kind: "tab-activated"; peer: string; path: string }
+  | { kind: "file-changed"; peer: string; path: string; hash: string }
+  | { kind: "file-removed"; peer: string; path: string }
+  | {
+      kind: "pair-pending";
+      peer: string;
+      device: string;
+      fingerprint: string[];
+      role: "host" | "guest";
+    }
+  | { kind: "pair-link"; peer: string; peer_short: string; device: string; ticket: string }
+  | { kind: "peers-updated" };
+
+/** `platform_info` — the one signal the frontend uses to tell the desktop
+ * and iOS builds apart (PRODUCT.md Operating Context). Optional: older
+ * builds / test doubles without it fall back to macOS (see
+ * `state/platform.tsx`). */
+export interface PlatformInfo {
+  os: "macos" | "ios";
+}
+
 export interface IpcSurface {
   listProjects(): Promise<ProjectEntry[] | string[]>;
   listDir(projectPath: string): Promise<TreeEntry[]>;
@@ -138,6 +240,44 @@ export interface IpcSurface {
   beamReceivedDir?(): Promise<string>;
   /** Past beams, newest first. */
   beamListReceived?(): Promise<BeamReceivedEntry[]>;
+
+  /** Trusted peers, newest pairing first. Never boots the endpoint. */
+  remoteListPeers?(): Promise<RemotePeer[]>;
+  /** Mint a one-time pairing ticket + link. Boots the endpoint. */
+  remotePairBegin?(): Promise<RemotePairInvite>;
+  /** Open a pairing ticket and park at the fingerprint step. */
+  remotePairComplete?(ticket: string): Promise<RemotePendingPair>;
+  /** Resolve a parked pairing after the human compares the six words. */
+  remotePairConfirm?(
+    nodeId: string,
+    accept: boolean,
+    scope?: RemoteScope,
+  ): Promise<RemotePeer | null>;
+  /** Revoke a peer. Never boots. */
+  remoteUnpair?(nodeId: string): Promise<void>;
+  /** Change what a peer may do. Never boots. */
+  remoteSetScope?(nodeId: string, scope: RemoteScope): Promise<void>;
+  /** The host bridge from the tabs reducer — called on every tabs commit. */
+  remotePublishTabs?(tabs: RemoteTabEntry[]): Promise<void>;
+  /** The peer's open tabs, live. */
+  remoteListTabs?(peer: string): Promise<RemoteTabEntry[]>;
+  /** The peer's bookmarks. */
+  remoteListBookmarks?(peer: string): Promise<RemotePathEntry[]>;
+  /** The peer's recents. */
+  remoteListRecents?(peer: string): Promise<RemotePathEntry[]>;
+  /** One directory level of the peer's workspace (browse scope and up). */
+  remoteListTree?(peer: string, path: string): Promise<TreeEntry[]>;
+  /** Fetch an artifact from a peer into the local cache. */
+  remoteGet?(peer: string, path: string): Promise<RemoteArtifact>;
+  /** Drive the peer: open an artifact on ITS screen (control scope only). */
+  remoteOpenOnHost?(peer: string, path: string, readerMode: boolean): Promise<void>;
+  /** Start receiving the peer's events (`vlerv://remote-event`). */
+  remoteSubscribe?(peer: string): Promise<void>;
+  /** Stop receiving the peer's events. */
+  remoteUnsubscribe?(peer: string): Promise<void>;
+
+  /** Which shell this build runs in — macOS desktop or the iOS companion. */
+  platformInfo?(): Promise<PlatformInfo>;
 }
 
 const WORKSPACE_ROOT_KEY = "vlerv.workspaceRoot";
@@ -180,6 +320,20 @@ class TauriIpc implements IpcSurface {
   }
 
   async readFile(path: string): Promise<FilePayload> {
+    // A `vlerv-remote://<peer>/abs/path` tab address (design §6): fetch the
+    // verified artifact into the local content-addressed cache, then read
+    // THAT file for bytes — `read_file` is deliberately ungated (see
+    // reader.rs), and the cache path is our own app-data file, not
+    // attacker-controlled. The returned payload's `path` is overwritten back
+    // to the remote address: that address, not the hash-addressed cache
+    // file, is the stable identity scroll memory and tab reload key off, and
+    // it must survive a live-reload refetch landing at a NEW cache path.
+    const remote = parseRemoteAddress(path);
+    if (remote) {
+      const artifact = await this.remoteGet(remote.peer, remote.path);
+      const payload = await invoke<FilePayload>("read_file", { path: artifact.path });
+      return { ...payload, path };
+    }
     return await invoke<FilePayload>("read_file", { path });
   }
 
@@ -273,6 +427,74 @@ class TauriIpc implements IpcSurface {
 
   async beamListReceived(): Promise<BeamReceivedEntry[]> {
     return await invoke<BeamReceivedEntry[]>("beam_list_received");
+  }
+
+  async remoteListPeers(): Promise<RemotePeer[]> {
+    return await invoke<RemotePeer[]>("remote_list_peers");
+  }
+
+  async remotePairBegin(): Promise<RemotePairInvite> {
+    return await invoke<RemotePairInvite>("remote_pair_begin");
+  }
+
+  async remotePairComplete(ticket: string): Promise<RemotePendingPair> {
+    return await invoke<RemotePendingPair>("remote_pair_complete", { ticket });
+  }
+
+  async remotePairConfirm(
+    nodeId: string,
+    accept: boolean,
+    scope?: RemoteScope,
+  ): Promise<RemotePeer | null> {
+    return await invoke<RemotePeer | null>("remote_pair_confirm", { nodeId, accept, scope });
+  }
+
+  async remoteUnpair(nodeId: string): Promise<void> {
+    await invoke<void>("remote_unpair", { nodeId });
+  }
+
+  async remoteSetScope(nodeId: string, scope: RemoteScope): Promise<void> {
+    await invoke<void>("remote_set_scope", { nodeId, scope });
+  }
+
+  async remotePublishTabs(tabs: RemoteTabEntry[]): Promise<void> {
+    await invoke<void>("remote_publish_tabs", { tabs });
+  }
+
+  async remoteListTabs(peer: string): Promise<RemoteTabEntry[]> {
+    return await invoke<RemoteTabEntry[]>("remote_list_tabs", { peer });
+  }
+
+  async remoteListBookmarks(peer: string): Promise<RemotePathEntry[]> {
+    return await invoke<RemotePathEntry[]>("remote_list_bookmarks", { peer });
+  }
+
+  async remoteListRecents(peer: string): Promise<RemotePathEntry[]> {
+    return await invoke<RemotePathEntry[]>("remote_list_recents", { peer });
+  }
+
+  async remoteListTree(peer: string, path: string): Promise<TreeEntry[]> {
+    return await invoke<TreeEntry[]>("remote_list_tree", { peer, path });
+  }
+
+  async remoteGet(peer: string, path: string): Promise<RemoteArtifact> {
+    return await invoke<RemoteArtifact>("remote_get", { peer, path });
+  }
+
+  async remoteOpenOnHost(peer: string, path: string, readerMode: boolean): Promise<void> {
+    await invoke<void>("remote_open_on_host", { peer, path, readerMode });
+  }
+
+  async remoteSubscribe(peer: string): Promise<void> {
+    await invoke<void>("remote_subscribe", { peer });
+  }
+
+  async remoteUnsubscribe(peer: string): Promise<void> {
+    await invoke<void>("remote_unsubscribe", { peer });
+  }
+
+  async platformInfo(): Promise<PlatformInfo> {
+    return await invoke<PlatformInfo>("platform_info");
   }
 }
 

@@ -420,3 +420,53 @@ describe("reopen closed tab", () => {
     expect(s.closed[0].history[0].path).toBe(`/f${CLOSED_CAP + 2}`);
   });
 });
+
+describe("FOLLOW_NAVIGATE — follow mode's dedicated per-peer tab", () => {
+  const PREFIX = "vlerv-remote://peer1";
+  const A = `${PREFIX}/w/a.md`;
+  const B = `${PREFIX}/w/b.md`;
+
+  it("opens a new tab when no tab shows this peer yet", () => {
+    let s = initialTabsState();
+    s = nav(s, "/local.md");
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: A });
+    expect(s.tabs).toHaveLength(2);
+    expect(currentEntry(activeTab(s))?.path).toBe(A);
+    expect(currentEntry(activeTab(s))?.external).toBe(true);
+  });
+
+  it("reuses that tab on every later switch, leaving the local tab alone", () => {
+    let s = initialTabsState();
+    s = nav(s, "/local.md");
+    const localId = s.activeTabId;
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: A });
+    const followId = s.activeTabId;
+    // The user goes back to reading something local...
+    s = tabsReducer(s, { type: "ACTIVATE_TAB", tabId: localId });
+    // ...and the host switches tabs again.
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: B });
+    expect(s.tabs).toHaveLength(2);
+    expect(s.activeTabId).toBe(followId);
+    expect(currentEntry(s.tabs.find((t) => t.id === followId)!)?.path).toBe(B);
+    // The local tab kept its own document.
+    expect(currentEntry(s.tabs.find((t) => t.id === localId)!)?.path).toBe("/local.md");
+  });
+
+  it("keeps one tab per peer — another peer gets its own", () => {
+    let s = initialTabsState();
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: A });
+    s = tabsReducer(s, {
+      type: "FOLLOW_NAVIGATE",
+      prefix: "vlerv-remote://peer2",
+      path: "vlerv-remote://peer2/w/c.md",
+    });
+    expect(s.tabs.filter((t) => currentEntry(t) !== null)).toHaveLength(2);
+  });
+
+  it("pushes history in the followed tab, so back walks the host's trail", () => {
+    let s = initialTabsState();
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: A });
+    s = tabsReducer(s, { type: "FOLLOW_NAVIGATE", prefix: PREFIX, path: B });
+    expect(canGoBack(activeTab(s))).toBe(true);
+  });
+});

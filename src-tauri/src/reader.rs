@@ -52,6 +52,13 @@ pub struct FilePayload {
     /// base64 bytes for raster images. None for other binary or oversized
     /// files.
     pub content: Option<String>,
+    /// True when the file was authored by someone other than this machine's
+    /// user — a beam-received or a Scope-fetched artifact under the app's own
+    /// `received/` or `cache/` dirs. The renderer isolates it (opaque-origin
+    /// iframe, no `file://` base). Provenance travels ON the payload so the
+    /// decision never depends on an async lookup the frontend races.
+    #[serde(default)]
+    pub untrusted: bool,
 }
 
 /// Raster image extensions served as base64 (rendered via data: URI in the
@@ -85,7 +92,25 @@ pub enum ReadError {
 /// content; everything else returns metadata-only. Returns a typed error
 /// for missing paths.
 pub fn read_file(path: &Path) -> Result<FilePayload, ReadError> {
-    read_file_with_caps(path, MAX_TEXT_BYTES, MAX_IMAGE_BYTES)
+    let mut payload = read_file_with_caps(path, MAX_TEXT_BYTES, MAX_IMAGE_BYTES)?;
+    payload.untrusted = is_untrusted_origin(path);
+    Ok(payload)
+}
+
+/// True when `path` lives under the app's `received/` or `cache/` dirs — i.e.
+/// a beam-received or Scope-fetched artifact authored by another machine.
+/// Compared on the canonical form so a `..` cannot dodge the prefix check.
+fn is_untrusted_origin(path: &Path) -> bool {
+    let dirs = crate::remote::dirs();
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    for base in [dirs.received(), dirs.cache()] {
+        if let Ok(base) = base.canonicalize() {
+            if canonical.starts_with(&base) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Implementation with injectable caps so tests don't need multi-MiB files.
@@ -116,6 +141,7 @@ fn read_file_with_caps(
     if is_raster(path) {
         if size > max_image_bytes {
             return Ok(FilePayload {
+                untrusted: false,
                 path: path.to_path_buf(),
                 size,
                 mtime,
@@ -132,6 +158,7 @@ fn read_file_with_caps(
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         return Ok(FilePayload {
+                untrusted: false,
             path: path.to_path_buf(),
             size,
             mtime,
@@ -145,6 +172,7 @@ fn read_file_with_caps(
     // Oversized check — return metadata only, no content.
     if size > max_text_bytes {
         return Ok(FilePayload {
+                untrusted: false,
             path: path.to_path_buf(),
             size,
             mtime,
@@ -174,6 +202,7 @@ fn read_file_with_caps(
 
     if is_binary {
         return Ok(FilePayload {
+                untrusted: false,
             path: path.to_path_buf(),
             size,
             mtime,
@@ -200,6 +229,7 @@ fn read_file_with_caps(
     };
 
     Ok(FilePayload {
+                untrusted: false,
         path: path.to_path_buf(),
         size,
         mtime,

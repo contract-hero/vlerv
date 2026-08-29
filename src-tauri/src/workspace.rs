@@ -184,16 +184,10 @@ pub enum ScanError {
     NotADirectory(PathBuf),
 }
 
-/// Default-ignored directory names filtered out during expansion.
-pub const DEFAULT_IGNORED: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".venv",
-];
+/// Default-ignored directory names filtered out during expansion. Defined in
+/// `vlerv-remote` and re-exported here: the remote `ListTree` applies the same
+/// list (design §6), and two copies would drift.
+pub use vlerv_remote::DEFAULT_IGNORED;
 
 /// Cap on entries returned by `list_files_recursive`. BFS order means the
 /// shallowest paths survive truncation — better quick-open hits.

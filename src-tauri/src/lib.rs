@@ -1,9 +1,18 @@
 // Vlerv Tauri core library. Modules are declared here so integration tests
 // under tests/ can import them as `src_tauri::workspace::...` etc.
 
+// The Tauri builder itself. Shared by the desktop `main.rs` shim and by the
+// iOS `start_app` entry point (`#[tauri::mobile_entry_point]` on `app::run`).
+pub mod app;
 pub mod workspace;
 pub mod reader;
 pub mod deeplink;
+pub mod platform;
+// macOS-only: the payload it builds is an AppKit pasteboard shape
+// (`public.file-url` + a `file://` URL) for drag-out to Finder. iOS has no
+// Finder and no drag-out target, and the `drag` plugin that consumes the
+// shape is a macOS-target dependency.
+#[cfg(target_os = "macos")]
 pub mod drag_spike;
 pub mod security;
 pub mod share;
@@ -34,6 +43,11 @@ pub struct OpenFileEvent {
     /// Optional line number from `vlerv://open?path=…&line=N`.
     #[serde(default)]
     pub line: Option<u32>,
+    /// Set only by a control-scoped remote peer's `OpenOnHost` (Scope v2):
+    /// open the artifact in reader mode. Absent for every local deep link,
+    /// so the frontend's existing handling is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_mode: Option<bool>,
 }
 
 /// Typed payload emitted on `vlerv://deep-link-error` when the URL is
@@ -68,6 +82,21 @@ pub struct BeamReceiveRequest {
     pub hash: String,
 }
 
+/// Typed payload emitted for a `vlerv://pair` deep link after the ticket
+/// parses. Nothing is persisted and no fingerprint exists yet — the frontend
+/// calls `remote_pair_complete` with the ticket, which is what dials the
+/// host and produces the six words both screens compare.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PairRequest {
+    pub ticket: String,
+    /// The inviting instance's NodeId (full and short), straight from the
+    /// ticket — shown beside the device name before the user proceeds.
+    pub host_id: String,
+    pub host_id_short: String,
+    /// Sanitized device-name hint from the ticket.
+    pub device: String,
+}
+
 /// Typed payload emitted on `vlerv://beam-send-request` for the CLI's
 /// `vlerv beam <path>`. Opens the send dialog; the offer is only minted when
 /// the user confirms there.
@@ -85,6 +114,7 @@ pub enum DeepLinkAction {
     OpenFile(OpenFileEvent),
     BeamReceive(BeamReceiveRequest),
     BeamSend(BeamSendRequest),
+    Pair(PairRequest),
 }
 
 /// C2: truncate-at-char-boundary helper exposed to tests (B5 carry-forward).
@@ -127,6 +157,18 @@ pub fn dispatch_deep_link(
                 hash: info.hash,
             }));
         }
+        deeplink::DeepLinkIntent::Pair { ticket } => {
+            // Validate the ticket and surface the inviting instance for the
+            // confirm face. Pure parse — no endpoint boot, no dial.
+            let parsed: remote::peers::PairTicket = ticket.parse().map_err(&make_err)?;
+            let id = parsed.addr.id;
+            return Ok(DeepLinkAction::Pair(PairRequest {
+                ticket,
+                host_id: id.to_string(),
+                host_id_short: id.fmt_short().to_string(),
+                device: parsed.device,
+            }));
+        }
         deeplink::DeepLinkIntent::Beam { path } => {
             // One offer-path policy, shared with beam_offer: conservative
             // share gate (beam sends data OFF the machine), files only,
@@ -160,6 +202,7 @@ pub fn dispatch_deep_link(
         intent: kind,
         out_of_root,
         line,
+        reader_mode: None,
     }))
 }
 
@@ -180,6 +223,13 @@ pub fn handle_deep_link(url: &str) {
         deeplink::DeepLinkIntent::Open { path, .. } => path,
         deeplink::DeepLinkIntent::Reveal { path } => path,
         deeplink::DeepLinkIntent::Beam { path } => path,
+        deeplink::DeepLinkIntent::Pair { ticket } => {
+            eprintln!(
+                "vlerv: deep-link: pair ticket {}…",
+                ticket.chars().take(16).collect::<String>()
+            );
+            return;
+        }
         deeplink::DeepLinkIntent::Receive { ticket, .. } => {
             // No local path to echo — the ticket names remote content.
             // chars().take, not a byte slice: panic-free even if the ticket
@@ -476,6 +526,64 @@ mod dispatch_deep_link_tests {
             }
             other => panic!("expected BeamReceive, got {other:?}"),
         }
+    }
+
+    // ── The pair verb (Scope v2) ─────────────────────────────────────────
+
+    #[test]
+    fn pair_verb_surfaces_the_inviting_instance_without_dialing_it() {
+        let secret = iroh::SecretKey::generate();
+        let ticket = remote::peers::PairTicket {
+            addr: iroh::EndpointAddr::from(secret.public()),
+            token: [7u8; 32],
+            // Hostile device hint: the bidi override must not survive to the
+            // confirm face.
+            device: "Mac\u{202E}Studio".to_string(),
+        }
+        .to_string();
+        let url = format!("vlerv://pair?ticket={ticket}");
+
+        match dispatch_deep_link(&url, &security::RootSet::empty()).expect("ok") {
+            DeepLinkAction::Pair(req) => {
+                assert_eq!(req.ticket, ticket);
+                assert_eq!(req.host_id, secret.public().to_string());
+                assert_eq!(req.host_id_short, secret.public().fmt_short().to_string());
+                assert_eq!(req.device, "MacStudio");
+            }
+            other => panic!("expected Pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_verb_with_a_garbage_ticket_is_rejected_before_any_ui() {
+        let err = dispatch_deep_link("vlerv://pair?ticket=notaticket123", &security::RootSet::empty())
+            .expect_err("err");
+        assert!(err.reason.contains("invalid pairing ticket"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn pair_verb_rejects_a_beam_ticket() {
+        // Both are base32; the kind prefix is what keeps the two verbs apart.
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            iroh::SecretKey::generate().public().into(),
+            iroh_blobs::Hash::new(b"payload"),
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let url = format!("vlerv://pair?ticket={ticket}");
+        assert!(dispatch_deep_link(&url, &security::RootSet::empty()).is_err());
+    }
+
+    #[test]
+    fn pair_verb_enforces_the_same_strict_parsing_as_receive() {
+        // Missing parameter, empty value, and a non-alphanumeric ticket all
+        // die in the parser — the ticket parser never sees them.
+        assert!(deeplink::parse("vlerv://pair").is_err());
+        assert!(deeplink::parse("vlerv://pair?ticket=").is_err());
+        let err = deeplink::parse("vlerv://pair?ticket=abc%2F..%2Fdef").expect_err("err");
+        assert!(err.to_string().contains("alphanumeric"));
+        let err = deeplink::parse("vlerv://pair?ticket=ab%00cd").expect_err("err");
+        assert!(err.to_string().contains("alphanumeric"));
     }
 
     #[test]

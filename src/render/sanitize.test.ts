@@ -1,0 +1,58 @@
+import { describe, expect, it } from "vitest";
+import { isForbiddenTag, isUnsafeAttribute } from "./sanitize";
+
+describe("isForbiddenTag", () => {
+  it("drops the elements that execute or re-address the document", () => {
+    for (const tag of ["SCRIPT", "IFRAME", "OBJECT", "EMBED", "BASE"]) {
+      expect(isForbiddenTag(tag)).toBe(true);
+    }
+  });
+
+  it("drops the elements that navigate or fetch on insertion", () => {
+    // `<meta http-equiv="refresh">` runs on insertion into ANY part of the
+    // document, so an importNode'd markdown fragment could send the
+    // privileged host webview somewhere else.
+    expect(isForbiddenTag("META")).toBe(true);
+    expect(isForbiddenTag("meta")).toBe(true);
+    expect(isForbiddenTag("LINK")).toBe(true);
+  });
+
+  it("is case-insensitive — an SVG tree reports lowercase tag names", () => {
+    expect(isForbiddenTag("script")).toBe(true);
+  });
+
+  it("keeps ordinary content and SVG drawing elements", () => {
+    for (const tag of ["DIV", "svg", "path", "image", "use", "foreignObject"]) {
+      expect(isForbiddenTag(tag)).toBe(false);
+    }
+  });
+});
+
+describe("isUnsafeAttribute", () => {
+  it("strips every on* handler, whatever the case", () => {
+    expect(isUnsafeAttribute("onload", "x()")).toBe(true);
+    expect(isUnsafeAttribute("OnError", "x()")).toBe(true);
+    expect(isUnsafeAttribute("onclick", "")).toBe(true);
+  });
+
+  it("strips javascript: in URL-bearing attributes", () => {
+    expect(isUnsafeAttribute("href", "javascript:alert(1)")).toBe(true);
+    expect(isUnsafeAttribute("xlink:href", "JavaScript:alert(1)")).toBe(true);
+    expect(isUnsafeAttribute("src", "javascript:alert(1)")).toBe(true);
+    expect(isUnsafeAttribute("formaction", "javascript:alert(1)")).toBe(true);
+  });
+
+  it("sees through whitespace and control characters in the scheme", () => {
+    expect(isUnsafeAttribute("href", "java\tscript:alert(1)")).toBe(true);
+    expect(isUnsafeAttribute("href", " java\nscript:alert(1)")).toBe(true);
+    expect(isUnsafeAttribute("href", "java\u0000script:alert(1)")).toBe(true);
+  });
+
+  it("keeps ordinary attributes and ordinary URLs", () => {
+    expect(isUnsafeAttribute("class", "onload")).toBe(false);
+    expect(isUnsafeAttribute("href", "https://example.com")).toBe(false);
+    expect(isUnsafeAttribute("href", "#anchor")).toBe(false);
+    expect(isUnsafeAttribute("d", "M0 0 L10 10")).toBe(false);
+    expect(isUnsafeAttribute("title", "javascript: is a language")).toBe(false);
+  });
+});

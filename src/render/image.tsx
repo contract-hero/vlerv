@@ -1,7 +1,8 @@
-// Image renderer — raster via data URI; SVG inline (scripts stripped).
+// Image renderer — raster via data URI; SVG inline (sanitized).
 import * as React from "react";
 import type { FilePayload } from "../ipc";
 import MetadataRenderer from "./metadata";
+import { sanitizeTree } from "./sanitize";
 
 export interface ImageRendererProps {
   payload: FilePayload;
@@ -60,7 +61,13 @@ function SvgInline({ source }: { source: string }): React.ReactElement {
     try {
       const doc = new DOMParser().parseFromString(source, "image/svg+xml");
       const svg = doc.documentElement;
-      svg.querySelectorAll("script").forEach((s) => s.parentNode?.removeChild(s));
+      // An SVG imported here goes into the PRIVILEGED host DOM, where
+      // `window.__TAURI_INTERNALS__.invoke` is reachable. Dropping <script>
+      // alone left `<svg onload=…>` and `javascript:` hrefs live, and the
+      // author of this file is not always the local user — a Scope peer's
+      // artifact and a beamed file both reach this renderer. Sanitize every
+      // SVG, whatever its provenance: a drawing loses nothing by it.
+      sanitizeTree(svg);
       el.appendChild(document.importNode(svg, true));
     } catch {
       // Source unparseable — show empty container.

@@ -5,6 +5,10 @@ export interface OpenFileOptions {
   background?: boolean;
   /** Override the computed in-root/external classification. */
   external?: boolean;
+  /** Follow mode only: retarget the tab already showing an address under
+   *  this prefix (one dedicated tab per peer), opening one if there is
+   *  none — instead of navigating whatever tab is active locally. */
+  followPrefix?: string;
 }
 
 /**

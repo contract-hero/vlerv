@@ -1,0 +1,32 @@
+[package]
+name = "vlerv-remote"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "vlerv_remote"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+percent-encoding = "2"
+# Exact-pinned on purpose: the iroh API churned through 0.x, and a same-range
+# bump can change request-gate behavior (see beam.rs gate). Upgrades are
+# deliberate migrations, not `cargo update` accidents.
+iroh = "=1.0.3"
+iroh-blobs = "=0.103.0"
+# Same pin discipline: the Scope pairing ticket rides iroh's own ticket
+# encoding (postcard + base32 + kind prefix), and postcard is the wire format
+# of the scope protocol frames.
+iroh-tickets = "=1.0.0"
+postcard = { version = "1", features = ["use-std"] }
+# gethostname for the device name announced in every handshake.
+libc = "0.2"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+n0-future = "0.3"
+bao-tree = "0.16"
+
+[dev-dependencies]
+tempfile = "3"

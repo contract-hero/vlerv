@@ -66,6 +66,9 @@
      the equalities are real instead of asserted in comments. */
   --band-h: 40px;
   --titlebar-inset: 78px;
+  /* The Apple HIG minimum comfortable touch target. Every phone control is
+     at least this tall; widths still vary with the control. */
+  --tap-min: 44px;
 
   /* motion */
   --dur-fast: 80ms;
@@ -1660,3 +1663,353 @@ pre {
 }
 .beam-popover-received:hover { background: var(--bg-row-hover); }
 .beam-popover-received .beam-popover-meta { margin-left: auto; flex: 0 0 auto; }
+
+/* ── Remote (remote-control-design.html v2 — Scope) ────────────────────── */
+/* The drawer reuses the shared [data-section] row grammar; only the
+   header's presence dot / Follow toggle and the active-tab highlight are
+   new here. */
+[data-section] li.active {
+  background: var(--bg-row-selected);
+  color: var(--fg);
+}
+.remote-presence-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: var(--space-1);
+  background: var(--fg-muted);
+}
+.remote-presence-dot.remote-presence-online { background: var(--accent-strong); }
+.remote-presence-dot.remote-presence-connecting {
+  background: var(--fg-muted);
+  animation: remote-pulse 1.2s ease-in-out infinite;
+}
+.remote-presence-dot.remote-presence-offline { background: var(--border-strong); }
+@keyframes remote-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.remote-follow-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: var(--space-1);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.remote-follow-toggle:hover { background: var(--button-hover-bg); color: var(--fg); }
+.remote-follow-toggle.active { color: var(--accent-strong); }
+/* Sub-heading inside a peer drawer: "Bookmarks" / "Recent". */
+.remote-list-label {
+  padding: var(--space-2) var(--space-3) 2px;
+  font-size: var(--text-caption);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.remote-tree-error {
+  padding: 2px var(--space-3) var(--space-2);
+  font-size: var(--text-caption);
+  color: var(--error-fg);
+}
+.remote-fingerprint-words {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+}
+.remote-fingerprint-words span {
+  font-family: var(--font-mono);
+  font-size: var(--text-body-sm);
+  color: var(--fg);
+  background: var(--badge-bg);
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+}
+.remote-peer-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+.remote-peer-info { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; }
+.remote-peer-name { font-size: var(--text-body-sm); color: var(--fg); }
+.remote-peer-meta { font-size: var(--text-caption); color: var(--fg-muted); }
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--overlay-scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 8vh;
+  overflow-y: auto;
+}
+.settings-dialog {
+  width: min(560px, 90vw);
+  margin-bottom: 8vh;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-overlay), var(--edge-highlight);
+  overflow: hidden;
+}
+
+/* ── iOS companion (PRODUCT.md: read-only companion, no desktop chrome) ──
+   `platform-ios`/`platform-macos` are set on <body> by PlatformProvider
+   (src/state/platform.tsx). Same tokens, different architecture: the phone
+   never mounts the desktop panes — PhoneShell is one column (title band /
+   artifact / bottom bar) with Library and Tabs as bottom sheets. The
+   artifact stays the protagonist; the chrome stays a dark frame. */
+body.platform-ios .app-shell {
+  /* 100vh overshoots WKWebView's visible viewport on iOS (the browser-chrome
+     vh bug); dvh tracks the real one so the bottom bar stays on screen. */
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  /* No bottom padding: .phone-bar owns the home-indicator inset so its
+     surface runs to the physical edge of the screen. */
+}
+body.platform-ios [data-section] li,
+body.platform-ios .start-row,
+body.platform-ios .remote-follow-toggle {
+  min-height: var(--tap-min);
+}
+
+.phone-shell {
+  position: relative; /* anchor for the floating .app-notice toast */
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--bg);
+}
+
+/* Title band — the only top chrome. One centered label; the live dot sits
+   in the flow beside it and pulses when the open artifact is rewritten
+   (locally or across the wire — the one place the accent moves). */
+.phone-titlebar {
+  flex: none;
+  height: var(--band-h);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+}
+.phone-title {
+  font-size: var(--text-ui);
+  font-weight: 500;
+  letter-spacing: var(--track-body);
+  color: var(--fg-strong);
+  max-width: 72%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.phone-title-brand {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: var(--track-headline);
+  color: var(--fg);
+}
+.phone-live-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-pill);
+  background: var(--accent-strong);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.phone-live-dot.is-live {
+  opacity: 1;
+  animation: phone-live-pulse 1.2s var(--ease) 2;
+}
+@keyframes phone-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(130, 143, 255, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(130, 143, 255, 0); }
+}
+
+.phone-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Bottom bar — navigation at the thumb. It owns the home-indicator inset
+   so the chrome surface runs to the screen edge. */
+.phone-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 2px var(--space-3) env(safe-area-inset-bottom);
+  min-height: 50px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border);
+  box-shadow: var(--edge-highlight);
+}
+.phone-bar-button {
+  width: 64px;
+  height: var(--tap-min);
+  display: grid;
+  place-items: center;
+  background: none;
+  border: none;
+  border-radius: var(--r-md);
+  color: var(--fg-muted);
+}
+.phone-bar-button:active { background: var(--bg-row-hover); color: var(--fg-strong); }
+.phone-bar-button:disabled { color: var(--fg-dim); opacity: 0.55; }
+.phone-tab-count {
+  min-width: 21px;
+  height: 21px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid currentColor;
+  border-radius: var(--r-xs);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sheets — the Library and the open-tab list rise from the bar and leave
+   the artifact visible behind the scrim. */
+.phone-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  border: none;
+  padding: 0;
+  background: var(--overlay-scrim);
+}
+.phone-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 41;
+  max-height: 78%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border-strong);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  box-shadow: var(--shadow-overlay), var(--edge-highlight);
+  padding-bottom: env(safe-area-inset-bottom);
+  animation: phone-sheet-up var(--dur) var(--ease);
+}
+@keyframes phone-sheet-up {
+  from { transform: translateY(24px); opacity: 0.6; }
+  to { transform: none; opacity: 1; }
+}
+.phone-sheet-grab {
+  flex: none;
+  width: 36px;
+  height: 5px;
+  margin: 8px auto 4px;
+  border-radius: var(--r-pill);
+  background: var(--border-tertiary);
+}
+.phone-sheet-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 4px var(--space-3) 8px var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+.phone-sheet-title {
+  flex: 1;
+  font-size: var(--text-body-sm);
+  font-weight: 600;
+  letter-spacing: var(--track-headline);
+  color: var(--fg);
+}
+/* Width stays at the icon's visual size; the HEIGHT carries the touch target,
+   because these sit in a row where a wider button would eat the title. */
+.phone-sheet-action {
+  width: 40px;
+  min-height: var(--tap-min);
+  display: grid;
+  place-items: center;
+  background: none;
+  border: none;
+  border-radius: var(--r-md);
+  color: var(--fg-muted);
+}
+.phone-sheet-action:active { background: var(--bg-row-hover); color: var(--fg-strong); }
+.phone-sheet-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  min-height: 120px;
+}
+
+.phone-tab-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.phone-tab-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 52px;
+  padding: 0 var(--space-2) 0 var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+.phone-tab-row.is-active {
+  background: var(--bg-row-selected);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.phone-tab-row-label {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 0;
+  background: none;
+  border: none;
+  text-align: left;
+  color: inherit;
+}
+.phone-tab-row-name {
+  font-size: var(--text-body-sm);
+  font-weight: 500;
+  color: var(--fg);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Same treatment as .start-row-dir, mono included: a path reads as a path. */
+.phone-tab-row-path {
+  font-size: var(--text-caption);
+  font-family: var(--font-mono);
+  color: var(--fg-path);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* keep the discriminating tail of a long path visible */
+  text-align: left;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phone-live-dot.is-live { animation: none; }
+  .phone-sheet { animation: none; }
+}

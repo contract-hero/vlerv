@@ -3,6 +3,7 @@
 import * as React from "react";
 import type { IpcSurface } from "../ipc";
 import { isUnderRoot } from "../utils/path";
+import { isRemoteAddress } from "../utils/remote-address";
 import type { OpenFileOptions } from "./open-opts";
 import { useRecentsContext } from "./recents-context";
 import { useWatcherBus } from "./watcher-bus";
@@ -190,11 +191,14 @@ export function TabsProvider({ ipc, children }: TabsProviderProps): React.ReactE
   // ── External-file watch registration ─────────────────────────────────────
   // The workspace watcher covers in-root files; every open out-of-root file
   // needs an individual watch. Re-register the full set whenever it changes.
+  // A Scope v2 tab is external too, but its address is a `vlerv-remote://`
+  // string, not a local path — the host's own watcher already covers it and
+  // ships the change over the wire, so it never goes to `watch_external_paths`.
   const externalPaths = React.useMemo(() => {
     const set = new Set<string>();
     for (const tab of state.tabs) {
       const e = currentEntry(tab);
-      if (e?.external) set.add(e.path);
+      if (e?.external && !isRemoteAddress(e.path)) set.add(e.path);
     }
     return Array.from(set).sort();
   }, [state.tabs]);
@@ -231,7 +235,9 @@ export function useOpenFile(
   return React.useCallback(
     (path: string, opts?: OpenFileOptions) => {
       const external = opts?.external ?? !isUnderRoot(path, workspaceRoot);
-      if (opts?.newTab) {
+      if (opts?.followPrefix) {
+        dispatch({ type: "FOLLOW_NAVIGATE", prefix: opts.followPrefix, path });
+      } else if (opts?.newTab) {
         dispatch({ type: "OPEN_NEW_TAB", path, external, background: opts.background });
       } else {
         dispatch({ type: "NAVIGATE", path, external });
