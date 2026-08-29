@@ -21,6 +21,7 @@ import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useBookmarksContext } from "../state/bookmarks-context";
 import { useWorkspace } from "../state/workspace";
 import { useBeamActions } from "../state/beam";
+import { usePlatform } from "../state/platform";
 import { BeamIndicator } from "./BeamDialog";
 import { displayPath, isUnderRoot, normalizePathBarInput } from "../utils/path";
 import { slackUrlFromTarget } from "../utils/slack";
@@ -164,11 +165,15 @@ export default function Toolbar({
   const { root } = useWorkspace();
   const { receivedDir } = useBeamActions();
   const { isBookmarked, toggle } = useBookmarksContext();
+  // Native share sheet, Slack hand-off, and outbound Beam sends are macOS/
+  // desktop affordances (PRODUCT.md: iOS is a read-only companion that owns
+  // no files to hand off).
+  const { isMacos } = usePlatform();
   // One settings subscription for the toolbar; the Slack affordance stays
   // hidden until a target is configured.
   const { state: settings } = useSettings(tauriIpc);
   const slackTarget = settings?.preferences?.slack_target;
-  const slackUrl = slackTarget ? slackUrlFromTarget(slackTarget) : null;
+  const slackUrl = isMacos && slackTarget ? slackUrlFromTarget(slackTarget) : null;
 
   const entry = currentEntry(tab);
   const currentPath = entry?.path ?? "";
@@ -333,8 +338,8 @@ export default function Toolbar({
               jobs; the rule between them is the grouping cue. */}
           <span className="toolbar-sep" aria-hidden />
           <CopyPathButton path={entry.path} />
-          <ShareButton path={entry.path} />
-          <BeamButton path={entry.path} />
+          {isMacos ? <ShareButton path={entry.path} /> : null}
+          {isMacos ? <BeamButton path={entry.path} /> : null}
           {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
       ) : null}

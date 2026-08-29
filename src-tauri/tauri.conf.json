@@ -39,6 +39,9 @@
     "resources": ["icons/drag-icon.png"],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    },
+    "iOS": {
+      "frameworks": ["SystemConfiguration"]
     }
   },
   "plugins": {

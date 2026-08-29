@@ -85,6 +85,7 @@ export type TabsAction =
   | { type: "NAVIGATE"; path: string; external: boolean; mode?: "push" | "replace" }
   | { type: "OPEN_NEW_TAB"; path?: string; external?: boolean; background?: boolean }
   | { type: "FOCUS_OR_OPEN"; path: string; external: boolean }
+  | { type: "FOLLOW_NAVIGATE"; prefix: string; path: string }
   | { type: "GO_BACK" }
   | { type: "GO_FORWARD" }
   | { type: "RELOAD"; tabId?: string }
@@ -288,6 +289,27 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         ...state,
         tabs,
         activeTabId: action.background ? state.activeTabId : tab.id,
+      };
+    }
+
+    case "FOLLOW_NAVIGATE": {
+      // Follow mode owns ONE tab per peer: the tab already pointing at an
+      // address of that peer (`prefix` is `vlerv-remote://<peer-id>`).
+      // Routing it through NAVIGATE instead would retarget whatever tab is
+      // active locally, so every switch on the host would overwrite the
+      // local reading position. A remote address is always external.
+      const entry: HistoryEntry = { path: action.path, external: true };
+      const target = state.tabs.find((t) => currentEntry(t)?.path.startsWith(action.prefix));
+      if (!target) {
+        return tabsReducer(state, {
+          type: "OPEN_NEW_TAB",
+          path: action.path,
+          external: true,
+        });
+      }
+      return {
+        ...updateTab(state, target.id, (tab) => pushEntry(tab, entry)),
+        activeTabId: target.id,
       };
     }
 

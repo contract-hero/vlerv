@@ -35,6 +35,10 @@ export interface SidebarSectionProps {
   title: string;
   /** Row count shown at the header's right edge; omit to hide. */
   count?: number;
+  /** Extra header content between the title and the count — the remote
+   * drawer's presence dot + Follow toggle live here (design §6: "presence
+   * shows in the drawer header"). Absent for every other section. */
+  headerExtra?: React.ReactNode;
   /** Collapse state when the user has never toggled this section. */
   defaultCollapsed?: boolean;
   /** Give the section the sidebar's leftover height (the tree). */
@@ -46,6 +50,7 @@ export default function SidebarSection({
   id,
   title,
   count,
+  headerExtra,
   defaultCollapsed = false,
   grow = false,
   children,
@@ -80,6 +85,7 @@ export default function SidebarSection({
           </span>
           <span>{title}</span>
         </button>
+        {headerExtra}
         {count !== undefined ? (
           <span className="section-count" aria-hidden>{count}</span>
         ) : null}

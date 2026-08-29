@@ -18,14 +18,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bao_tree::io::BaoContentItem;
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::provider::events::{
-    AbortReason, EventMask, EventSender, ProviderMessage, RequestMode,
+    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode,
 };
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, Hash};
 use n0_future::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-use super::endpoint::RemoteNode;
+use crate::endpoint::RemoteNode;
 use crate::security::{self, RootSet};
 
 /// Soft warn threshold (receive-dialog copy) and hard cap, per design §5.
@@ -197,11 +197,19 @@ impl Offers {
     /// those kinds are rejected before they ever reach this loop. This is
     /// what makes Stop an *instant* revocation instead of a GC eventually.
     /// `on_change` receives the fresh offers list (fetch counts moved).
+    /// `grants` is the v2 half of the same gate: Scope's `GetArtifact` stages
+    /// an artifact and grants ONE peer a fetch of that hash, so the gate also
+    /// needs to know which NodeId is asking. `connected: Notify` is what
+    /// supplies that — the provider reports the endpoint id once per
+    /// connection, and this loop keeps the connection→peer map for the life
+    /// of the connection.
     pub fn gate(
         self: Arc<Self>,
+        grants: Arc<crate::scope::Grants>,
         on_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
     ) -> EventSender {
         let mask = EventMask {
+            connected: ConnectMode::Notify,
             get: RequestMode::Intercept,
             get_many: RequestMode::Disabled,
             push: RequestMode::Disabled,
@@ -209,10 +217,33 @@ impl Offers {
         };
         let (tx, mut rx) = EventSender::channel(32, mask);
         tokio::spawn(async move {
+            let mut conn_peers: HashMap<u64, iroh::EndpointId> = HashMap::new();
             while let Some(msg) = rx.recv().await {
                 match msg {
+                    ProviderMessage::ClientConnectedNotify(msg) => {
+                        if let Some(id) = msg.endpoint_id {
+                            conn_peers.insert(msg.connection_id, id);
+                        }
+                    }
+                    ProviderMessage::ConnectionClosed(msg) => {
+                        conn_peers.remove(&msg.connection_id);
+                    }
                     ProviderMessage::GetRequestReceived(msg) => {
-                        let res = self.admit(&msg.request.hash, msg.request.ranges.is_blob());
+                        let is_blob = msg.request.ranges.is_blob();
+                        let hash = msg.request.hash;
+                        // A beam offer is a capability held by whoever has the
+                        // ticket; a scope grant is peer-locked. Either admits.
+                        let res = match self.admit(&hash, is_blob) {
+                            Ok(()) => Ok(()),
+                            Err(denied) => {
+                                let peer = conn_peers.get(&msg.connection_id).copied();
+                                if grants.admit(&hash, peer, is_blob) {
+                                    Ok(())
+                                } else {
+                                    Err(denied)
+                                }
+                            }
+                        };
                         let admitted = res.is_ok();
                         msg.tx.send(res).await.ok();
                         if admitted {
@@ -269,6 +300,33 @@ pub fn ticket_info(ticket_str: &str) -> Result<TicketInfo, String> {
         node_id_short: id.fmt_short().to_string(),
         hash: ticket.hash().to_string(),
     })
+}
+
+/// The push-side ticket policy (Scope v2 `Req::PushArtifact`), in one place
+/// beside the receive-side one it mirrors. A pushed ticket is NOT a beam
+/// ticket: a beam ticket is a capability anyone holding it may use, while a
+/// push tells the host to DIAL somebody, so the host admits it only when
+///
+///   * it is a single raw blob (same as beam v1),
+///   * its NodeId is the peer that sent the frame — peer-locked, so a control
+///     peer cannot make the host fetch from a third machine, and
+///   * its hash equals the announced one, so the display metadata the host
+///     shows describes the bytes it is about to pull.
+///
+/// Pure parse — no endpoint, no network. Returns the verified content address.
+pub fn verify_push_ticket(
+    ticket_str: &str,
+    from: iroh::EndpointId,
+    claimed_hash: &str,
+) -> Result<Hash, String> {
+    let ticket = parse_raw_ticket(ticket_str)?;
+    if ticket.addr().id != from {
+        return Err("a pushed ticket must name the pushing peer".to_string());
+    }
+    if ticket.hash().to_string() != claimed_hash {
+        return Err("the pushed ticket does not match the announced content".to_string());
+    }
+    Ok(ticket.hash())
 }
 
 /// A path that passed the full offer policy: share-module root gate,
@@ -378,11 +436,70 @@ async fn delete_tags(node: &RemoteNode, tags: Vec<iroh_blobs::api::Tag>) {
     }
 }
 
+/// Stream one blob into `file`, BLAKE3-verified chunk by chunk, enforcing the
+/// hard size cap on the ACTUAL bytes (never on a claimed size). Shared by the
+/// Beam receive path and Scope's content-addressed cache fetch — one loop, so
+/// the cap and the contiguity invariant cannot drift apart.
+pub(crate) async fn stream_blob_into(
+    connection: iroh::endpoint::Connection,
+    hash: Hash,
+    file: &mut std::io::BufWriter<std::fs::File>,
+    hash_hex: &str,
+    on_progress: &mut impl FnMut(&str, u64),
+) -> Result<u64, String> {
+    let mut written: u64 = 0;
+    let mut last_emitted: u64 = 0;
+    // The bao stream yields leaves in ascending offset order for a full-blob
+    // request; the offset check guards that invariant.
+    let mut progress = get_blob(connection, hash);
+    loop {
+        match progress.next().await {
+            Some(GetBlobItem::Item(BaoContentItem::Leaf(leaf))) => {
+                if leaf.offset != written {
+                    return Err("transfer aborted: non-contiguous stream".to_string());
+                }
+                written += leaf.data.len() as u64;
+                if written > HARD_CAP_BYTES {
+                    return Err(format!(
+                        "transfer aborted: content exceeds the {} cap",
+                        human_bytes(HARD_CAP_BYTES)
+                    ));
+                }
+                file.write_all(&leaf.data)
+                    .map_err(|e| format!("cannot write the incoming file: {e}"))?;
+                if written - last_emitted >= PROGRESS_STRIDE_BYTES {
+                    last_emitted = written;
+                    on_progress(hash_hex, written);
+                }
+            }
+            Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
+            Some(GetBlobItem::Done(_stats)) => break,
+            Some(GetBlobItem::Error(e)) => return Err(format!("transfer failed: {e}")),
+            None => return Err("transfer failed: stream ended unexpectedly".to_string()),
+        }
+    }
+    Ok(written)
+}
+
 /// Dial a ticket and stream the blob into `received_root`, verified chunk by
 /// chunk. `on_progress(hash_hex, received)` fires about once per MiB with the
 /// real measured byte count.
 pub async fn receive(
     node: &RemoteNode,
+    ticket_str: &str,
+    name_hint: Option<&str>,
+    received_root: &Path,
+    on_progress: impl FnMut(&str, u64),
+) -> Result<ReceivedFile, String> {
+    receive_via(&node.endpoint, ticket_str, name_hint, received_root, on_progress).await
+}
+
+/// `receive` against a bare endpoint. The Scope host uses this to pull a
+/// pushed artifact: it holds an endpoint and the peer's ticket, not a whole
+/// node, and a push must land through EXACTLY this path — same verification,
+/// same cap, same `received/` folder, same collision naming.
+pub async fn receive_via(
+    endpoint: &iroh::Endpoint,
     ticket_str: &str,
     name_hint: Option<&str>,
     received_root: &Path,
@@ -396,7 +513,7 @@ pub async fn receive(
 
     let connection = tokio::time::timeout(
         Duration::from_secs(30),
-        node.endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
+        endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
     )
     .await
     .map_err(|_| "sender offline — could not reach the sender (timed out)".to_string())?
@@ -424,41 +541,8 @@ pub async fn receive(
             std::fs::File::create(&partial_path)
                 .map_err(|e| format!("cannot open the incoming file {}: {e}", partial_path.display()))?,
         );
-        let mut written: u64 = 0;
-        let mut last_emitted: u64 = 0;
-        // The bao stream yields leaves in ascending offset order for a
-        // full-blob request; the offset check guards that invariant.
-        let mut progress = get_blob(connection, hash);
-        loop {
-            match progress.next().await {
-                Some(GetBlobItem::Item(BaoContentItem::Leaf(leaf))) => {
-                    if leaf.offset != written {
-                        return Err("transfer aborted: non-contiguous stream".to_string());
-                    }
-                    written += leaf.data.len() as u64;
-                    if written > HARD_CAP_BYTES {
-                        return Err(format!(
-                            "transfer aborted: content exceeds the {} cap",
-                            human_bytes(HARD_CAP_BYTES)
-                        ));
-                    }
-                    file.write_all(&leaf.data)
-                        .map_err(|e| format!("cannot write the incoming file: {e}"))?;
-                    if written - last_emitted >= PROGRESS_STRIDE_BYTES {
-                        last_emitted = written;
-                        on_progress(&hash_hex, written);
-                    }
-                }
-                Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
-                Some(GetBlobItem::Done(_stats)) => break,
-                Some(GetBlobItem::Error(e)) => {
-                    return Err(format!("transfer failed: {e}"));
-                }
-                None => {
-                    return Err("transfer failed: stream ended unexpectedly".to_string());
-                }
-            }
-        }
+        let written =
+            stream_blob_into(connection, hash, &mut file, &hash_hex, &mut on_progress).await?;
         file.into_inner()
             .map_err(|e| format!("cannot flush the incoming file: {e}"))?
             .sync_all()
@@ -714,6 +798,43 @@ mod tests {
     fn ticket_info_rejects_malformed_tickets() {
         assert!(ticket_info("not-a-ticket").is_err());
         assert!(ticket_info("").is_err());
+    }
+
+    // ── verify_push_ticket — a push is peer-locked, an offer is not ─────────
+
+    #[test]
+    fn a_pushed_ticket_must_name_the_pushing_peer_and_the_announced_hash() {
+        let pusher = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let stranger = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let hash = Hash::new(b"pushed bytes");
+        let ticket =
+            BlobTicket::new(pusher.into(), hash, BlobFormat::Raw).to_string();
+
+        assert_eq!(
+            verify_push_ticket(&ticket, pusher, &hash.to_string()).unwrap(),
+            hash
+        );
+        // A control peer must not be able to point the host at a third machine.
+        assert_eq!(
+            verify_push_ticket(&ticket, stranger, &hash.to_string()).unwrap_err(),
+            "a pushed ticket must name the pushing peer"
+        );
+        // Nor announce one artifact and hand over a ticket for another.
+        assert_eq!(
+            verify_push_ticket(&ticket, pusher, &Hash::new(b"other").to_string()).unwrap_err(),
+            "the pushed ticket does not match the announced content"
+        );
+    }
+
+    #[test]
+    fn a_pushed_ticket_is_single_file_only_like_a_beam_ticket() {
+        let pusher = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let hash = Hash::new(b"seq");
+        let seq = BlobTicket::new(pusher.into(), hash, BlobFormat::HashSeq).to_string();
+        assert!(verify_push_ticket(&seq, pusher, &hash.to_string())
+            .unwrap_err()
+            .contains("single-file"));
+        assert!(verify_push_ticket("not-a-ticket", pusher, "x").is_err());
     }
 
     // ── offers registry: admit / expiry / revocation ────────────────────────

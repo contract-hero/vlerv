@@ -1,5 +1,5 @@
 // Pure display helpers for Beam UI (dialog + offers indicator). Size
-// *limits* live in the backend (src-tauri/src/remote/beam.rs) — the
+// *limits* live in the backend (crates/vlerv-remote/src/beam.rs) — the
 // receive dialog gets a pre-computed `warn` flag instead of mirroring the
 // threshold here.
 

@@ -8,6 +8,7 @@ import { Marked } from "marked";
 import markedKatex from "marked-katex-extension";
 import "katex/dist/katex.min.css";
 import { useTheme } from "../hooks/useTheme";
+import { sanitizeTree } from "./sanitize";
 
 // Module-level Marked instance with the KaTeX extension registered once.
 // $inline$ and $$block$$ math both render; throwOnError off so a bad
@@ -92,25 +93,12 @@ export default function MdRenderer({ source, path, onRendered }: MdRendererProps
 
     while (el.firstChild) el.removeChild(el.firstChild);
     const doc = new DOMParser().parseFromString(`<div>${html}</div>`, "text/html");
-    // Markdown lands in the PRIVILEGED host DOM (Tauri IPC is in scope here),
-    // and marked passes raw HTML through unsanitized. DOMParser neuters
-    // <script>, but inline `onerror=` handlers and `javascript:` URLs still
-    // fire once nodes go live — strip them before importNode below.
-    for (const node of Array.from(doc.body.querySelectorAll("*"))) {
-      if (/^(SCRIPT|IFRAME|OBJECT|EMBED|BASE)$/.test(node.tagName)) {
-        node.remove();
-        continue;
-      }
-      for (const attr of Array.from(node.attributes)) {
-        const name = attr.name.toLowerCase();
-        const value = attr.value.replace(/[\s\u0000-\u001f]/g, "").toLowerCase();
-        const isUrlAttr =
-          name === "href" || name === "src" || name === "xlink:href" || name === "srcset";
-        if (name.startsWith("on") || (isUrlAttr && value.startsWith("javascript:"))) {
-          node.removeAttribute(attr.name);
-        }
-      }
-    }
+    // Markdown lands in the PRIVILEGED host DOM (Tauri IPC is in scope
+    // here), and marked passes raw HTML through unsanitized. DOMParser
+    // neuters <script>, but inline `onerror=` handlers and `javascript:`
+    // URLs still fire once nodes go live — strip them before importNode
+    // below. Same walker the inline-SVG renderer uses.
+    sanitizeTree(doc.body);
     const wrapper = doc.body.firstChild;
     if (wrapper) {
       for (const child of Array.from(wrapper.childNodes)) {

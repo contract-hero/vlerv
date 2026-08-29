@@ -43,9 +43,15 @@ export function useTheme(): Theme {
     let unlistenTauri: (() => void) | null = null;
     let cancelled = false;
 
-    // Try Tauri first.
+    // Try Tauri first — on macOS only. Tauri's window.theme() is a desktop
+    // API; on iOS it reports "light" regardless of the trait collection,
+    // which would override the webview's own (correct) media query. The
+    // matchMedia subscription below is the whole mechanism on iOS. UA
+    // sniffing, not the platform-ios body class: that class arrives async
+    // from platform_info and would race this probe.
     (async () => {
       try {
+        if (/iPhone|iPad|iPod/.test(navigator.userAgent)) return;
         const mod = await import("@tauri-apps/api/window");
         const win = mod.getCurrentWindow();
         const current = await win.theme();

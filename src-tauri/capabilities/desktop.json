@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop",
+  "description": "Desktop-only capabilities. The `drag` and `window-state` plugins are macOS-target dependencies (Cargo.toml) and are not registered on iOS, so their permissions cannot live in the cross-platform capability — the iOS build would fail to resolve them.",
+  "platforms": ["macOS"],
+  "windows": ["main"],
+  "permissions": [
+    "drag:default",
+    "window-state:default",
+    {
+      "identifier": "opener:allow-reveal-item-in-dir",
+      "allow": [{ "path": "**" }]
+    }
+  ]
+}

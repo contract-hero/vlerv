@@ -72,6 +72,16 @@ pub struct Preferences {
     /// clamped to ≥ 1 at the use site so a zero can't mint dead tickets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub beam_ttl_hours: Option<u32>,
+    /// Scope v2: accept incoming sessions at launch. Default FALSE — with it
+    /// off the app opens no listening socket until the user invokes a remote
+    /// action, which is the lazy-boot contract (design §4). Even when on, the
+    /// endpoint only starts if the peer store is non-empty.
+    pub remote_listen: bool,
+    /// Reserved: a self-hosted `iroh-relay` URL. None = n0's public relays
+    /// (design §7, the escape hatch if the trust calculus changes). Read by
+    /// nothing yet — the endpoint boots the n0 preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 impl Default for Preferences {
@@ -81,6 +91,8 @@ impl Default for Preferences {
             drag_out_mode: "file".to_string(),
             slack_target: None,
             beam_ttl_hours: None,
+            remote_listen: false,
+            relay_url: None,
         }
     }
 }

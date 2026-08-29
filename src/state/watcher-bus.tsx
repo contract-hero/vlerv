@@ -11,17 +11,26 @@ export interface FsChange {
   path: string;
   /** Present for workspace-tree events, absent for external-file events. */
   project_root?: string;
-  source: "tree" | "external";
+  source: "tree" | "external" | "remote";
 }
 
 type Subscriber = (change: FsChange) => void;
 
 export interface WatcherBus {
   subscribe(cb: Subscriber): () => void;
+  /**
+   * Inject a synthetic change — the remote-drawer live-reload bridge uses
+   * this to turn a `vlerv://remote-event` FileChanged into the same shape a
+   * local watcher event has, so the debounce/reload/scroll-restore
+   * machinery downstream doesn't know or care that the file lives on
+   * another Mac (design §6, Fig. 3).
+   */
+  publish(change: FsChange): void;
 }
 
 const WatcherContext = React.createContext<WatcherBus>({
   subscribe: () => () => {},
+  publish: () => {},
 });
 
 export function useWatcherBus(): WatcherBus {
@@ -48,6 +57,10 @@ export interface WatcherProviderProps {
 export function WatcherProvider({ ipc, root, children }: WatcherProviderProps): React.ReactElement {
   const subscribers = React.useRef(new Set<Subscriber>());
 
+  const emit = React.useCallback((change: FsChange) => {
+    subscribers.current.forEach((cb) => cb(change));
+  }, []);
+
   const bus = React.useMemo<WatcherBus>(
     () => ({
       subscribe(cb: Subscriber) {
@@ -56,13 +69,10 @@ export function WatcherProvider({ ipc, root, children }: WatcherProviderProps): 
           subscribers.current.delete(cb);
         };
       },
+      publish: emit,
     }),
-    [],
+    [emit],
   );
-
-  const emit = React.useCallback((change: FsChange) => {
-    subscribers.current.forEach((cb) => cb(change));
-  }, []);
 
   // Start (or replace) the backend workspace watcher whenever the root changes.
   React.useEffect(() => {

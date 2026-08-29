@@ -10,6 +10,7 @@ import Preview from "./Preview";
 import StartPage from "./StartPage";
 import { dirname } from "../utils/path";
 import { readErrorTitle } from "../utils/read-error";
+import { usePlatform } from "../state/platform";
 
 
 export interface TabViewProps {
@@ -17,6 +18,8 @@ export interface TabViewProps {
   onPickFile: () => void;
   onPickWorkspace: () => void;
   workspaceRoot: string | null;
+  /** Forwarded to StartPage — only consumed by its iOS variant. */
+  onOpenSettings?: () => void;
 }
 
 function isErrorPayload(p: unknown): p is { error: { kind: string; path: string; reason: string } } {
@@ -28,9 +31,11 @@ export default function TabView({
   onPickFile,
   onPickWorkspace,
   workspaceRoot,
+  onOpenSettings,
 }: TabViewProps): React.ReactElement {
   const tab = useActiveTab();
   const dispatch = useTabsDispatch();
+  const { isMacos } = usePlatform();
   const entry = currentEntry(tab);
 
   if (!entry) {
@@ -40,6 +45,7 @@ export default function TabView({
         onPickFile={onPickFile}
         onPickWorkspace={onPickWorkspace}
         workspaceRoot={workspaceRoot}
+        onOpenSettings={onOpenSettings}
       />
     );
   }
@@ -87,23 +93,25 @@ export default function TabView({
           >
             <RotateCw size={13} strokeWidth={2} aria-hidden /> Try again
           </button>
-          <button
-            type="button"
-            className="button"
-            onClick={() => {
-              // tauri-plugin-opener canonicalizes first, so revealing a file
-              // that no longer exists always rejects — which is exactly the
-              // state that renders this button most often. Fall back to the
-              // folder that contained it.
-              void revealItemInDir(path)
-                .catch(() => revealItemInDir(dirname(path)))
-                .catch(() => {
-                  // The folder is gone too. Nothing left to show.
-                });
-            }}
-          >
-            <Folder size={13} strokeWidth={2} aria-hidden /> Reveal in Finder
-          </button>
+          {isMacos ? (
+            <button
+              type="button"
+              className="button"
+              onClick={() => {
+                // tauri-plugin-opener canonicalizes first, so revealing a file
+                // that no longer exists always rejects — which is exactly the
+                // state that renders this button most often. Fall back to the
+                // folder that contained it.
+                void revealItemInDir(path)
+                  .catch(() => revealItemInDir(dirname(path)))
+                  .catch(() => {
+                    // The folder is gone too. Nothing left to show.
+                  });
+              }}
+            >
+              <Folder size={13} strokeWidth={2} aria-hidden /> Reveal in Finder
+            </button>
+          ) : null}
         </div>
       </div>
     );

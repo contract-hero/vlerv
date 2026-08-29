@@ -1,5 +1,6 @@
 // Deep-link parser — `vlerv://open?path=<abs>`, `vlerv://reveal?path=<abs>`,
-// `vlerv://receive?ticket=<t>`, `vlerv://beam?path=<abs>`.
+// `vlerv://receive?ticket=<t>`, `vlerv://beam?path=<abs>`,
+// `vlerv://pair?ticket=<t>`.
 // Pure URL parsing, no Tauri dependency.
 
 use percent_encoding::percent_decode_str;
@@ -29,6 +30,12 @@ pub enum DeepLinkIntent {
     /// the user clicking through it.
     Beam {
         path: PathBuf,
+    },
+    /// Scope v2: a pairing invitation minted by another instance. Parsing
+    /// performs NO network action — the fingerprint confirmation stands
+    /// between this intent and a persisted peer.
+    Pair {
+        ticket: String,
     },
 }
 
@@ -163,6 +170,22 @@ fn require_abs_path(
     Ok(PathBuf::from(path_val))
 }
 
+/// The required `ticket` parameter with the shared validation every ticket
+/// verb gets. Tickets are base32 strings; alphanumeric-only is a strict
+/// superset that rejects NUL, separators and quoting tricks before any ticket
+/// parser sees the value. Shared by `receive` and `pair` so a new ticket verb
+/// cannot silently lose the charset check.
+fn require_ticket(input: &str, params: &[(String, String)]) -> Result<String, DeepLinkError> {
+    let ticket = require_param(input, params, "ticket")?;
+    if !ticket.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(DeepLinkError::Malformed {
+            input: input.to_string(),
+            reason: "ticket must be alphanumeric".to_string(),
+        });
+    }
+    Ok(ticket.to_string())
+}
+
 /// Parse a `vlerv://` URL string into a typed intent.
 pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
     let input = url.to_string();
@@ -209,20 +232,10 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
         }
         "receive" => {
             let params = parse_query_for(&input, query_opt, "ticket")?;
-            let ticket = require_param(&input, &params, "ticket")?;
-
-            // Tickets are base32 strings. Alphanumeric-only is a strict
-            // superset that rejects NUL, separators, and quoting tricks
-            // before the ticket parser ever sees the value.
-            if !ticket.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Err(DeepLinkError::Malformed {
-                    input: input.clone(),
-                    reason: "ticket must be alphanumeric".to_string(),
-                });
-            }
+            let ticket = require_ticket(&input, &params)?;
 
             Ok(DeepLinkIntent::Receive {
-                ticket: ticket.to_string(),
+                ticket,
                 name: optional_param(&params, "name"),
                 size: optional_param(&params, "size").and_then(|v| v.parse::<u64>().ok()),
             })
@@ -231,6 +244,10 @@ pub fn parse(url: &str) -> Result<DeepLinkIntent, DeepLinkError> {
             let params = parse_query_for(&input, query_opt, "path")?;
             let path = require_abs_path(&input, &params)?;
             Ok(DeepLinkIntent::Beam { path })
+        }
+        "pair" => {
+            let params = parse_query_for(&input, query_opt, "ticket")?;
+            Ok(DeepLinkIntent::Pair { ticket: require_ticket(&input, &params)? })
         }
         other => Err(DeepLinkError::UnknownVerb {
             input: input.clone(),

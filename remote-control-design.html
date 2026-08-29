@@ -127,9 +127,9 @@ footer { margin-top: 4rem; border-top: 1px solid var(--border); padding-top: 1re
   <p><strong>Beam</strong> (v1): send an artifact from one Vlervcode instance to another with one link — peer-to-peer, end-to-end encrypted, no VPN, no hosting.<br>
   <strong>Scope</strong> (v2): a persistent paired session — browse and live-follow the artifacts open on another machine's Vlervcode, and drive it remotely.</p>
   <p>
-    <span class="pill">status: v1 (Beam) merged · v2 (Scope) proposed</span>
+    <span class="pill">status: v1 (Beam) + v2 (Scope) + MCP + iOS companion shipped</span>
     <span class="pill">transport: iroh (QUIC, hole-punched)</span>
-    <span class="pill">platforms: macOS · iOS (planned)</span>
+    <span class="pill">platforms: macOS · iOS (simulator-proven)</span>
   </p>
 </header>
 
@@ -565,12 +565,12 @@ enum Event { TabOpened { path }, TabClosed { path }, TabActivated { path },
   <h2>11 · Beyond v2</h2>
   <p>Not designed here, but the foundation makes them cheap to imagine:</p>
   <ul>
-    <li><strong>iOS companion — the committed next platform.</strong> A read-only phone reader for artifacts whose entire data layer is this design: the phone owns no files, so it pairs as a <code>view-open</code>/<code>browse</code> Scope client and receives Beams. The stack carries over — Tauri 2 targets iOS from this same React + Rust codebase, and iroh compiles for iOS, so the <code>remote/</code> module ships to the phone unchanged. Distribution can stay personal (sideload or TestFlight; no App Store). <strong>Now unblocked:</strong> Beam (v1) is merged, so the remote foundation exists; the iOS app's remaining prerequisite is Scope (v2), which gives the phone the paired-session browse/live-follow it reads over. PRODUCT.md now records macOS <em>and</em> iOS as the product's two platforms (this doc previously asked for that revision), so the macOS-only constraint is no longer in the way.</li>
     <li><strong>Co-reading.</strong> Scroll-position sharing over the session stream — a laser pointer for pair-reviewing an audit, two machines, one scroll.</li>
     <li><strong>Collections.</strong> Beam a directory (an HTML report with assets, a whole learning module) as one ticket via blob collections.</li>
     <li><strong>Locked beams by default.</strong> Once most beams flow between paired machines, flip the default from capability-link to peer-locked.</li>
     <li><strong>Menu-bar residency.</strong> A headless serve mode so the Studio answers fetches without the window open.</li>
-    <li><strong>Agent-to-remote deep links.</strong> A Claude Code session on the Studio ends with a link that opens the artifact <em>on whichever paired machine you're holding</em> — <code>vlerv://open?path=…&amp;on=macbook</code>. The deep-link scheme becomes location-transparent.</li>
+    <li><strong>Agent-to-remote deep links.</strong> A Claude Code session on the Studio ends with a link that opens the artifact <em>on whichever paired machine you're holding</em> — <code>vlerv://open?path=…&amp;on=macbook</code>. The deep-link scheme becomes location-transparent.
+      <br><em>Shipped, ahead of this list: <code>crates/vlerv-mcp</code> gives an agent this exact capability today via the <code>PushArtifact</code> protocol verb and the <code>beam_artifact</code> / <code>send_to_device</code> MCP tools.</em></li>
   </ul>
   <details>
     <summary>Explicit non-goals</summary>
