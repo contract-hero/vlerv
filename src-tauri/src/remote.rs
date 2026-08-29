@@ -26,6 +26,7 @@ pub use vlerv_remote::{beam, endpoint, peers, proto, scope};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
@@ -35,7 +36,7 @@ use peers::{Peer, PendingPair, Scope};
 use proto::{ArtifactMeta, PathEntry, TabEntry, TreeEntry};
 // Re-exported for the app's own consumers (deep-link layer, tests) and for
 // symmetry with the module re-exports above.
-pub use vlerv_remote::{Dirs, EmptyCatalog, EventSink, HostCatalog, HostSignal};
+pub use vlerv_remote::{Dirs, EmptyCatalog, HostCatalog, HostSignal};
 
 /// Where this app keeps the remote subsystem's files. The crate hardcodes no
 /// directory: every path below derives from the app's own state dir, so a
@@ -65,6 +66,11 @@ impl HostCatalog for AppCatalog {
 /// pairings) and the client-side sessions this instance holds.
 pub struct RemoteState {
     node: tokio::sync::Mutex<Option<Arc<endpoint::RemoteNode>>>,
+    /// `node.is_some()`, readable without the async mutex. The watcher bridge
+    /// asks this on its own thread for every filesystem event, and an app that
+    /// never booted an endpoint must not spawn a task per event to find that
+    /// out. Only ever goes false → true, under the node mutex.
+    booted: AtomicBool,
     peers: Arc<peers::PeerStore>,
     pairing: Arc<peers::Pairing>,
     tabs: Arc<scope::TabsCache>,
@@ -77,6 +83,7 @@ impl RemoteState {
     pub fn new(roots: RootSet) -> Self {
         Self {
             node: tokio::sync::Mutex::new(None),
+            booted: AtomicBool::new(false),
             peers: Arc::new(peers::PeerStore::load(&dirs().remote())),
             pairing: Arc::new(peers::Pairing::new()),
             tabs: Arc::new(scope::TabsCache::new()),
@@ -86,20 +93,26 @@ impl RemoteState {
         }
     }
 
-    /// Get the booted node, booting it on first use. The `on_offers_change`
-    /// callback is installed once, at boot, and fires with the fresh offers
-    /// list whenever the request gate mutates the registry (fetch counts).
+    /// Get the booted node, booting it on first use. `scope_state` is a
+    /// FACTORY, not a value: every call after the first returns the node
+    /// already in hand, and building a `ScopeState` to drop it again is what
+    /// each of those calls used to do. The `on_offers_change` callback is
+    /// installed once, at boot, and fires with the fresh offers list whenever
+    /// the request gate mutates the registry (fetch counts).
     async fn node(
         &self,
-        scope_state: Option<Arc<scope::ScopeState>>,
+        scope_state: impl FnOnce() -> Arc<scope::ScopeState> + Send,
         on_offers_change: impl Fn(Vec<beam::OfferInfo>) + Send + Sync + 'static,
     ) -> Result<Arc<endpoint::RemoteNode>, String> {
         let mut guard = self.node.lock().await;
         if let Some(node) = guard.as_ref() {
             return Ok(node.clone());
         }
-        let node = Arc::new(endpoint::boot(&dirs(), scope_state, on_offers_change).await?);
+        let node = Arc::new(endpoint::boot(&dirs(), Some(scope_state()), on_offers_change).await?);
         *guard = Some(node.clone());
+        // Published while the mutex is still held, so nothing can observe the
+        // flag before the node it advertises is in place.
+        self.booted.store(true, Ordering::Release);
         Ok(node)
     }
 
@@ -108,6 +121,12 @@ impl RemoteState {
     /// a guaranteed no-op would break the lazy-boot contract.
     async fn existing(&self) -> Option<Arc<endpoint::RemoteNode>> {
         self.node.lock().await.clone()
+    }
+
+    /// Has an endpoint ever booted? The lock-free half of `existing`, for
+    /// callers that only need "is there anything at all to talk to".
+    fn is_booted(&self) -> bool {
+        self.booted.load(Ordering::Acquire)
     }
 }
 
@@ -272,19 +291,6 @@ impl RemoteEvent {
     }
 }
 
-/// What `remote_pair_begin` hands the Settings pane: the link to carry to the
-/// other machine, and this instance's own identity to show beside it.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PairInvite {
-    pub ticket: String,
-    /// `vlerv://pair?ticket=…`
-    pub link: String,
-    pub node_id: String,
-    pub device: String,
-    /// Unix seconds after which the token is dead.
-    pub expires_at: u64,
-}
-
 /// A verified artifact fetched from a peer, in the local content-addressed
 /// cache. `path` is what the render pipeline opens.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -309,31 +315,23 @@ pub fn remote_list_peers(state: tauri::State<'_, RemoteState>) -> Vec<Peer> {
 /// Mint a one-time pairing token and the `vlerv://pair?ticket=…` link that
 /// carries it. Boots the endpoint: the ticket must contain reachable
 /// addresses, which only a bound endpoint knows.
+///
+/// What the Settings pane gets back is `peers::PairInvite` — the link to carry
+/// to the other machine plus this instance's own identity to show beside it.
+/// The crate mints it, so the ticket cannot be described here with a TTL, a
+/// link shape or a NodeId that differs from the one handed out.
 #[tauri::command]
 pub async fn remote_pair_begin(
     app: tauri::AppHandle,
     state: tauri::State<'_, RemoteState>,
-) -> Result<PairInvite, String> {
+) -> Result<peers::PairInvite, String> {
     let node = boot_node(&app, &state).await?;
     // Bounded wait for relay + discovery so the ticket dials from another
     // network; on timeout it still carries direct addresses (same policy as
-    // minting a beam ticket).
+    // minting a beam ticket). The wait is the caller's, not the minter's:
+    // it is endpoint lifecycle, not pairing policy.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), node.endpoint.online()).await;
-
-    let token = state.pairing.mint();
-    let ticket = peers::PairTicket {
-        addr: node.endpoint.addr(),
-        token,
-        device: state.device.clone(),
-    }
-    .to_string();
-    Ok(PairInvite {
-        link: peers::build_pair_link(&ticket),
-        ticket,
-        node_id: node.endpoint.id().to_string(),
-        device: state.device.clone(),
-        expires_at: peers::now_unix() + peers::PAIR_TOKEN_TTL_SECS,
-    })
+    Ok(peers::mint_invite(node.endpoint.addr(), &state.pairing, &state.device))
 }
 
 /// Open a pairing ticket: dial the host's pairing ALPN, present the token,
@@ -348,21 +346,7 @@ pub async fn remote_pair_complete(
     let ticket: peers::PairTicket = ticket.parse()?;
     let node = boot_node(&app, &state).await?;
     let pending = scope::pair_dial(&node, &ticket, state.device.clone()).await?;
-    state.pairing.park(pending.clone());
-    let _ = app.emit(
-        "vlerv://remote-event",
-        RemoteEvent::PairPending {
-            peer: pending.node_id.clone(),
-            device: pending.device.clone(),
-            fingerprint: pending.fingerprint.clone(),
-            role: pending.role.clone(),
-        },
-    );
-    // Debug-only E2E hook, same as the inbound arm in `host_signal_sink`: a
-    // simulator guest cannot be tapped from `simctl`, so the guest path honors
-    // VLERV_TEST_AUTOPAIR too. Absent from release builds.
-    #[cfg(debug_assertions)]
-    test_autopair(&app, &pending);
+    park_and_announce(&app, pending.clone());
     Ok(pending)
 }
 
@@ -437,17 +421,14 @@ pub async fn remote_publish_tabs(
     state: tauri::State<'_, RemoteState>,
     tabs: Vec<TabEntry>,
 ) -> Result<(), String> {
+    // ONE cache either way: `boot_node` hands the server `state.tabs`, so
+    // `server.state.tabs` IS this `state.tabs` and both arms leave the same
+    // gated, canonical list behind for the next `ListTabs`. The only thing a
+    // live server adds is fanning the derived events out to its subscribers.
     match state.existing().await.and_then(|n| n.scope.clone()) {
-        Some(server) => {
-            server.state.publish_tabs(tabs);
-        }
-        None => {
-            // No endpoint yet: the cache still has to be current for the
-            // moment one connects, and it holds the same gated, canonical
-            // shape the wire uses.
-            state.tabs.publish(scope::canonical_tabs(tabs, &state.roots));
-        }
-    }
+        Some(server) => server.state.publish_tabs(tabs),
+        None => state.tabs.publish(scope::canonical_tabs(tabs, &state.roots)),
+    };
     Ok(())
 }
 
@@ -506,7 +487,10 @@ pub async fn remote_get(
 ) -> Result<RemoteArtifact, String> {
     let session = session(&app, &state, &peer).await?;
     let meta: ArtifactMeta = session.get_artifact(path.clone()).await?;
-    let node = boot_node(&app, &state).await?;
+    // A live session means the endpoint is already up — `session` booted it
+    // (or reused the boot that opened the cached one), and the node is never
+    // torn down. So this reads the node instead of asking to boot a second.
+    let node = state.existing().await.ok_or("the remote endpoint is gone")?;
     let addr = endpoint::addr_for(&peer)?;
     // The cache filename carries the source extension (design intent: the
     // local reader dispatches raster images by extension — reader.rs never
@@ -543,26 +527,6 @@ pub async fn remote_open_on_host(
     session(&app, &state, &peer).await?.open_on_host(path, reader_mode).await
 }
 
-/// Push a local artifact onto a peer's machine — the reverse of `remote_get`,
-/// and the write half of "remote control". The host accepts it only from a
-/// control-scoped peer, only over a ticket locked to THIS instance's NodeId,
-/// and lands it through its own verified receive path.
-///
-/// The path is resolved against the same RootSet the local UI uses, by the
-/// same conservative policy Beam applies to an outbound file: pushing sends
-/// data OFF this machine.
-#[tauri::command]
-pub async fn remote_push_artifact(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, RemoteState>,
-    peer: String,
-    path: String,
-) -> Result<scope::PushedArtifact, String> {
-    let session = session(&app, &state, &peer).await?;
-    let roots = state.roots.clone();
-    session.push_artifact(std::path::Path::new(&path), &roots).await
-}
-
 /// Start receiving the peer's events (`vlerv://remote-event`).
 #[tauri::command]
 pub async fn remote_subscribe(
@@ -595,23 +559,31 @@ async fn boot_node(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, RemoteState>,
 ) -> Result<Arc<endpoint::RemoteNode>, String> {
-    let scope_state = Arc::new(scope::ScopeState::new(
-        state.peers.clone(),
-        state.pairing.clone(),
-        state.tabs.clone(),
-        state.roots.clone(),
-        state.device.clone(),
-        Arc::new(AppCatalog),
-        host_signal_sink(app.clone()),
-    ));
     let offers_app = app.clone();
-    // The gate hands the fresh offers list straight to the callback — one
-    // emit path that never re-locks the RemoteState.node tokio mutex (the
-    // gate loop still takes the Offers mutex to admit + list; that's fine).
     state
-        .node(Some(scope_state), move |offers| {
-            let _ = offers_app.emit("vlerv://beam-offers-updated", offers);
-        })
+        .node(
+            // Cold path only: `node` calls this exactly when it is about to
+            // boot, so a command that finds the endpoint already up never
+            // builds a `ScopeState` it would immediately drop.
+            || {
+                Arc::new(scope::ScopeState::new(
+                    state.peers.clone(),
+                    state.pairing.clone(),
+                    state.tabs.clone(),
+                    state.roots.clone(),
+                    state.device.clone(),
+                    Arc::new(AppCatalog),
+                    host_signal_sink(app.clone()),
+                ))
+            },
+            // The gate hands the fresh offers list straight to the callback —
+            // one emit path that never re-locks the RemoteState.node tokio
+            // mutex (the gate loop still takes the Offers mutex to admit +
+            // list; that's fine).
+            move |offers| {
+                let _ = offers_app.emit("vlerv://beam-offers-updated", offers);
+            },
+        )
         .await
 }
 
@@ -620,23 +592,7 @@ async fn boot_node(
 /// seam a headless host replaces with its own handling.
 fn host_signal_sink(app: tauri::AppHandle) -> impl Fn(HostSignal) + Send + Sync + 'static {
     move |signal| match signal {
-        HostSignal::PairPending(pending) => {
-            // Park before emitting: `remote_pair_confirm` resolves against the
-            // parked entry, same as the outbound `remote_pair_complete` path.
-            app.state::<RemoteState>().pairing.park(pending.clone());
-            let _ = app.emit(
-                "vlerv://remote-event",
-                RemoteEvent::PairPending {
-                    peer: pending.node_id.clone(),
-                    device: pending.device.clone(),
-                    fingerprint: pending.fingerprint.clone(),
-                    role: pending.role.clone(),
-                },
-            );
-            // Debug-only E2E hook. Absent from release builds — see below.
-            #[cfg(debug_assertions)]
-            test_autopair(&app, &pending);
-        }
+        HostSignal::PairPending(pending) => park_and_announce(&app, pending),
         HostSignal::OpenOnHost { peer, path, reader_mode } => {
             // A control peer inherits the deep-link posture exactly: the SAME
             // event the `vlerv://open` verb emits, on an already-gated path.
@@ -664,6 +620,29 @@ fn host_signal_sink(app: tauri::AppHandle) -> impl Fn(HostSignal) + Send + Sync 
             );
         }
     }
+}
+
+/// Park a pairing at the fingerprint step and tell the UI about it. BOTH faces
+/// of pairing land here — the outbound `remote_pair_complete` and the inbound
+/// `HostSignal::PairPending` — so the order is the same on either side: park
+/// first, because `remote_pair_confirm` resolves against the parked entry, and
+/// only then emit the prompt that makes a human call it.
+fn park_and_announce(app: &tauri::AppHandle, pending: PendingPair) {
+    app.state::<RemoteState>().pairing.park(pending.clone());
+    let _ = app.emit(
+        "vlerv://remote-event",
+        RemoteEvent::PairPending {
+            peer: pending.node_id.clone(),
+            device: pending.device.clone(),
+            fingerprint: pending.fingerprint.clone(),
+            role: pending.role.clone(),
+        },
+    );
+    // Debug-only E2E hook: a simulator has no screen to tap "Confirm" on, so
+    // both faces honor VLERV_TEST_AUTOPAIR. Absent from release builds — see
+    // the banner below.
+    #[cfg(debug_assertions)]
+    test_autopair(app, &pending);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -700,10 +679,24 @@ fn host_signal_sink(app: tauri::AppHandle) -> impl Fn(HostSignal) + Send + Sync 
 // The default is `control` on purpose: the E2E drives push/open-on-host,
 // which is the only scope that admits them. `peers::DEFAULT_SCOPE` stays
 // `view-open` for real humans and is deliberately not reused here.
+
+/// The env var name, declared ONCE. Both hooks below and the deep-link gate in
+/// `app.rs` (through `autopair_enabled`) read this const — three separate
+/// copies of the string were three chances for one of them to drift.
+#[cfg(debug_assertions)]
+const AUTOPAIR_ENV: &str = "VLERV_TEST_AUTOPAIR";
+
+/// Is the hook armed? The deep-link arm in `app.rs` asks before it dials an
+/// arriving `vlerv://pair` link with no human in the loop. Same `env::var`
+/// read the hook itself performs, so the gate and the hook agree.
+#[cfg(debug_assertions)]
+pub fn autopair_enabled() -> bool {
+    std::env::var(AUTOPAIR_ENV).is_ok()
+}
+
 #[cfg(debug_assertions)]
 fn test_autopair(app: &tauri::AppHandle, pending: &PendingPair) {
-    const ENV: &str = "VLERV_TEST_AUTOPAIR";
-    let Ok(raw) = std::env::var(ENV) else { return };
+    let Ok(raw) = std::env::var(AUTOPAIR_ENV) else { return };
 
     let requested = raw.trim();
     let scope = if requested.is_empty() {
@@ -712,7 +705,7 @@ fn test_autopair(app: &tauri::AppHandle, pending: &PendingPair) {
         match Scope::parse(requested) {
             Ok(scope) => scope,
             Err(e) => {
-                eprintln!("vlerv: {ENV}: {e}; leaving the pairing for a human");
+                eprintln!("vlerv: {AUTOPAIR_ENV}: {e}; leaving the pairing for a human");
                 return;
             }
         }
@@ -728,38 +721,37 @@ fn test_autopair(app: &tauri::AppHandle, pending: &PendingPair) {
     match state.peers.upsert(&parked.node_id, &parked.device, scope) {
         Ok(_) => {
             eprintln!(
-                "vlerv: {ENV}: AUTO-CONFIRMED {} ({}) as {} — TEST BUILD ONLY",
+                "vlerv: {AUTOPAIR_ENV}: AUTO-CONFIRMED {} ({}) as {} — TEST BUILD ONLY",
                 parked.device,
                 parked.node_id,
                 scope.as_str()
             );
             let _ = app.emit("vlerv://remote-event", RemoteEvent::PeersUpdated);
         }
-        Err(e) => eprintln!("vlerv: {ENV}: cannot persist the peer: {e}"),
+        Err(e) => eprintln!("vlerv: {AUTOPAIR_ENV}: cannot persist the peer: {e}"),
     }
 }
 
 // Debug-only E2E hook, third arm: a `vlerv://pair` link arrived and no human
 // can tap the confirm UI (simulator). Dial + park + `test_autopair` — the same
 // steps `remote_pair_complete` then a confirm tap would take. Only called when
-// VLERV_TEST_AUTOPAIR is set (checked at the deep-link site); absent from
+// `autopair_enabled` says so (checked at the deep-link site); absent from
 // release builds.
 #[cfg(debug_assertions)]
 pub fn test_autopair_dial(app: tauri::AppHandle, ticket: String) {
-    const ENV: &str = "VLERV_TEST_AUTOPAIR";
     tauri::async_runtime::spawn(async move {
         let parsed: peers::PairTicket = match ticket.parse() {
             Ok(t) => t,
-            Err(e) => return eprintln!("vlerv: {ENV}: bad ticket: {e}"),
+            Err(e) => return eprintln!("vlerv: {AUTOPAIR_ENV}: bad ticket: {e}"),
         };
         let state = app.state::<RemoteState>();
         let node = match boot_node(&app, &state).await {
             Ok(n) => n,
-            Err(e) => return eprintln!("vlerv: {ENV}: boot failed: {e}"),
+            Err(e) => return eprintln!("vlerv: {AUTOPAIR_ENV}: boot failed: {e}"),
         };
         let pending = match scope::pair_dial(&node, &parsed, state.device.clone()).await {
             Ok(p) => p,
-            Err(e) => return eprintln!("vlerv: {ENV}: dial failed: {e}"),
+            Err(e) => return eprintln!("vlerv: {AUTOPAIR_ENV}: dial failed: {e}"),
         };
         state.pairing.park(pending.clone());
         test_autopair(&app, &pending);
@@ -853,6 +845,14 @@ fn presence(
 /// content address). Called from the watcher bridge threads in `main.rs`.
 /// Does nothing — and boots nothing — when no scope session exists.
 pub fn note_file_change(app: &tauri::AppHandle, change: crate::watcher::FileChange) {
+    // Answered on the watcher's own thread, before anything is spawned or
+    // cloned: an install that never booted an endpoint gets one atomic load
+    // per filesystem event instead of a tokio task that takes the node mutex
+    // only to find `None`. Editing a file in the workspace fires this
+    // hundreds of times.
+    if !app.state::<RemoteState>().is_booted() {
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<RemoteState>();

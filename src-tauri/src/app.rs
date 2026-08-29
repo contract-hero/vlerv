@@ -309,7 +309,6 @@ pub fn run() {
             crate::remote::remote_list_tree,
             crate::remote::remote_get,
             crate::remote::remote_open_on_host,
-            crate::remote::remote_push_artifact,
             crate::remote::remote_subscribe,
             crate::remote::remote_unsubscribe,
         ])
@@ -355,9 +354,10 @@ pub fn run() {
                             // Debug-only E2E hook (third arm, same env contract
                             // as `remote::test_autopair`): a simulator cannot
                             // be tapped, so the arriving link dials without the
-                            // confirm UI. Absent from release builds.
+                            // confirm UI. Absent from release builds, and the
+                            // env var is named in exactly one place.
                             #[cfg(debug_assertions)]
-                            if std::env::var("VLERV_TEST_AUTOPAIR").is_ok() {
+                            if crate::remote::autopair_enabled() {
                                 crate::remote::test_autopair_dial(
                                     app_handle.clone(),
                                     req.ticket.clone(),

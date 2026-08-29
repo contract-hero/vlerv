@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { parsePlatformOs, platformBodyClass, resolvePlatformOs } from "./platform";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  guessPlatformOs,
+  parsePlatformOs,
+  platformBodyClass,
+  resolvePlatformOs,
+} from "./platform";
 
 describe("parsePlatformOs", () => {
   it("recognizes ios", () => {
@@ -53,6 +58,33 @@ describe("resolvePlatformOs", () => {
       },
     };
     await expect(resolvePlatformOs(ipc)).resolves.toBe("macos");
+  });
+});
+
+describe("guessPlatformOs", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const stubUserAgent = (userAgent: string | null): void => {
+    vi.stubGlobal("navigator", userAgent === null ? undefined : { userAgent });
+  };
+
+  it("guesses ios for an iPhone, iPad or iPod user agent", () => {
+    for (const device of ["iPhone", "iPad", "iPod"]) {
+      stubUserAgent(`Mozilla/5.0 (${device}; CPU OS 17_0 like Mac OS X)`);
+      expect(guessPlatformOs()).toBe("ios");
+    }
+  });
+
+  it("guesses macos for a desktop user agent", () => {
+    stubUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+    expect(guessPlatformOs()).toBe("macos");
+  });
+
+  it("guesses macos when there is no navigator at all", () => {
+    stubUserAgent(null);
+    expect(guessPlatformOs()).toBe("macos");
   });
 });
 

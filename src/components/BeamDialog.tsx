@@ -2,43 +2,11 @@
 // indicator. State machine lives in src/state/beam.tsx; this file only
 // renders it.
 import * as React from "react";
-import { Check, Copy, X, Zap } from "lucide-react";
+import { X, Zap } from "lucide-react";
 import { useBeamActions, useBeamState } from "../state/beam";
-import { useCopyFeedback } from "../hooks/useCopyFeedback";
-import { expiresIn, humanBytes } from "../utils/beam-format";
-
-function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function CopyLinkButton({ link }: { link: string }): React.ReactElement {
-  const { copied, copy } = useCopyFeedback();
-  return (
-    <button
-      type="button"
-      className="button"
-      data-testid="beam-copy-link"
-      onClick={() => copy(link)}
-    >
-      {copied ? <Check size={13} strokeWidth={2.5} /> : <Copy size={13} strokeWidth={2} />}
-      {copied ? "Copied" : "Copy link"}
-    </button>
-  );
-}
-
-/** Escape closes whichever dialog face is open (decline semantics). */
-function useEscape(onEscape: () => void): void {
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onEscape();
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onEscape]);
-}
+import { useEscape } from "../hooks/useEscape";
+import CopyLinkButton from "./CopyLinkButton";
+import { expiresIn, humanBytes, nowSecs } from "../utils/beam-format";
 
 function SendFace(): React.ReactElement {
   const { send } = useBeamState();
@@ -98,7 +66,7 @@ function SendFace(): React.ReactElement {
               from the ⚡ indicator.
             </p>
             <div className="beam-actions">
-              <CopyLinkButton link={send.offer.link} />
+              <CopyLinkButton link={send.offer.link} testId="beam-copy-link" />
               <button type="button" className="button button-secondary" onClick={closeSend}>Done</button>
             </div>
           </>

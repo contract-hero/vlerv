@@ -15,7 +15,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use iroh::{EndpointAddr, TransportAddr};
 use vlerv_remote::host::{EmptyCatalog, HostSignal};
 use vlerv_remote::peers::{PeerStore, Pairing, Scope};
 use vlerv_remote::proto::Req;
@@ -24,28 +23,13 @@ use vlerv_remote::security::RootSet;
 use vlerv_remote::{endpoint, Dirs};
 
 /// A node's address with its transport reduced to loopback — the endpoint
-/// binds 0.0.0.0, so 127.0.0.1 always reaches it.
-async fn loopback_addr(node: &endpoint::RemoteNode) -> EndpointAddr {
-    let addr = node.endpoint.addr();
-    let port = match addr.ip_addrs().find(|a| a.is_ipv4()) {
-        Some(a) => a.port(),
-        None => {
-            // Direct addresses appear a moment after bind on some machines.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(10), node.endpoint.online())
-                    .await;
-            node.endpoint
-                .addr()
-                .ip_addrs()
-                .find(|a| a.is_ipv4())
-                .expect("the endpoint publishes an IPv4 direct address")
-                .port()
-        }
-    };
-    EndpointAddr::from_parts(
-        addr.id,
-        [TransportAddr::Ip((std::net::Ipv4Addr::LOCALHOST, port).into())],
-    )
+/// binds 0.0.0.0, so 127.0.0.1 always reaches it. Both halves are the crate's
+/// own helpers, so this test cannot drift from how the app names a peer.
+async fn loopback_addr(node: &endpoint::RemoteNode) -> iroh::EndpointAddr {
+    let socket = endpoint::loopback_socket(node)
+        .await
+        .expect("the endpoint publishes an IPv4 direct address");
+    endpoint::addr_at_id(node.endpoint.id(), socket)
 }
 
 #[tokio::test(flavor = "multi_thread")]

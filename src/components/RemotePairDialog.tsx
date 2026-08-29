@@ -9,26 +9,20 @@
 import * as React from "react";
 import { Check, ShieldCheck, X } from "lucide-react";
 import { useRemoteActions, useRemoteState } from "../state/remote";
-import type { RemoteScope } from "../ipc";
+import type { RemotePairLinkArrival } from "../state/remote";
+import { useEscape } from "../hooks/useEscape";
+import type { RemotePendingPair, RemoteScope } from "../ipc";
 
-function useEscape(onEscape: () => void): void {
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onEscape();
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onEscape]);
-}
-
-function PairLinkFace(): React.ReactElement {
-  const { pairLinkArrival } = useRemoteState();
+// Both faces take their subject as a prop. The host below has already
+// decided which one is up, and re-reading the context here would only buy a
+// null the parent has ruled out.
+function PairLinkFace({
+  arrival,
+}: {
+  arrival: RemotePairLinkArrival;
+}): React.ReactElement {
   const { completePairing, dismissPairLink } = useRemoteActions();
   useEscape(dismissPairLink);
-  if (!pairLinkArrival) return <></>;
 
   return (
     <div
@@ -52,12 +46,12 @@ function PairLinkFace(): React.ReactElement {
       </div>
       <div className="beam-dialog-body">
         <div className="beam-file-row">
-          <span className="beam-file-name">{pairLinkArrival.device}</span>
+          <span className="beam-file-name">{arrival.device}</span>
         </div>
         <p className="beam-hint">
           This link asks to pair with{" "}
-          <code className="beam-fingerprint" title={pairLinkArrival.peer}>
-            {pairLinkArrival.peer_short}
+          <code className="beam-fingerprint" title={arrival.peer}>
+            {arrival.peer_short}
           </code>
           . Nothing is dialed until you proceed, and nothing is trusted until
           you compare the six words on both screens.
@@ -66,7 +60,7 @@ function PairLinkFace(): React.ReactElement {
           <button
             type="button"
             className="button"
-            onClick={() => completePairing(pairLinkArrival.ticket)}
+            onClick={() => completePairing(arrival.ticket)}
           >
             Continue
           </button>
@@ -79,12 +73,15 @@ function PairLinkFace(): React.ReactElement {
   );
 }
 
-function FingerprintFace(): React.ReactElement {
-  const { pendingConfirm, pairingError } = useRemoteState();
+function FingerprintFace({
+  pending,
+}: {
+  pending: RemotePendingPair;
+}): React.ReactElement {
+  const { pairingError } = useRemoteState();
   const { confirmPairing } = useRemoteActions();
   const [scope, setScope] = React.useState<RemoteScope>("view-open");
   useEscape(() => confirmPairing(false));
-  if (!pendingConfirm) return <></>;
 
   return (
     <div
@@ -108,9 +105,9 @@ function FingerprintFace(): React.ReactElement {
       </div>
       <div className="beam-dialog-body">
         <div className="beam-file-row">
-          <span className="beam-file-name">{pendingConfirm.device}</span>
+          <span className="beam-file-name">{pending.device}</span>
           <span className="beam-file-meta">
-            {pendingConfirm.role === "host" ? "wants to pair" : "you are pairing with"}
+            {pending.role === "host" ? "wants to pair" : "you are pairing with"}
           </span>
         </div>
         <p className="beam-hint">
@@ -118,7 +115,7 @@ function FingerprintFace(): React.ReactElement {
           screen too — that is what rules out a machine-in-the-middle.
         </p>
         <div className="remote-fingerprint-words" data-testid="remote-fingerprint-words">
-          {pendingConfirm.fingerprint.map((word, i) => (
+          {pending.fingerprint.map((word, i) => (
             <span key={`${word}-${i}`}>{word}</span>
           ))}
         </div>
@@ -158,10 +155,13 @@ function FingerprintFace(): React.ReactElement {
  * already happened and is the more time-sensitive of the two. */
 export default function RemotePairDialog(): React.ReactElement | null {
   const { pendingConfirm, pairLinkArrival } = useRemoteState();
-  if (!pendingConfirm && !pairLinkArrival) return null;
+  let face: React.ReactElement;
+  if (pendingConfirm) face = <FingerprintFace pending={pendingConfirm} />;
+  else if (pairLinkArrival) face = <PairLinkFace arrival={pairLinkArrival} />;
+  else return null;
   return (
     <div className="beam-backdrop" data-testid="remote-pair-backdrop">
-      {pendingConfirm ? <FingerprintFace /> : <PairLinkFace />}
+      {face}
     </div>
   );
 }

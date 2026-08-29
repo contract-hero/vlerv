@@ -21,7 +21,7 @@ import { useActiveTab, useTabs, useTabsDispatch } from "../state/TabsProvider";
 import type { OpenFileOptions } from "../state/TabsProvider";
 import { canGoBack, canGoForward, currentEntry } from "../state/tabs";
 import { useWatcherBus } from "../state/watcher-bus";
-import { phoneTitle } from "../utils/phone-title";
+import { basename } from "../utils/path";
 
 /** How long the title-band live dot glows after a cross-wire reload. */
 const LIVE_PULSE_MS = 2400;
@@ -73,7 +73,9 @@ export default function PhoneShell({
     };
   }, [bus, activePath]);
 
-  const title = phoneTitle(activePath);
+  // `basename` also does the right thing for a `vlerv-remote://<peer>/abs/path`
+  // address: its strip is greedy, so what survives is the host-side filename.
+  const title = activePath ? basename(activePath) : null;
 
   const openFromSheet = React.useCallback(
     (path: string, opts?: OpenFileOptions) => {
@@ -158,10 +160,11 @@ export default function PhoneShell({
       ) : null}
 
       {sheet === "library" ? (
-        <div className="phone-sheet" role="dialog" aria-label="Library">
-          <div className="phone-sheet-grab" aria-hidden />
-          <div className="phone-sheet-head">
-            <span className="phone-sheet-title">Library</span>
+        <PhoneSheet
+          label="Library"
+          title="Library"
+          onClose={closeSheet}
+          actions={
             <button
               type="button"
               className="phone-sheet-action"
@@ -173,27 +176,19 @@ export default function PhoneShell({
             >
               <SettingsIcon size={17} strokeWidth={1.8} />
             </button>
-            <button
-              type="button"
-              className="phone-sheet-action"
-              aria-label="Close"
-              onClick={closeSheet}
-            >
-              <X size={17} strokeWidth={1.8} />
-            </button>
-          </div>
-          <div className="phone-sheet-body">
-            <RemoteDrawerList ipc={ipc} onOpenFile={openFromSheet} />
-            <ReceivedDrawer onOpen={closeSheet} />
-          </div>
-        </div>
+          }
+        >
+          <RemoteDrawerList ipc={ipc} onOpenFile={openFromSheet} />
+          <ReceivedDrawer onOpen={closeSheet} />
+        </PhoneSheet>
       ) : null}
 
       {sheet === "tabs" ? (
-        <div className="phone-sheet" role="dialog" aria-label="Open tabs">
-          <div className="phone-sheet-grab" aria-hidden />
-          <div className="phone-sheet-head">
-            <span className="phone-sheet-title">Tabs</span>
+        <PhoneSheet
+          label="Open tabs"
+          title="Tabs"
+          onClose={closeSheet}
+          actions={
             <button
               type="button"
               className="phone-sheet-action"
@@ -205,55 +200,84 @@ export default function PhoneShell({
             >
               <Plus size={17} strokeWidth={1.8} />
             </button>
-            <button
-              type="button"
-              className="phone-sheet-action"
-              aria-label="Close"
-              onClick={closeSheet}
-            >
-              <X size={17} strokeWidth={1.8} />
-            </button>
-          </div>
-          <div className="phone-sheet-body">
-            <ul className="phone-tab-list">
-              {tabs.map((tab) => {
-                const tabEntry = currentEntry(tab);
-                const label = phoneTitle(tabEntry?.path ?? null) ?? "New tab";
-                return (
-                  <li
-                    key={tab.id}
-                    className={
-                      "phone-tab-row" + (tab.id === activeTabId ? " is-active" : "")
-                    }
+          }
+        >
+          <ul className="phone-tab-list">
+            {tabs.map((tab) => {
+              const tabEntry = currentEntry(tab);
+              const label = tabEntry ? basename(tabEntry.path) : "New tab";
+              return (
+                <li
+                  key={tab.id}
+                  className={
+                    "phone-tab-row" + (tab.id === activeTabId ? " is-active" : "")
+                  }
+                >
+                  <button
+                    type="button"
+                    className="phone-tab-row-label"
+                    onClick={() => {
+                      dispatch({ type: "ACTIVATE_TAB", tabId: tab.id });
+                      closeSheet();
+                    }}
                   >
-                    <button
-                      type="button"
-                      className="phone-tab-row-label"
-                      onClick={() => {
-                        dispatch({ type: "ACTIVATE_TAB", tabId: tab.id });
-                        closeSheet();
-                      }}
-                    >
-                      <span className="phone-tab-row-name">{label}</span>
-                      {tabEntry ? (
-                        <span className="phone-tab-row-path">{tabEntry.path}</span>
-                      ) : null}
-                    </button>
-                    <button
-                      type="button"
-                      className="phone-sheet-action"
-                      aria-label={`Close ${label}`}
-                      onClick={() => dispatch({ type: "CLOSE_TAB", tabId: tab.id })}
-                    >
-                      <X size={15} strokeWidth={1.8} />
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        </div>
+                    <span className="phone-tab-row-name">{label}</span>
+                    {tabEntry ? (
+                      <span className="phone-tab-row-path">{tabEntry.path}</span>
+                    ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className="phone-sheet-action"
+                    aria-label={`Close ${label}`}
+                    onClick={() => dispatch({ type: "CLOSE_TAB", tabId: tab.id })}
+                  >
+                    <X size={15} strokeWidth={1.8} />
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </PhoneSheet>
       ) : null}
+    </div>
+  );
+}
+
+/** The chrome both bottom sheets share: grab handle, head, and the scrolling
+ *  body. Close is always present and always last, so the dismiss target sits
+ *  in the same place in both sheets; `actions` is whatever that sheet adds
+ *  before it. `label` is the accessible name, which can say more than the
+ *  visible title has room for — the tabs sheet reads "Open tabs". */
+function PhoneSheet({
+  label,
+  title,
+  actions,
+  onClose,
+  children,
+}: {
+  label: string;
+  title: string;
+  actions?: React.ReactNode;
+  onClose: () => void;
+  children: React.ReactNode;
+}): React.ReactElement {
+  return (
+    <div className="phone-sheet" role="dialog" aria-label={label}>
+      <div className="phone-sheet-grab" aria-hidden />
+      <div className="phone-sheet-head">
+        <span className="phone-sheet-title">{title}</span>
+        {actions}
+        <button
+          type="button"
+          className="phone-sheet-action"
+          aria-label="Close"
+          onClick={onClose}
+        >
+          <X size={17} strokeWidth={1.8} />
+        </button>
+      </div>
+      <div className="phone-sheet-body">{children}</div>
     </div>
   );
 }

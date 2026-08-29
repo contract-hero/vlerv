@@ -206,13 +206,17 @@ pub fn frame_len(prefix: [u8; 4]) -> Result<usize, String> {
     Ok(len)
 }
 
-/// Reduce an attacker-controlled device name to safe display text: no control
-/// characters, no bidi/zero-width spoofing, bounded length. Same distrust the
-/// beam name hint gets — this string lands in the peer list and the drawer
-/// header.
-pub fn sanitize_device(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
+/// Drop every character that must not survive into display text or an on-disk
+/// name, then bound the length to `max_chars`. Two classes go: Cc control
+/// characters, and the Cf bidi / zero-width set a U+202E extension spoof rides
+/// on (`report<RLO>gnp.html` renders as `reporthtml.png`).
+///
+/// The ONE strip set in the crate. Both hostile strings a peer can hand us —
+/// the device name here and the beam name hint — pass through it, and each
+/// caller adds only its own trimming and fallback on top; a second copy is how
+/// one of them silently stops stripping a character the other does.
+pub fn strip_spoofing_chars(s: &str, max_chars: usize) -> String {
+    s.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(c,
@@ -221,8 +225,16 @@ pub fn sanitize_device(name: &str) -> String {
                     | '\u{2066}'..='\u{2069}'
                     | '\u{FEFF}')
         })
-        .take(MAX_DEVICE_CHARS)
-        .collect();
+        .take(max_chars)
+        .collect()
+}
+
+/// Reduce an attacker-controlled device name to safe display text: no control
+/// characters, no bidi/zero-width spoofing, bounded length. Same distrust the
+/// beam name hint gets — this string lands in the peer list and the drawer
+/// header.
+pub fn sanitize_device(name: &str) -> String {
+    let cleaned = strip_spoofing_chars(name, MAX_DEVICE_CHARS);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         "unknown device".to_string()

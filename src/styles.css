@@ -66,6 +66,9 @@
      the equalities are real instead of asserted in comments. */
   --band-h: 40px;
   --titlebar-inset: 78px;
+  /* The Apple HIG minimum comfortable touch target. Every phone control is
+     at least this tall; widths still vary with the control. */
+  --tap-min: 44px;
 
   /* motion */
   --dur-fast: 80ms;
@@ -1778,7 +1781,7 @@ body.platform-ios .app-shell {
 body.platform-ios [data-section] li,
 body.platform-ios .start-row,
 body.platform-ios .remote-follow-toggle {
-  min-height: 44px;
+  min-height: var(--tap-min);
 }
 
 .phone-shell {
@@ -1859,7 +1862,7 @@ body.platform-ios .remote-follow-toggle {
 }
 .phone-bar-button {
   width: 64px;
-  height: 44px;
+  height: var(--tap-min);
   display: grid;
   place-items: center;
   background: none;
@@ -1890,7 +1893,7 @@ body.platform-ios .remote-follow-toggle {
   z-index: 40;
   border: none;
   padding: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--overlay-scrim);
 }
 .phone-sheet {
   position: fixed;
@@ -1935,9 +1938,11 @@ body.platform-ios .remote-follow-toggle {
   letter-spacing: var(--track-headline);
   color: var(--fg);
 }
+/* Width stays at the icon's visual size; the HEIGHT carries the touch target,
+   because these sit in a row where a wider button would eat the title. */
 .phone-sheet-action {
   width: 40px;
-  height: 40px;
+  min-height: var(--tap-min);
   display: grid;
   place-items: center;
   background: none;
@@ -1991,8 +1996,10 @@ body.platform-ios .remote-follow-toggle {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Same treatment as .start-row-dir, mono included: a path reads as a path. */
 .phone-tab-row-path {
   font-size: var(--text-caption);
+  font-family: var(--font-mono);
   color: var(--fg-path);
   max-width: 100%;
   overflow: hidden;

@@ -68,6 +68,32 @@ function clampSidebarPx(px: number): number {
   return Math.max(MIN_SIDEBAR_PX, Math.min(MAX_SIDEBAR_PX, px));
 }
 
+/** The transient notice toast (a rejected deep link, so far). Identical on
+ *  both platforms — only where it mounts differs: over the phone shell, or
+ *  inside the desktop preview column under the toolbar. */
+function AppNotice({
+  text,
+  onDismiss,
+}: {
+  text: string;
+  onDismiss: () => void;
+}): React.ReactElement {
+  return (
+    <div className="app-notice" role="alert">
+      <span className="app-notice-text">{text}</span>
+      <button
+        type="button"
+        className="app-notice-dismiss"
+        title="Dismiss"
+        aria-label="Dismiss notice"
+        onClick={onDismiss}
+      >
+        <X size={13} strokeWidth={2} />
+      </button>
+    </div>
+  );
+}
+
 export default function App({ ipc: injectedIpc }: AppProps = {}): React.ReactElement {
   const ipc = injectedIpc ?? tauriIpc;
   // Drives <html data-theme="…"> via side-effect; must mount at the root.
@@ -382,6 +408,17 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
     return () => window.removeEventListener("message", onMessage);
   }, [openFile]);
 
+  // Dialogs are summoned by events (a beam arriving, a pair link) or by a
+  // gear button, never by the shell around them — so both architectures
+  // mount the same set, at the same depth.
+  const overlays = (
+    <>
+      <BeamDialog />
+      <RemotePairDialog />
+      {settingsOpen ? <SettingsModal ipc={ipc} onClose={() => setSettingsOpen(false)} /> : null}
+    </>
+  );
+
   // The phone gets its own architecture (PhoneShell): one column, bottom
   // bar, sheets. Overlays (dialogs, notice) mount the same either way.
   if (!isMacos) {
@@ -395,23 +432,8 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
           onPickWorkspace={handlePickWorkspace}
           workspaceRoot={root}
         />
-        {notice ? (
-          <div className="app-notice" role="alert">
-            <span className="app-notice-text">{notice}</span>
-            <button
-              type="button"
-              className="app-notice-dismiss"
-              title="Dismiss"
-              aria-label="Dismiss notice"
-              onClick={dismissNotice}
-            >
-              <X size={13} strokeWidth={2} />
-            </button>
-          </div>
-        ) : null}
-        <BeamDialog />
-        <RemotePairDialog />
-        {settingsOpen ? <SettingsModal ipc={ipc} onClose={() => setSettingsOpen(false)} /> : null}
+        {notice ? <AppNotice text={notice} onDismiss={dismissNotice} /> : null}
+        {overlays}
       </div>
     );
   }
@@ -463,20 +485,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
               onEnterReaderMode={toggleReaderMode}
             />
           )}
-          {notice ? (
-            <div className="app-notice" role="alert">
-              <span className="app-notice-text">{notice}</span>
-              <button
-                type="button"
-                className="app-notice-dismiss"
-                title="Dismiss"
-                aria-label="Dismiss notice"
-                onClick={dismissNotice}
-              >
-                <X size={13} strokeWidth={2} />
-              </button>
-            </div>
-          ) : null}
+          {notice ? <AppNotice text={notice} onDismiss={dismissNotice} /> : null}
           <div
             className="tab-view"
             id="tab-panel"
@@ -501,9 +510,7 @@ function AppShell({ ipc }: { ipc: IpcSurface }): React.ReactElement {
           onClose={() => setQuickOpenVisible(false)}
         />
       ) : null}
-      <BeamDialog />
-      <RemotePairDialog />
-      {settingsOpen ? <SettingsModal ipc={ipc} onClose={() => setSettingsOpen(false)} /> : null}
+      {overlays}
     </div>
   );
 }

@@ -148,6 +148,12 @@ export default function MdRenderer({ source, path, onRendered }: MdRendererProps
             const wrapper = document.createElement("div");
             wrapper.className = "mermaid";
             const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement;
+            // The diagram source is artifact-controlled, so the SVG mermaid
+            // hands back is too — a label or a node id can carry markup
+            // through. Same walker, same reason as the fragment above and as
+            // the inline-SVG renderer: this tree is about to go live in the
+            // PRIVILEGED host DOM.
+            sanitizeTree(parsed);
             wrapper.appendChild(document.importNode(parsed, true));
             code.parentElement?.replaceWith(wrapper);
           } catch {

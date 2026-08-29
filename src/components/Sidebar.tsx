@@ -48,6 +48,20 @@ export default function Sidebar({
   const { root: workspaceRoot, clearRoot } = useWorkspace();
   const { isIos } = usePlatform();
 
+  // Settings is reachable from every sidebar state — iOS, empty workspace,
+  // and the loaded tree all end their header with the same gear (STATUS.md:
+  // the modal's only mount point).
+  const settingsButton = (
+    <button
+      className="sidebar-header-change"
+      onClick={onOpenSettings}
+      title="Settings"
+      aria-label="Settings"
+    >
+      <SettingsIcon size={13} strokeWidth={2} />
+    </button>
+  );
+
   // iOS is a read-only companion with no local workspace (PRODUCT.md):
   // no folder/file picker, no full-tree Files drawer, no drag-out. It
   // centers on Remote (paired peers' tabs) and Received (Beam/PushArtifact
@@ -57,14 +71,7 @@ export default function Sidebar({
       <div className="sidebar">
         <div className="sidebar-header" data-tauri-drag-region>
           <span className="sidebar-header-title">Vlervtifacts</span>
-          <button
-            className="sidebar-header-change"
-            onClick={onOpenSettings}
-            title="Settings"
-            aria-label="Settings"
-          >
-            <SettingsIcon size={13} strokeWidth={2} />
-          </button>
+          {settingsButton}
         </div>
         <div className="sidebar-drawers">
           <RemoteDrawerList ipc={ipc} onOpenFile={onOpenFile} />
@@ -91,14 +98,7 @@ export default function Sidebar({
         >
           Open a single file…
         </button>
-        <button
-          className="sidebar-header-change"
-          onClick={onOpenSettings}
-          title="Settings"
-          aria-label="Settings"
-        >
-          <SettingsIcon size={13} strokeWidth={2} />
-        </button>
+        {settingsButton}
       </div>
     );
   }
@@ -136,14 +136,7 @@ export default function Sidebar({
         >
           <FolderOpen size={13} strokeWidth={2} />
         </button>
-        <button
-          className="sidebar-header-change"
-          onClick={onOpenSettings}
-          title="Settings"
-          aria-label="Settings"
-        >
-          <SettingsIcon size={13} strokeWidth={2} />
-        </button>
+        {settingsButton}
       </div>
       {/* Only the drawers scroll — the header above owns the traffic-light
           inset and the drag region, so it must stay pinned. */}

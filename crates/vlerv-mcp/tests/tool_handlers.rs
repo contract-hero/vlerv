@@ -238,7 +238,9 @@ async fn list_devices_and_server_status_report_what_the_tools_did() {
     assert_eq!(quiet[0].device, "Mac Studio");
     assert_eq!(quiet[0].scope, "view-open", "the scope shown is the one granted HERE");
     assert_eq!(quiet[0].presence, "unknown", "nothing dialed it yet");
-    assert_eq!(quiet[0].node_id_short, host.node_id()[..8]);
+    // 10 characters — iroh's own `fmt_short` width, so a short id in a log
+    // line and one in this list are the same string.
+    assert_eq!(quiet[0].node_id_short, host.node_id()[..10]);
 
     let probed = core.list_devices(true).await;
     assert_eq!(probed[0].presence, "online", "the probe reached the host");
@@ -273,7 +275,7 @@ async fn a_send_to_a_device_that_is_not_there_never_opens_a_socket() {
     // Paired but misnamed: the error lists the names that ARE valid.
     core.peer_store().upsert(&"ab".repeat(32), "Mac Studio", Scope::Control).unwrap();
     let err = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap_err();
-    assert!(err.contains("Mac Studio (abababab)"), "{err}");
+    assert!(err.contains("Mac Studio (ababababab)"), "{err}");
 
     // An empty device name is an argument error, not a lookup failure.
     assert!(core

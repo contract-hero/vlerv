@@ -10,14 +10,12 @@ use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use vlerv_remote::beam::DEFAULT_TTL_HOURS;
+// TTL bounds for a beam link, in hours: the crate's own, so the range this
+// server refuses outside of is exactly the range `beam::offer` serves. The
+// floor keeps a caller from minting an already-dead link; the ceiling is the
+// 30 days `beam::offer` would otherwise clamp to silently.
+use vlerv_remote::beam::{DEFAULT_TTL_HOURS, MAX_TTL_HOURS, MIN_TTL_HOURS};
 use vlerv_remote::peers::Scope;
-
-/// TTL bounds for a beam link, in hours. The floor keeps a caller from minting
-/// an already-dead link; the ceiling is the same 30 days `beam::offer` clamps
-/// to, stated here so the caller gets an error instead of a silent clamp.
-pub const MIN_TTL_HOURS: u32 = 1;
-pub const MAX_TTL_HOURS: u32 = 24 * 30;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct BeamArtifactArgs {
@@ -126,12 +124,10 @@ pub fn validate_device_query(raw: &str) -> Result<&str, String> {
 /// strings are refused rather than defaulted: a typo must not silently pick a
 /// scope the human did not ask for.
 pub fn validate_scope(raw: Option<&str>) -> Result<Scope, String> {
-    match raw {
-        None => Ok(vlerv_remote::peers::DEFAULT_SCOPE),
-        Some(s) => Scope::parse(s.trim()).map_err(|e| {
-            format!("{e} — use \"view-open\", \"browse\" or \"control\"")
-        }),
-    }
+    // The crate owns the "omitted means DEFAULT_SCOPE" rule, so this server
+    // and the app's IPC layer cannot end up defaulting to different grants.
+    Scope::parse_or_default(raw.map(str::trim))
+        .map_err(|e| format!("{e} — use \"view-open\", \"browse\" or \"control\""))
 }
 
 #[cfg(test)]

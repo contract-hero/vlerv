@@ -326,10 +326,7 @@ class TauriIpc implements IpcSurface {
     // it must survive a live-reload refetch landing at a NEW cache path.
     const remote = parseRemoteAddress(path);
     if (remote) {
-      const artifact = await invoke<RemoteArtifact>("remote_get", {
-        peer: remote.peer,
-        path: remote.path,
-      });
+      const artifact = await this.remoteGet(remote.peer, remote.path);
       const payload = await invoke<FilePayload>("read_file", { path: artifact.path });
       return { ...payload, path };
     }

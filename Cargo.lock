@@ -6939,6 +6939,8 @@ dependencies = [
 name = "vlerv-mcp"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
+ "futures-util",
  "rmcp",
  "schemars 1.2.1",
  "serde",

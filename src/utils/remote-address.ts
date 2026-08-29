@@ -22,14 +22,13 @@ export function isRemoteAddress(address: string): boolean {
 }
 
 /** Parses a `vlerv-remote://` address; `null` for anything else, including a
- * malformed one (empty peer id or a path that lost its leading slash). */
+ * malformed one (empty peer id or a path that lost its leading slash). The
+ * single `slash <= 0` test rules out both: a slash at index 0 means an empty
+ * peer id, and no slash at all means there is no absolute path to take. */
 export function parseRemoteAddress(address: string): RemoteAddress | null {
   if (!isRemoteAddress(address)) return null;
   const rest = address.slice(REMOTE_SCHEME.length);
   const slash = rest.indexOf("/");
   if (slash <= 0) return null;
-  const peer = rest.slice(0, slash);
-  const path = rest.slice(slash);
-  if (!peer || !path.startsWith("/")) return null;
-  return { peer, path };
+  return { peer: rest.slice(0, slash), path: rest.slice(slash) };
 }

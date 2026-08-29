@@ -6,15 +6,20 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 
 use crate::beam::{OfferInfo, Offers};
-use crate::paths::Dirs;
+use crate::paths::{self, Dirs};
 use crate::{proto, scope};
+
+/// How long any outgoing dial may take before it is reported as the other
+/// machine being offline. One constant for every ALPN: a beam fetch, a scope
+/// session, a pairing handshake and a cache download all wait the same.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Backing state for one booted remote node: identity, endpoint, protocol
 /// router, blob store, and the two registries the request gate enforces —
@@ -28,10 +33,6 @@ pub struct RemoteNode {
     /// The scope server, when this boot was given host state. `None` in the
     /// Beam-only transfer test, which boots endpoints with no peer store.
     pub scope: Option<Arc<scope::ScopeServer>>,
-    /// Where this node keeps its files. Carried on the node so the fetch
-    /// paths derive `received/` and `cache/` from the consumer's own base
-    /// instead of a hardcoded application-support directory.
-    pub dirs: Dirs,
 }
 
 /// Load the persisted ed25519 secret key, generating one on first use.
@@ -48,29 +49,14 @@ pub fn load_or_create_identity(dir: &std::path::Path) -> Result<SecretKey, Strin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             let key = SecretKey::generate();
-            write_secret_file(&key_path, &key.to_bytes())?;
+            // `create_private`, not `write_private`: two boots racing on a
+            // fresh install must not each write a key and leave one of them
+            // holding a NodeId the file no longer names.
+            paths::create_private(&key_path, &key.to_bytes())?;
             Ok(key)
         }
         Err(e) => Err(format!("cannot read {key_path:?}: {e}")),
     }
-}
-
-#[cfg(unix)]
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {path:?}: {e}"))?;
-    f.write_all(bytes).map_err(|e| e.to_string())
-}
-
-#[cfg(not(unix))]
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
 /// Boot the node: identity, endpoint (n0 preset: hole-punching + encrypted
@@ -135,8 +121,27 @@ pub async fn boot(
         offers,
         grants,
         scope: scope_server.map(|(server, _)| server),
-        dirs: dirs.clone(),
     })
+}
+
+/// Dial one peer on one ALPN, bounded by `DIAL_TIMEOUT`. Every outgoing
+/// connection in the crate opens here, so the timeout and the "who is
+/// unreachable" wording cannot drift between the four call sites.
+///
+/// `unreachable` is the subject of the failure sentence — "peer offline —
+/// could not reach it", "sender offline — could not reach the sender" — and
+/// the cause is appended in parentheses. A timeout and a refusal read the
+/// same on purpose: both mean the other machine did not answer.
+pub(crate) async fn dial(
+    endpoint: &Endpoint,
+    addr: iroh::EndpointAddr,
+    alpn: &[u8],
+    unreachable: &str,
+) -> Result<Connection, String> {
+    tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, alpn))
+        .await
+        .map_err(|_| format!("{unreachable} (timed out)"))?
+        .map_err(|e| format!("{unreachable} ({e})"))
 }
 
 /// Turn a peer's NodeId string into a dialable address. The one place a
@@ -153,11 +158,15 @@ pub fn addr_for(peer: &str) -> Result<iroh::EndpointAddr, String> {
 /// never names an iroh type: an in-process two-endpoint test dials loopback,
 /// and a caller that already knows the socket skips discovery entirely.
 pub fn addr_at(peer: &str, socket: SocketAddr) -> Result<iroh::EndpointAddr, String> {
-    let id: iroh::EndpointId = peer.parse().map_err(|_| "malformed peer id".to_string())?;
-    Ok(iroh::EndpointAddr::from_parts(
-        id,
-        [iroh::TransportAddr::Ip(socket)],
-    ))
+    let id: EndpointId = peer.parse().map_err(|_| "malformed peer id".to_string())?;
+    Ok(addr_at_id(id, socket))
+}
+
+/// `addr_at` for a caller that already holds the parsed id — its own
+/// endpoint's, typically, which cannot be malformed and so has no error to
+/// report. The one place `iroh::TransportAddr` is named outside a dial.
+pub fn addr_at_id(id: EndpointId, socket: SocketAddr) -> iroh::EndpointAddr {
+    iroh::EndpointAddr::from_parts(id, [iroh::TransportAddr::Ip(socket)])
 }
 
 /// This node's own `127.0.0.1:<bound port>`. The endpoint binds `0.0.0.0`, so

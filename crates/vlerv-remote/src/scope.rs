@@ -29,11 +29,12 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::api::Tag;
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::Hash;
+use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::endpoint::RemoteNode;
-use crate::paths::{Dirs, DEFAULT_IGNORED};
+use crate::beam::delete_tags;
+use crate::endpoint::{self, RemoteNode};
+use crate::paths::{base_name, mtime_secs, Dirs, DEFAULT_IGNORED};
 use crate::peers::{self, now_unix, Peer, PeerStore, Pairing, PendingPair, Scope};
 use crate::proto::{
     self, ArtifactMeta, Event, Frame, HelloAck, PairAck, PairHello, PathEntry, Req, Res, TabEntry,
@@ -66,14 +67,20 @@ pub const GRANT_TTL_SECS: u64 = 3600;
 /// Directory children returned by one `ListTree`. Bounds one hostile request.
 pub const MAX_TREE_ENTRIES: usize = 2_000;
 
-/// Handshake and idle timeouts. A peer that opens a connection and says
-/// nothing must not hold a session slot forever.
+/// Handshake timeout. A peer that opens a connection and says nothing must
+/// not hold a session slot forever. The dial half lives in
+/// `endpoint::DIAL_TIMEOUT`, shared with Beam.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// QUIC close code for a refused session. The value is arbitrary; the peer
 /// only needs to see that it was refused, not why.
 const CLOSE_REFUSED: u32 = 1;
+
+/// Subject of every failed dial this module makes — a session, a pairing
+/// handshake, a cache fetch. `endpoint::dial` appends the cause, and a
+/// timeout reads the same as a refusal because both mean the same thing to
+/// the person looking at the screen.
+const PEER_OFFLINE: &str = "peer offline — could not reach it";
 
 // ── Grants: peer-locked blob capabilities ──────────────────────────────────
 
@@ -84,6 +91,15 @@ struct Grant {
     peers: HashSet<EndpointId>,
     expires_at: u64,
     tag: Tag,
+}
+
+impl Grant {
+    /// Let one more peer fetch these bytes, and restart the clock — a peer
+    /// that just asked is about to fetch.
+    fn admit(&mut self, peer: EndpointId) {
+        self.peers.insert(peer);
+        self.expires_at = now_unix() + GRANT_TTL_SECS;
+    }
 }
 
 /// Blob capabilities minted by `GetArtifact`, consulted by the blobs request
@@ -111,20 +127,40 @@ impl Grants {
     /// it would pin a second copy of the bytes that nothing can reach.
     fn insert(&self, hash: Hash, peer: EndpointId, tag: Tag) -> Option<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let expires_at = now_unix() + GRANT_TTL_SECS;
         match map.get_mut(&hash) {
             Some(existing) => {
-                existing.peers.insert(peer);
-                existing.expires_at = expires_at;
+                existing.admit(peer);
                 Some(tag)
             }
             None => {
                 map.insert(
                     hash,
-                    Grant { peers: HashSet::from([peer]), expires_at, tag },
+                    Grant {
+                        peers: HashSet::from([peer]),
+                        expires_at: now_unix() + GRANT_TTL_SECS,
+                        tag,
+                    },
                 );
                 None
             }
+        }
+    }
+
+    /// Widen an EXISTING grant to one more peer, refreshing its TTL. `false`
+    /// when nothing is staged under `hash`: a grant with no bytes behind it is
+    /// a dangling capability, so the caller must stage first.
+    ///
+    /// This is the cheap half of `stage_for_peer`. Re-staging a file the
+    /// watcher touched costs a read plus a BLAKE3 pass and produces the same
+    /// hash for every interested peer — only the admission is per peer.
+    fn add_peer(&self, hash: Hash, peer: EndpointId) -> bool {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get_mut(&hash) {
+            Some(grant) => {
+                grant.admit(peer);
+                true
+            }
+            None => false,
         }
     }
 
@@ -145,12 +181,15 @@ impl Grants {
     /// Drop expired grants, returning their staging tags for cleanup.
     fn take_expired(&self, now: u64) -> Vec<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let expired: Vec<Hash> = map
-            .iter()
-            .filter(|(_, g)| g.expires_at <= now)
-            .map(|(h, _)| *h)
-            .collect();
-        expired.into_iter().filter_map(|h| map.remove(&h)).map(|g| g.tag).collect()
+        let mut expired = Vec::new();
+        map.retain(|_, grant| {
+            if grant.expires_at > now {
+                return true;
+            }
+            expired.push(grant.tag.clone());
+            false
+        });
+        expired
     }
 
     /// Revoke every grant held by one peer — what unpairing must do to bytes
@@ -211,34 +250,23 @@ impl TabsCache {
 /// fixed (closed, then opened, then activated) so a client applying the batch
 /// never sees a path briefly absent from a list it is about to re-add.
 pub fn diff_tabs(prev: &[TabEntry], next: &[TabEntry]) -> Vec<Event> {
-    let prev_paths: Vec<&str> = unique_paths(prev);
-    let next_paths: Vec<&str> = unique_paths(next);
-    let prev_set: HashSet<&str> = prev_paths.iter().copied().collect();
-    let next_set: HashSet<&str> = next_paths.iter().copied().collect();
+    let (prev_paths, prev_set) = unique_paths(prev);
+    let (next_paths, next_set) = unique_paths(next);
 
     let mut events = Vec::new();
-    for path in &prev_paths {
+    for path in prev_paths {
         if !next_set.contains(path) {
-            events.push(Event::TabClosed { path: (*path).to_string() });
+            events.push(Event::TabClosed { path: path.to_string() });
         }
     }
-    for path in &next_paths {
+    for path in next_paths {
         if !prev_set.contains(path) {
-            events.push(Event::TabOpened { path: (*path).to_string() });
+            events.push(Event::TabOpened { path: path.to_string() });
         }
     }
-    // An empty path is the start page, not an artifact: it is neither
-    // listed nor activated on the wire.
-    let active_of = |tabs: &[TabEntry]| -> Option<String> {
-        tabs.iter()
-            .find(|t| t.active && !t.path.is_empty())
-            .map(|t| t.path.clone())
-    };
-    let prev_active = active_of(prev);
-    let next_active = active_of(next);
-    if let Some(active) = next_active {
-        if prev_active.as_deref() != Some(active.as_str()) {
-            events.push(Event::TabActivated { path: active });
+    if let Some(active) = active_of(next) {
+        if active_of(prev) != Some(active) {
+            events.push(Event::TabActivated { path: active.to_string() });
         }
     }
     events
@@ -251,10 +279,7 @@ pub fn diff_tabs(prev: &[TabEntry], next: &[TabEntry]) -> Vec<Event> {
 pub fn canonical_tabs(tabs: Vec<TabEntry>, roots: &RootSet) -> Vec<TabEntry> {
     tabs.into_iter()
         .filter_map(|t| {
-            if t.path.is_empty() || !t.path.starts_with('/') || t.path.contains('\0') {
-                return None;
-            }
-            let canonical = security::canonicalize_and_check_root(Path::new(&t.path), roots).ok()?;
+            let canonical = gate_raw(&t.path, roots).ok()?;
             Some(TabEntry {
                 path: canonical.to_string_lossy().into_owned(),
                 active: t.active,
@@ -263,12 +288,40 @@ pub fn canonical_tabs(tabs: Vec<TabEntry>, roots: &RootSet) -> Vec<TabEntry> {
         .collect()
 }
 
-fn unique_paths(tabs: &[TabEntry]) -> Vec<&str> {
+/// The security gate with the wire's input hardening in front of it: absolute
+/// path, no NUL bytes (the deep-link parser's rules), then
+/// `canonicalize_and_check_root`. One refusal string for every failure, so a
+/// peer cannot tell a missing file from a forbidden one.
+///
+/// Free-standing because BOTH directions need it and only one of them has a
+/// `ScopeState`: an inbound request gates the path a peer named, and
+/// `canonical_tabs` gates every path this host is about to announce.
+fn gate_raw(raw: &str, roots: &RootSet) -> Result<PathBuf, String> {
+    if raw.is_empty() || !raw.starts_with('/') || raw.contains('\0') {
+        return Err(DENIED.to_string());
+    }
+    security::canonicalize_and_check_root(Path::new(raw), roots).map_err(|_| DENIED.to_string())
+}
+
+/// The distinct non-empty paths of a tab list, in strip order, plus the same
+/// paths as a set. Both come out of ONE pass: the diff needs the order to emit
+/// stable events and the set to answer "was this open before".
+fn unique_paths(tabs: &[TabEntry]) -> (Vec<&str>, HashSet<&str>) {
     let mut seen = HashSet::new();
-    tabs.iter()
+    let ordered: Vec<&str> = tabs
+        .iter()
         .map(|t| t.path.as_str())
         .filter(|p| !p.is_empty() && seen.insert(*p))
-        .collect()
+        .collect();
+    (ordered, seen)
+}
+
+/// The active tab's path, borrowed. An empty path is the start page, not an
+/// artifact: it is neither listed nor activated on the wire.
+fn active_of(tabs: &[TabEntry]) -> Option<&str> {
+    tabs.iter()
+        .find(|t| t.active && !t.path.is_empty())
+        .map(|t| t.path.as_str())
 }
 
 // ── Host state ─────────────────────────────────────────────────────────────
@@ -300,11 +353,36 @@ struct Session {
     id: u64,
     peer: String,
     tx: mpsc::Sender<Frame>,
-    subscribed: Arc<AtomicBool>,
+    /// Shared with the accept loop serving this session — ONE `Arc`, so the
+    /// registry and the request handler cannot end up looking at different
+    /// flags. Pairing two `Arc` fields by hand was how they could.
+    handles: Arc<SessionHandles>,
+}
+
+/// The per-session state the request handler mutates and the fan-out reads.
+struct SessionHandles {
+    subscribed: AtomicBool,
     /// Canonical paths this session fetched. A file change only crosses the
     /// wire for artifacts the client actually holds — that bounds re-hashing
     /// to what someone is looking at.
-    interest: Arc<Mutex<HashSet<PathBuf>>>,
+    interest: Mutex<HashSet<PathBuf>>,
+}
+
+impl SessionHandles {
+    fn new() -> Self {
+        Self {
+            subscribed: AtomicBool::new(false),
+            interest: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Ordering::SeqCst)
+    }
+
+    fn holds(&self, path: &Path) -> bool {
+        self.interest.lock().unwrap_or_else(|p| p.into_inner()).contains(path)
+    }
 }
 
 impl ScopeState {
@@ -370,18 +448,11 @@ impl ScopeState {
     fn broadcast(&self, event: Event, only_interested_in: Option<&Path>) {
         let sessions = self.sessions();
         for session in sessions.iter() {
-            if !session.subscribed.load(Ordering::SeqCst) {
+            if !session.handles.is_subscribed() {
                 continue;
             }
-            if let Some(path) = only_interested_in {
-                let holds = session
-                    .interest
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .contains(path);
-                if !holds {
-                    continue;
-                }
+            if only_interested_in.is_some_and(|path| !session.handles.holds(path)) {
+                continue;
             }
             // Events are droppable by design: a client that stopped reading
             // must not stall the host's watcher bridge.
@@ -389,53 +460,40 @@ impl ScopeState {
         }
     }
 
-    /// Paths at least one subscribed session fetched — the set worth
-    /// re-hashing when the watcher fires.
-    fn watched_paths(&self) -> HashSet<PathBuf> {
-        let sessions = self.sessions();
-        let mut all = HashSet::new();
-        for session in sessions.iter() {
-            if !session.subscribed.load(Ordering::SeqCst) {
-                continue;
-            }
-            all.extend(session.interest.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
-        }
-        all
+    /// Did any subscribed session fetch this path? The one question the
+    /// watcher bridge asks per event, and the answer that decides whether the
+    /// file is worth re-reading and re-hashing at all — so it short-circuits
+    /// on the first holder instead of collecting every session's interest.
+    fn any_session_holds(&self, path: &Path) -> bool {
+        self.sessions()
+            .iter()
+            .any(|s| s.handles.is_subscribed() && s.handles.holds(path))
     }
 
-    /// The artifacts a view-open peer may fetch: exactly what it was told
-    /// about. Every entry is gated first, so this can only ever narrow.
-    fn published_set(&self) -> HashSet<PathBuf> {
-        let mut set = HashSet::new();
-        for tab in self.tabs.list() {
-            if let Ok(canonical) = self.gate_path(&tab.path) {
-                set.insert(canonical);
-            }
-        }
-        for path in self.catalog.bookmarks().into_iter().chain(self.catalog.recents()) {
-            if let Ok(canonical) = self.gate_path(&path.to_string_lossy()) {
-                set.insert(canonical);
-            }
-        }
-        set
+    /// Is this canonical path one a view-open peer was told about — an open
+    /// tab, a bookmark or a recent? Every candidate is gated on the way past,
+    /// so this can only ever narrow what the RootSet already admitted.
+    ///
+    /// Short-circuiting on purpose: one `.contains` does not justify
+    /// canonicalizing every tab, bookmark and recent the host holds, and the
+    /// answer must stay live (a tab opened a moment ago is fetchable).
+    fn is_published(&self, canonical: &Path) -> bool {
+        let published = |raw: &str| self.gate_path(raw).is_ok_and(|p| p == canonical);
+        self.tabs.list().iter().any(|t| published(&t.path))
+            || self.catalog.bookmarks().iter().any(|p| published(&p.to_string_lossy()))
+            || self.catalog.recents().iter().any(|p| published(&p.to_string_lossy()))
     }
 
-    /// The security gate, with the wire's input hardening in front of it:
-    /// absolute path, no NUL bytes (the deep-link parser's rules), then
-    /// `canonicalize_and_check_root`. One refusal string for every failure.
+    /// This host's roots applied to one raw wire path. See `gate_raw`.
     fn gate_path(&self, raw: &str) -> Result<PathBuf, String> {
-        if raw.is_empty() || !raw.starts_with('/') || raw.contains('\0') {
-            return Err(DENIED.to_string());
-        }
-        security::canonicalize_and_check_root(Path::new(raw), &self.roots)
-            .map_err(|_| DENIED.to_string())
+        gate_raw(raw, &self.roots)
     }
 
     /// The full path check for one request: security gate, then the
     /// view-open peer's narrowing to the artifacts it was told about.
     fn gate_for(&self, peer: &Peer, raw: &str) -> Result<PathBuf, String> {
         let canonical = self.gate_path(raw)?;
-        if peer.scope == Scope::ViewOpen && !self.published_set().contains(&canonical) {
+        if peer.scope == Scope::ViewOpen && !self.is_published(&canonical) {
             return Err(DENIED.to_string());
         }
         Ok(canonical)
@@ -478,76 +536,58 @@ impl ScopeServer {
     /// so the event carries the NEW content address the client refetches by
     /// (design §6); a removed file needs no hash.
     pub async fn note_change(&self, path: &Path, removed: bool) {
-        let Ok(canonical) = path.canonicalize().or_else(|_| {
+        let canonical = match path.canonicalize() {
+            Ok(canonical) => canonical,
             // A removed file cannot canonicalize; fall back to the raw path,
             // which the interest set stores in canonical form anyway.
-            if removed {
-                Ok(path.to_path_buf())
-            } else {
-                Err(())
-            }
-        }) else {
-            return;
+            Err(_) if removed => path.to_path_buf(),
+            Err(_) => return,
         };
-        if !self.state.watched_paths().contains(&canonical) {
+        if !self.state.any_session_holds(&canonical) {
             return;
         }
+        let wire_path = canonical.to_string_lossy().into_owned();
         if removed {
-            self.state.broadcast(
-                Event::FileRemoved { path: canonical.to_string_lossy().into_owned() },
-                Some(&canonical),
-            );
+            self.state
+                .broadcast(Event::FileRemoved { path: wire_path }, Some(&canonical));
             return;
         }
+
         // Re-stage under the same peer grants that already hold this path, so
         // the refetch of the new hash is admitted without a second round trip.
+        // ONE staging pass for all of them: `add_path` re-reads the file and
+        // re-runs BLAKE3 over it, and neither depends on who is asking — the
+        // rest of the interested peers only need the admission.
         let peers = self.peers_holding(&canonical);
-        let mut hash = None;
-        for peer in peers {
-            match self.stage(&canonical, peer).await {
-                Ok(h) => hash = Some(h),
-                Err(e) => eprintln!("vlerv: scope: cannot re-stage {canonical:?}: {e}"),
+        let Some((first, rest)) = peers.split_first() else { return };
+        let staged = match stage_for_peer(&self.store, &self.grants, &canonical, *first).await {
+            Ok(staged) => staged,
+            Err(e) => {
+                eprintln!("vlerv: scope: cannot re-stage {canonical:?}: {e}");
+                return;
+            }
+        };
+        for peer in rest {
+            if !self.grants.add_peer(staged.hash, *peer) {
+                // The grant `stage_for_peer` just made was revoked underneath
+                // us. Say so rather than drop it silently: that peer's refetch
+                // of the new hash will be refused at the gate.
+                eprintln!("vlerv: scope: no live grant to widen for {canonical:?}");
             }
         }
-        if let Some(hash) = hash {
-            self.state.broadcast(
-                Event::FileChanged {
-                    path: canonical.to_string_lossy().into_owned(),
-                    hash: hash.to_string(),
-                },
-                Some(&canonical),
-            );
-        }
+        self.state.broadcast(
+            Event::FileChanged { path: wire_path, hash: staged.hash.to_string() },
+            Some(&canonical),
+        );
     }
 
     fn peers_holding(&self, path: &Path) -> Vec<EndpointId> {
         let sessions = self.state.sessions();
         sessions
             .iter()
-            .filter(|s| s.subscribed.load(Ordering::SeqCst))
-            .filter(|s| s.interest.lock().unwrap_or_else(|p| p.into_inner()).contains(path))
+            .filter(|s| s.handles.is_subscribed() && s.handles.holds(path))
             .filter_map(|s| s.peer.parse::<EndpointId>().ok())
             .collect()
-    }
-
-    /// Stage a gated path into the blob store and grant the peer a fetch of
-    /// the resulting hash.
-    async fn stage(&self, canonical: &Path, peer: EndpointId) -> Result<Hash, String> {
-        self.delete_tags(self.grants.take_expired(now_unix())).await;
-        let tag = self
-            .store
-            .blobs()
-            .add_path(canonical)
-            .await
-            .map_err(|e| format!("cannot stage artifact: {e}"))?;
-        if let Some(redundant) = self.grants.insert(tag.hash, peer, tag.name) {
-            self.delete_tags(vec![redundant]).await;
-        }
-        Ok(tag.hash)
-    }
-
-    async fn delete_tags(&self, tags: Vec<Tag>) {
-        delete_tags(&self.store, tags).await;
     }
 
     /// Revoke a peer's grants and drop its sessions. Called on unpair.
@@ -555,7 +595,7 @@ impl ScopeServer {
         self.state.drop_sessions_for(node_id);
         if let Ok(id) = node_id.parse::<EndpointId>() {
             let orphaned = self.grants.revoke_peer(&id);
-            self.delete_tags(orphaned).await;
+            delete_tags(&self.store, orphaned).await;
         }
     }
 
@@ -570,76 +610,76 @@ impl ScopeServer {
         if !peer.scope.allows(&req) {
             return Res::Denied("not permitted for this peer".to_string());
         }
+        // Every refusal below — scope, path, size — is an `Err`, and this is
+        // the ONE place it becomes the no-existence-leak `Denied` frame.
+        self.dispatch(peer, peer_id, req, session).await.unwrap_or_else(Res::Denied)
+    }
+
+    async fn dispatch(
+        &self,
+        peer: &Peer,
+        peer_id: EndpointId,
+        req: Req,
+        session: &SessionHandles,
+    ) -> Result<Res, String> {
         match req {
             // A second Hello on a live session is a protocol error, not a
             // request; answer it as a refusal rather than re-handshaking.
-            Req::Hello { .. } => Res::Denied("session already established".to_string()),
-            Req::ListTabs => Res::Tabs(
-                self.state
-                    .tabs
-                    .list()
-                    .into_iter()
-                    .filter(|t| self.state.gate_path(&t.path).is_ok())
-                    .collect(),
-            ),
-            Req::ListBookmarks => Res::Paths(
+            Req::Hello { .. } => Err("session already established".to_string()),
+            // The cached list is already gated AND canonicalized: nothing
+            // reaches it except through `canonical_tabs` at publish time, so
+            // re-canonicalizing every entry per request would only re-derive
+            // an answer the host already holds.
+            Req::ListTabs => Ok(Res::Tabs(self.state.tabs.list())),
+            Req::ListBookmarks => Ok(Res::Paths(
                 self.state
                     .catalog
                     .bookmarks()
                     .into_iter()
                     .filter_map(|p| self.path_entry(&p))
                     .collect(),
-            ),
-            Req::ListRecents => Res::Paths(
+            )),
+            Req::ListRecents => Ok(Res::Paths(
                 self.state
                     .catalog
                     .recents()
                     .into_iter()
                     .filter_map(|p| self.path_entry(&p))
                     .collect(),
-            ),
-            Req::ListTree { path } => match self.state.gate_for(peer, &path) {
-                Ok(canonical) => match list_tree(&canonical) {
-                    Ok(entries) => Res::Tree(entries),
-                    Err(e) => Res::Denied(e),
-                },
-                Err(e) => Res::Denied(e),
-            },
-            Req::GetArtifact { path } => match self.artifact(peer, peer_id, &path).await {
-                Ok((meta, canonical)) => {
-                    session
-                        .interest
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(canonical);
-                    Res::Artifact(meta)
-                }
-                Err(e) => Res::Denied(e),
-            },
+            )),
+            Req::ListTree { path } => {
+                let canonical = self.state.gate_for(peer, &path)?;
+                Ok(Res::Tree(list_tree(&canonical)?))
+            }
+            Req::GetArtifact { path } => {
+                let (meta, canonical) = self.artifact(peer, peer_id, &path).await?;
+                session
+                    .interest
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(canonical);
+                Ok(Res::Artifact(meta))
+            }
             Req::Subscribe => {
                 session.subscribed.store(true, Ordering::SeqCst);
-                Res::Subscribed
+                Ok(Res::Subscribed)
             }
             Req::Unsubscribe => {
                 session.subscribed.store(false, Ordering::SeqCst);
-                Res::Subscribed
+                Ok(Res::Subscribed)
             }
-            Req::OpenOnHost { path, reader_mode } => match self.state.gate_for(peer, &path) {
-                Ok(canonical) => {
-                    self.state.signal(HostSignal::OpenOnHost {
-                        peer: peer.node_id.clone(),
-                        path: canonical,
-                        reader_mode,
-                    });
-                    Res::Opened
-                }
-                Err(e) => Res::Denied(e),
-            },
+            Req::OpenOnHost { path, reader_mode } => {
+                let canonical = self.state.gate_for(peer, &path)?;
+                self.state.signal(HostSignal::OpenOnHost {
+                    peer: peer.node_id.clone(),
+                    path: canonical,
+                    reader_mode,
+                });
+                Ok(Res::Opened)
+            }
             Req::PushArtifact { name, size, hash, ticket } => {
-                match self.accept_push(peer, peer_id, &name, size, &hash, &ticket).await {
-                    Ok(file) => Res::Pushed { name: file.name, size: file.size },
-                    Err(e) => Res::Denied(e),
-                }
+                let file = self.accept_push(peer, peer_id, &name, size, &hash, &ticket).await?;
+                Ok(Res::Pushed { name: file.name, size: file.size })
             }
         }
     }
@@ -690,11 +730,7 @@ impl ScopeServer {
         // The name that matters downstream is the one ON DISK: collision
         // handling may have landed `report.html` as `report-2.html`, and both
         // the signal and the response describe the file the host now holds.
-        let landed = file
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file.name.clone());
+        let landed = base_name(&file.path).unwrap_or_else(|| file.name.clone());
         self.state.signal(HostSignal::ArtifactReceived {
             peer: peer.node_id.clone(),
             path: file.path.clone(),
@@ -708,10 +744,7 @@ impl ScopeServer {
     fn path_entry(&self, path: &Path) -> Option<PathEntry> {
         let canonical = self.state.gate_path(&path.to_string_lossy()).ok()?;
         Some(PathEntry {
-            name: canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            name: base_name(&canonical).unwrap_or_default(),
             path: canonical.to_string_lossy().into_owned(),
         })
     }
@@ -731,17 +764,12 @@ impl ScopeServer {
         if meta.len() > crate::beam::HARD_CAP_BYTES {
             return Err("artifact exceeds the transfer size cap".to_string());
         }
-        let hash = self.stage(&canonical, peer_id).await?;
+        let staged = stage_for_peer(&self.store, &self.grants, &canonical, peer_id).await?;
         Ok((
             ArtifactMeta {
-                hash: hash.to_string(),
+                hash: staged.hash.to_string(),
                 size: meta.len(),
-                mtime: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                mtime: mtime_secs(&meta),
                 warn: meta.len() > crate::beam::WARN_BYTES,
             },
             canonical,
@@ -749,22 +777,35 @@ impl ScopeServer {
     }
 }
 
-/// Delete staging tags, logging failures rather than discarding them — a
-/// failed delete leaves a copy of somebody's artifact pinned on disk after the
-/// grant that justified it is gone, and that should be diagnosable. Shared by
-/// the host's staging path and the client's push path.
-async fn delete_tags(store: &FsStore, tags: Vec<Tag>) {
-    for tag in tags {
-        if let Err(e) = store.tags().delete(tag.clone()).await {
-            eprintln!("vlerv: scope: could not delete blob tag {tag:?}: {e}");
-        }
+/// Stage a file into the blob store and grant EXACTLY ONE peer a fetch of the
+/// resulting hash — plus the housekeeping sweep that unpins whatever expired
+/// while the store was at hand.
+///
+/// The `add_path` and the `grants.insert` are one operation on purpose, in one
+/// place, used by both directions: the host staging an artifact a peer asked
+/// for, and a client staging one it is about to push. Bytes in the store with
+/// no grant behind them are unreachable, and a grant is what makes the fetch
+/// peer-locked — splitting the pair is how a hash becomes fetchable by anyone
+/// who learns it.
+async fn stage_for_peer(
+    store: &FsStore,
+    grants: &Grants,
+    path: &Path,
+    peer: EndpointId,
+) -> Result<HashAndFormat, String> {
+    delete_tags(store, grants.take_expired(now_unix())).await;
+    let tag = store
+        .blobs()
+        .add_path(path)
+        .await
+        .map_err(|e| format!("cannot stage artifact: {e}"))?;
+    let staged = HashAndFormat { hash: tag.hash, format: tag.format };
+    if let Some(redundant) = grants.insert(tag.hash, peer, tag.name) {
+        // This content was already staged: the fresh tag would pin a second
+        // copy of the same bytes that nothing can reach.
+        delete_tags(store, vec![redundant]).await;
     }
-}
-
-/// The per-session flags the request handler mutates.
-struct SessionHandles {
-    subscribed: Arc<AtomicBool>,
-    interest: Arc<Mutex<HashSet<PathBuf>>>,
+    Ok(staged)
 }
 
 impl ProtocolHandler for ScopeServer {
@@ -808,18 +849,14 @@ impl ProtocolHandler for ScopeServer {
         let _ = self.state.peers.upsert(&node_id, &device, peer.scope);
 
         let (tx, mut rx) = mpsc::channel::<Frame>(SESSION_QUEUE);
-        let handles = SessionHandles {
-            subscribed: Arc::new(AtomicBool::new(false)),
-            interest: Arc::new(Mutex::new(HashSet::new())),
-        };
+        let handles = Arc::new(SessionHandles::new());
         let id = self.state.next_session_id.fetch_add(1, Ordering::SeqCst);
         self.state
             .register(Session {
                 id,
                 peer: node_id.clone(),
                 tx: tx.clone(),
-                subscribed: handles.subscribed.clone(),
-                interest: handles.interest.clone(),
+                handles: handles.clone(),
             })
             .map_err(|e| {
                 connection.close(VarInt::from_u32(CLOSE_REFUSED), b"session cap");
@@ -1027,13 +1064,7 @@ impl ClientSession {
         on_closed: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Self>, String> {
         let peer = addr.id.to_string();
-        let connection = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            node.endpoint.connect(addr, proto::SCOPE_ALPN),
-        )
-        .await
-        .map_err(|_| "peer offline — could not reach it (timed out)".to_string())?
-        .map_err(|e| format!("peer offline — could not reach it ({e})"))?;
+        let connection = endpoint::dial(&node.endpoint, addr, proto::SCOPE_ALPN, PEER_OFFLINE).await?;
 
         let (mut send, mut recv) = connection
             .open_bi()
@@ -1131,60 +1162,81 @@ impl ClientSession {
         rx.await.map_err(|_| "the session is closed".to_string())
     }
 
+    /// Issue one request and pull the expected shape out of the answer.
+    /// `extract` hands back any other variant untouched, which `unexpected`
+    /// turns into the host's own wording — a `Denied` frame is the host's
+    /// answer, not a protocol failure, and every accessor must surface it the
+    /// same way.
+    async fn request_as<T>(
+        &self,
+        req: Req,
+        extract: fn(Res) -> Result<T, Res>,
+    ) -> Result<T, String> {
+        self.request(req).await.and_then(|res| extract(res).map_err(unexpected))
+    }
+
     pub async fn list_tabs(&self) -> Result<Vec<TabEntry>, String> {
-        match self.request(Req::ListTabs).await? {
+        self.request_as(Req::ListTabs, |res| match res {
             Res::Tabs(tabs) => Ok(tabs),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn list_bookmarks(&self) -> Result<Vec<PathEntry>, String> {
-        match self.request(Req::ListBookmarks).await? {
+        self.request_as(Req::ListBookmarks, |res| match res {
             Res::Paths(paths) => Ok(paths),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn list_recents(&self) -> Result<Vec<PathEntry>, String> {
-        match self.request(Req::ListRecents).await? {
+        self.request_as(Req::ListRecents, |res| match res {
             Res::Paths(paths) => Ok(paths),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn list_tree(&self, path: String) -> Result<Vec<TreeEntry>, String> {
-        match self.request(Req::ListTree { path }).await? {
+        self.request_as(Req::ListTree { path }, |res| match res {
             Res::Tree(entries) => Ok(entries),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn get_artifact(&self, path: String) -> Result<ArtifactMeta, String> {
-        match self.request(Req::GetArtifact { path }).await? {
+        self.request_as(Req::GetArtifact { path }, |res| match res {
             Res::Artifact(meta) => Ok(meta),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn open_on_host(&self, path: String, reader_mode: bool) -> Result<(), String> {
-        match self.request(Req::OpenOnHost { path, reader_mode }).await? {
+        self.request_as(Req::OpenOnHost { path, reader_mode }, |res| match res {
             Res::Opened => Ok(()),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn subscribe(&self) -> Result<(), String> {
-        match self.request(Req::Subscribe).await? {
+        self.request_as(Req::Subscribe, |res| match res {
             Res::Subscribed => Ok(()),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     pub async fn unsubscribe(&self) -> Result<(), String> {
-        match self.request(Req::Unsubscribe).await? {
+        self.request_as(Req::Unsubscribe, |res| match res {
             Res::Subscribed => Ok(()),
-            other => Err(unexpected(other)),
-        }
+            other => Err(other),
+        })
+        .await
     }
 
     /// Push a local artifact onto the host — the reverse of `get_artifact`,
@@ -1219,10 +1271,7 @@ impl ClientSession {
         roots: &RootSet,
         socket: std::net::SocketAddr,
     ) -> Result<PushedArtifact, String> {
-        let addr = EndpointAddr::from_parts(
-            self.endpoint.id(),
-            [iroh::TransportAddr::Ip(socket)],
-        );
+        let addr = endpoint::addr_at_id(self.endpoint.id(), socket);
         self.push_artifact_via(path, roots, addr).await
     }
 
@@ -1242,36 +1291,29 @@ impl ClientSession {
             .parse()
             .map_err(|_| "malformed peer id".to_string())?;
 
-        // Housekeeping, same as the host's staging path: unpin the bytes of
-        // grants that expired while the store is at hand.
-        delete_tags(&self.store, self.grants.take_expired(now_unix())).await;
-        let tag = self
-            .store
-            .blobs()
-            .add_path(&cand.canonical)
-            .await
-            .map_err(|e| format!("cannot stage file: {e}"))?;
-        // Peer-locked: possession of the ticket is NOT enough on this side
-        // either — the local request gate admits the hash only for the host
-        // we are pushing to.
-        if let Some(redundant) = self.grants.insert(tag.hash, host, tag.name) {
-            delete_tags(&self.store, vec![redundant]).await;
-        }
+        // Peer-locked, through the same pairing the host uses: possession of
+        // the ticket is NOT enough on this side either, because the local
+        // request gate admits the hash only for the host we are pushing to.
+        let staged = stage_for_peer(&self.store, &self.grants, &cand.canonical, host).await?;
 
-        let hash = tag.hash.to_string();
-        let ticket = iroh_blobs::ticket::BlobTicket::new(addr, tag.hash, tag.format).to_string();
-        match self
-            .request(Req::PushArtifact {
-                name: cand.name,
-                size: cand.size,
-                hash: hash.clone(),
-                ticket,
-            })
-            .await?
-        {
-            Res::Pushed { name, size } => Ok(PushedArtifact { name, size, hash }),
-            other => Err(unexpected(other)),
-        }
+        let hash = staged.hash.to_string();
+        let ticket =
+            iroh_blobs::ticket::BlobTicket::new(addr, staged.hash, staged.format).to_string();
+        let (name, size) = self
+            .request_as(
+                Req::PushArtifact {
+                    name: cand.name,
+                    size: cand.size,
+                    hash: hash.clone(),
+                    ticket,
+                },
+                |res| match res {
+                    Res::Pushed { name, size } => Ok((name, size)),
+                    other => Err(other),
+                },
+            )
+            .await?;
+        Ok(PushedArtifact { name, size, hash })
     }
 }
 
@@ -1292,13 +1334,13 @@ pub async fn pair_dial(
     local_device: String,
 ) -> Result<PendingPair, String> {
     let host_id = ticket.addr.id;
-    let connection = tokio::time::timeout(
-        DIAL_TIMEOUT,
-        node.endpoint.connect(ticket.addr.clone(), proto::PAIR_ALPN),
+    let connection = endpoint::dial(
+        &node.endpoint,
+        ticket.addr.clone(),
+        proto::PAIR_ALPN,
+        PEER_OFFLINE,
     )
-    .await
-    .map_err(|_| "peer offline — could not reach it (timed out)".to_string())?
-    .map_err(|e| format!("peer offline — could not reach it ({e})"))?;
+    .await?;
 
     let (mut send, mut recv) = connection
         .open_bi()
@@ -1333,23 +1375,6 @@ pub async fn pair_dial(
     }
 }
 
-/// Serial number for in-flight cache downloads — see `fetch_into_cache`.
-static PARTIAL_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Temp file name for one in-flight cache download. Unique per call, not per
-/// content address: two tabs on the same remote artifact (or a live-reload
-/// refetch overlapping the first read) fetch concurrently, and a shared
-/// `<hash><ext>.partial` would let them interleave writes into one file and
-/// make the loser's rename fail. Both still rename onto the same final path,
-/// which is atomic and idempotent — the bytes are identical, the hash says so.
-fn partial_name(hash_hex: &str, ext: &str) -> String {
-    format!(
-        "{hash_hex}{ext}.{}.{}.partial",
-        std::process::id(),
-        PARTIAL_SEQ.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
 /// Fetch an artifact by content address into `remote/cache/<hash><ext>`,
 /// verified by the blob protocol. Content-addressed: a hash (+ extension)
 /// already in the cache is a hit and costs no network at all.
@@ -1381,38 +1406,27 @@ pub async fn fetch_into_cache(
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("cannot prepare the cache folder {}: {e}", cache_dir.display()))?;
 
-    let connection = tokio::time::timeout(
-        DIAL_TIMEOUT,
-        node.endpoint.connect(addr, iroh_blobs::ALPN),
+    let connection =
+        endpoint::dial(&node.endpoint, addr, iroh_blobs::ALPN, PEER_OFFLINE).await?;
+
+    // Same staging, verification and one-cleanup discipline as a Beam
+    // receive — it IS that routine. Only the final move differs: the cache
+    // name is the content address, so the target is known before the bytes are.
+    let partial = cache_dir.join(crate::beam::partial_name(hash_hex, ext));
+    let (_written, landed) = crate::beam::download_to(
+        connection,
+        hash,
+        hash_hex,
+        &partial,
+        |partial| {
+            std::fs::rename(partial, &target)
+                .map_err(|e| format!("cannot move the fetched artifact into place: {e}"))?;
+            Ok(target.clone())
+        },
+        &mut |_, _| {},
     )
-    .await
-    .map_err(|_| "peer offline — could not reach it (timed out)".to_string())?
-    .map_err(|e| format!("peer offline — could not reach it ({e})"))?;
-
-    let partial = cache_dir.join(partial_name(hash_hex, ext));
-    let result = async {
-        let mut file = std::io::BufWriter::new(
-            std::fs::File::create(&partial)
-                .map_err(|e| format!("cannot open the incoming file {}: {e}", partial.display()))?,
-        );
-        crate::beam::stream_blob_into(connection, hash, &mut file, hash_hex, &mut |_, _| {}).await?;
-        file.into_inner()
-            .map_err(|e| format!("cannot flush the incoming file: {e}"))?
-            .sync_all()
-            .map_err(|e| format!("cannot flush the incoming file: {e}"))?;
-        std::fs::rename(&partial, &target)
-            .map_err(|e| format!("cannot move the fetched artifact into place: {e}"))?;
-        Ok::<(), String>(())
-    }
-    .await;
-
-    match result {
-        Ok(()) => Ok(target),
-        Err(e) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(e)
-        }
-    }
+    .await?;
+    Ok(landed)
 }
 
 // ── Framing over a QUIC stream ─────────────────────────────────────────────
@@ -1725,58 +1739,60 @@ mod tests {
 
     // ── Session caps ───────────────────────────────────────────────────────
 
+    /// A registrable session with a live channel. The receiver is returned so
+    /// the caller keeps it alive — a dropped one closes the sender.
+    fn session(id: u64, peer: &str) -> (Session, mpsc::Receiver<Frame>) {
+        let (tx, rx) = mpsc::channel(1);
+        let session = Session {
+            id,
+            peer: peer.to_string(),
+            tx,
+            handles: Arc::new(SessionHandles::new()),
+        };
+        (session, rx)
+    }
+
     #[test]
     fn a_peer_cannot_hold_more_than_the_session_cap() {
         let dir = tempfile::TempDir::new().unwrap();
         let st = state(&dir, RootSet::empty());
         let mut ids = Vec::new();
+        let mut keep_alive = Vec::new();
         for n in 0..MAX_SESSIONS_PER_PEER {
-            let (tx, _rx) = mpsc::channel(1);
-            ids.push(
-                st.register(Session {
-                    id: n as u64,
-                    peer: "nodeA".into(),
-                    tx,
-                    subscribed: Arc::new(AtomicBool::new(false)),
-                    interest: Arc::new(Mutex::new(HashSet::new())),
-                })
-                .expect("under the cap"),
-            );
+            let (session, rx) = session(n as u64, "nodeA");
+            keep_alive.push(rx);
+            ids.push(st.register(session).expect("under the cap"));
         }
-        let (tx, _rx) = mpsc::channel(1);
-        assert!(
-            st.register(Session {
-                id: 99,
-                peer: "nodeA".into(),
-                tx,
-                subscribed: Arc::new(AtomicBool::new(false)),
-                interest: Arc::new(Mutex::new(HashSet::new())),
-            })
-            .is_err(),
-            "the cap refuses the next session"
-        );
+        let (over_cap, _rx) = session(99, "nodeA");
+        assert!(st.register(over_cap).is_err(), "the cap refuses the next session");
+
         // Another peer is unaffected — the cap is per peer.
-        let (tx, _rx) = mpsc::channel(1);
-        assert!(st
-            .register(Session {
-                id: 100,
-                peer: "nodeB".into(),
-                tx,
-                subscribed: Arc::new(AtomicBool::new(false)),
-                interest: Arc::new(Mutex::new(HashSet::new())),
-            })
-            .is_ok());
+        let (other_peer, _rx) = session(100, "nodeB");
+        assert!(st.register(other_peer).is_ok());
+
         st.unregister(ids[0]);
-        let (tx, _rx) = mpsc::channel(1);
-        assert!(st
-            .register(Session {
-                id: 101,
-                peer: "nodeA".into(),
-                tx,
-                subscribed: Arc::new(AtomicBool::new(false)),
-                interest: Arc::new(Mutex::new(HashSet::new())),
-            })
-            .is_ok());
+        let (replacement, _rx) = session(101, "nodeA");
+        assert!(st.register(replacement).is_ok());
+    }
+
+    #[test]
+    fn only_a_subscribed_session_that_fetched_a_path_makes_it_worth_re_hashing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = state(&dir, RootSet::empty());
+        let watched = PathBuf::from("/w/a.html");
+
+        let (session, _rx) = session(1, "nodeA");
+        let handles = session.handles.clone();
+        st.register(session).unwrap();
+
+        // Fetched but not subscribed: the client is not listening for events.
+        handles.interest.lock().unwrap().insert(watched.clone());
+        assert!(!st.any_session_holds(&watched));
+
+        // Subscribed and holding it: this is the one case worth the re-read.
+        handles.subscribed.store(true, Ordering::SeqCst);
+        assert!(st.any_session_holds(&watched));
+        assert!(!st.any_session_holds(Path::new("/w/never-fetched.html")));
     }
 
     // ── Grants ─────────────────────────────────────────────────────────────
@@ -1852,19 +1868,4 @@ mod tests {
         assert_eq!(list_tree(&file).unwrap_err(), DENIED);
     }
 
-    // ── Cache download temp names ──────────────────────────────────────────
-
-    #[test]
-    fn every_in_flight_download_gets_its_own_temp_name() {
-        let hash = "a".repeat(64);
-        let first = partial_name(&hash, ".html");
-        let second = partial_name(&hash, ".html");
-        // Two fetches of the SAME content address must not share a temp file:
-        // they would interleave writes and one rename would fail.
-        assert_ne!(first, second);
-        for name in [&first, &second] {
-            assert!(name.starts_with(&format!("{hash}.html.")), "{name} keeps hash and ext");
-            assert!(name.ends_with(".partial"), "{name} stays a partial");
-        }
-    }
 }

@@ -21,7 +21,7 @@ use iroh_blobs::Hash;
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
 
-use crate::proto;
+use crate::{paths, proto};
 
 /// On-disk schema version for `peers.json`. A document written by a newer
 /// build is left alone rather than rewritten in an older shape.
@@ -63,6 +63,17 @@ impl Scope {
         }
     }
 
+    /// `parse`, with `None` meaning "the caller said nothing" rather than
+    /// "the caller said something unknown". Every IPC and MCP entry point that
+    /// takes an OPTIONAL scope resolves it here, so an omitted argument lands
+    /// on `DEFAULT_SCOPE` and a typo is still rejected.
+    pub fn parse_or_default(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            Some(raw) => Self::parse(raw),
+            None => Ok(DEFAULT_SCOPE),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::ViewOpen => "view-open",
@@ -73,7 +84,7 @@ impl Scope {
 
     /// The verb-level half of the scope filter: may this scope issue this
     /// request kind at all? The path-level half (which artifacts a view-open
-    /// peer may fetch) lives in `scope::published_set`.
+    /// peer may fetch) lives in `ScopeState::is_published`.
     pub fn allows(self, req: &proto::Req) -> bool {
         match req {
             proto::Req::Hello { .. }
@@ -255,39 +266,21 @@ impl PeerStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        write_private(&tmp, json.as_bytes())?;
+        paths::write_private(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("cannot write {:?}: {e}", self.path))
     }
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {path:?}: {e}"))?;
-    // `mode` applies at CREATION only. This path is the `peers.json.tmp`
-    // staging file, which a crash between write and rename can leave behind:
-    // reopening it would keep whatever mode it already had. Set the mode on
-    // the open handle so the renamed file is 0600 either way — it names the
-    // machines this install trusts.
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot restrict {path:?}: {e}"))?;
-    f.write_all(bytes).map_err(|e| e.to_string())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
-}
-
 pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The first 10 hex characters of a NodeId — the same width iroh's own
+/// `fmt_short` prints (its first five bytes), so a short id copied from a log
+/// line and one shown in a peer list are the same string. The length guard
+/// covers a truncated entry read off disk.
+pub fn short_id(node_id: &str) -> String {
+    node_id.chars().take(10).collect()
 }
 
 // ── Pairing ticket ─────────────────────────────────────────────────────────
@@ -347,6 +340,49 @@ pub fn build_pair_link(ticket: &str) -> String {
     format!("vlerv://pair?ticket={ticket}")
 }
 
+/// Everything "open pairing" produces: the ticket, the link that carries it,
+/// who is offering, and when the token dies. Consumers wrap this in their own
+/// IPC shape — the desktop's `PairInvite` command result, the MCP server's
+/// `PairingInvite` with its extra prose fields — instead of re-deriving the
+/// four facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairInvite {
+    /// The encoded `PairTicket`.
+    pub ticket: String,
+    /// `vlerv://pair?ticket=…`.
+    pub link: String,
+    /// The offering machine's NodeId, hex.
+    pub node_id: String,
+    /// The offering machine's sanitized device name.
+    pub device: String,
+    /// Unix seconds after which the token is dead.
+    pub expires_at: u64,
+}
+
+/// Mint a one-time token and wrap it in the ticket, the link and the TTL that
+/// belong to it. `addr` is the offering endpoint's own address — the caller
+/// owns the bounded `online()` wait that makes it reachable from another
+/// network, because that is endpoint lifecycle, not pairing policy.
+///
+/// One place mints, so a caller cannot mint a token and then describe it with
+/// a TTL, a link shape or a NodeId that does not match what it handed out.
+pub fn mint_invite(addr: EndpointAddr, pairing: &Pairing, device: &str) -> PairInvite {
+    let node_id = addr.id.to_string();
+    let ticket = PairTicket {
+        addr,
+        token: pairing.mint(),
+        device: device.to_string(),
+    }
+    .to_string();
+    PairInvite {
+        link: build_pair_link(&ticket),
+        ticket,
+        node_id,
+        device: device.to_string(),
+        expires_at: now_unix() + PAIR_TOKEN_TTL_SECS,
+    }
+}
+
 // ── One-time pairing tokens ────────────────────────────────────────────────
 
 /// Live pairing tokens minted by `remote_pair_begin`. A token is consumed by
@@ -384,19 +420,15 @@ impl Pairing {
     /// instead of adding a second one.
     pub fn mint(&self) -> [u8; 32] {
         let token = SecretKey::generate().to_bytes();
-        let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
-        let now = now_unix();
-        tokens.retain(|(minted, _)| now.saturating_sub(*minted) < PAIR_TOKEN_TTL_SECS);
-        tokens.push((now, token));
+        let mut tokens = self.sweep();
+        tokens.push((now_unix(), token));
         token
     }
 
     /// Consume a token. `false` for an unknown, expired, or already-used
     /// token — the three are indistinguishable to the caller on purpose.
     pub fn consume(&self, token: &[u8; 32]) -> bool {
-        let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
-        let now = now_unix();
-        tokens.retain(|(minted, _)| now.saturating_sub(*minted) < PAIR_TOKEN_TTL_SECS);
+        let mut tokens = self.sweep();
         let Some(idx) = tokens.iter().position(|(_, t)| t == token) else {
             return false;
         };
@@ -404,14 +436,21 @@ impl Pairing {
         true
     }
 
-    pub fn live_tokens(&self) -> usize {
+    /// Take the token list with every expired entry already dropped. The TTL
+    /// is applied HERE and nowhere else, so no entry point can see a token the
+    /// others consider dead.
+    fn sweep(&self) -> std::sync::MutexGuard<'_, Vec<(u64, [u8; 32])>> {
+        let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_unix();
-        self.tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .filter(|(minted, _)| now.saturating_sub(*minted) < PAIR_TOKEN_TTL_SECS)
-            .count()
+        tokens.retain(|(minted, _)| now.saturating_sub(*minted) < PAIR_TOKEN_TTL_SECS);
+        tokens
+    }
+
+    /// How many tokens are still usable. Test-only: nothing in the product
+    /// asks, and a live count is exactly the pairing fact worth not logging.
+    #[cfg(test)]
+    fn live_tokens(&self) -> usize {
+        self.sweep().len()
     }
 
     /// Park a pairing at the fingerprint step.
@@ -756,5 +795,46 @@ mod tests {
     #[test]
     fn pair_link_has_the_documented_shape() {
         assert_eq!(build_pair_link("TICKET"), "vlerv://pair?ticket=TICKET");
+    }
+
+    #[test]
+    fn mint_invite_hands_out_a_token_that_is_actually_live() {
+        let pairing = Pairing::new();
+        let invite = mint_invite(EndpointAddr::from(id(7)), &pairing, "Mac Studio");
+
+        assert_eq!(invite.node_id, id(7).to_string());
+        assert_eq!(invite.device, "Mac Studio");
+        assert_eq!(invite.link, build_pair_link(&invite.ticket));
+        assert!(invite.expires_at > now_unix(), "the link must not be born dead");
+
+        // The described ticket IS the minted one: decoding the link's ticket
+        // yields a token this `Pairing` accepts, exactly once.
+        let decoded: PairTicket = invite.ticket.parse().expect("own ticket re-parses");
+        assert_eq!(decoded.device, "Mac Studio");
+        assert_eq!(pairing.live_tokens(), 1);
+        assert!(pairing.consume(&decoded.token));
+        assert!(!pairing.consume(&decoded.token));
+    }
+
+    // ── Optional-scope parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn an_omitted_scope_is_the_default_and_a_typo_is_still_refused() {
+        assert_eq!(Scope::parse_or_default(None).unwrap(), DEFAULT_SCOPE);
+        assert_eq!(Scope::parse_or_default(Some("control")).unwrap(), Scope::Control);
+        assert!(Scope::parse_or_default(Some("admin")).is_err());
+        assert!(Scope::parse_or_default(Some("")).is_err());
+    }
+
+    // ── Short ids ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_id_matches_iroh_fmt_short_and_never_panics() {
+        let node = id(3);
+        assert_eq!(short_id(&node.to_string()), node.fmt_short().to_string());
+        assert_eq!(short_id(&node.to_string()).len(), 10);
+        // A truncated entry read off disk must not slice past its end.
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
     }
 }

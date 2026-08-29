@@ -14,13 +14,9 @@ pub struct PlatformInfo {
 
 /// The OS this binary was built for. `std::env::consts::OS` already reports
 /// `"macos"` / `"ios"`, so there is no table to keep in sync.
-pub fn info() -> PlatformInfo {
-    PlatformInfo { os: std::env::consts::OS }
-}
-
 #[tauri::command]
 pub fn platform_info() -> PlatformInfo {
-    info()
+    PlatformInfo { os: std::env::consts::OS }
 }
 
 #[cfg(test)]
@@ -32,19 +28,19 @@ mod tests {
         // The two platforms PRODUCT.md commits to. The assertion is the
         // contract the frontend switches on.
         assert!(
-            matches!(info().os, "macos" | "ios"),
+            matches!(platform_info().os, "macos" | "ios"),
             "unexpected target os: {}",
-            info().os
+            platform_info().os
         );
         #[cfg(target_os = "macos")]
-        assert_eq!(info().os, "macos");
+        assert_eq!(platform_info().os, "macos");
         #[cfg(target_os = "ios")]
-        assert_eq!(info().os, "ios");
+        assert_eq!(platform_info().os, "ios");
     }
 
     #[test]
     fn serializes_as_a_bare_os_field() {
-        let json = serde_json::to_value(info()).expect("serialize");
-        assert_eq!(json, serde_json::json!({ "os": info().os }));
+        let json = serde_json::to_value(platform_info()).expect("serialize");
+        assert_eq!(json, serde_json::json!({ "os": platform_info().os }));
     }
 }

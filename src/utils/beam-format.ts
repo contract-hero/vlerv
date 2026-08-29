@@ -3,6 +3,12 @@
 // receive dialog gets a pre-computed `warn` flag instead of mirroring the
 // threshold here.
 
+/** Unix seconds — the unit every expiry and `created_at` on the wire uses.
+ * Shared so the dialog and the remote provider cannot drift on it. */
+export function nowSecs(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
 /** "482 KB", "1.2 MB" — coarse on purpose, one decimal only when it matters. */
 export function humanBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return "?";

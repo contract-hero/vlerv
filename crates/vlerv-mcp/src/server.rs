@@ -21,6 +21,11 @@ use rmcp::model::{
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Serialize;
 
+// One byte formatter for the whole subsystem: the size beside a link here and
+// the size in the crate's own "file is X — beam v1 caps at Y" refusal must
+// read the same, and a second formatter is how they stop matching.
+use vlerv_remote::beam::human_bytes;
+
 use crate::args::{
     BeamArtifactArgs, ConfirmPairingArgs, ListDevicesArgs, SendToDeviceArgs, StopBeamArgs,
 };
@@ -56,20 +61,16 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<BeamArtifactArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.core.beam_artifact(&args.path, args.ttl_hours).await {
-            Ok(link) => ok(
-                format!(
-                    "{} ({}) is now beamable. Give the user this link:\n{}\nIt expires in {}, and \
-                     it stops working when this MCP server exits.",
-                    link.name,
-                    human_bytes(link.size),
-                    link.link,
-                    human_hours(link.expires_at)
-                ),
-                &link,
-            ),
-            Err(e) => tool_failure(e),
-        }
+        render(self.core.beam_artifact(&args.path, args.ttl_hours).await, |link| {
+            format!(
+                "{} ({}) is now beamable. Give the user this link:\n{}\nIt expires in {}, and it \
+                 stops working when this MCP server exits.",
+                link.name,
+                human_bytes(link.size),
+                link.link,
+                human_hours(link.expires_at)
+            )
+        })
     }
 
     #[tool(
@@ -86,25 +87,18 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<StopBeamArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.core.stop_beam(args.hash.as_deref()).await {
-            Ok(stopped) if stopped.is_empty() => ok(
-                "No beam link was live, so nothing had to be revoked.".to_string(),
-                &stopped,
-            ),
-            Ok(stopped) => {
-                let names: Vec<&str> = stopped.iter().map(|o| o.name.as_str()).collect();
-                ok(
-                    format!(
-                        "Revoked {} beam link(s): {}. Any further fetch is refused, even from \
-                         somebody who still holds the link.",
-                        stopped.len(),
-                        names.join(", ")
-                    ),
-                    &stopped,
-                )
+        render(self.core.stop_beam(args.hash.as_deref()).await, |stopped| {
+            if stopped.is_empty() {
+                return "No beam link was live, so nothing had to be revoked.".to_string();
             }
-            Err(e) => tool_failure(e),
-        }
+            let names: Vec<&str> = stopped.iter().map(|o| o.name.as_str()).collect();
+            format!(
+                "Revoked {} beam link(s): {}. Any further fetch is refused, even from somebody \
+                 who still holds the link.",
+                stopped.len(),
+                names.join(", ")
+            )
+        })
     }
 
     #[tool(
@@ -151,19 +145,15 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<SendToDeviceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.core.send_to_device(&args.path, &args.device).await {
-            Ok(delivery) => ok(
-                format!(
-                    "Delivered {} ({}) to {}. It landed there as \"{}\" and opened on that device.",
-                    args.path,
-                    human_bytes(delivery.size),
-                    delivery.device,
-                    delivery.name
-                ),
-                &delivery,
-            ),
-            Err(e) => tool_failure(e),
-        }
+        render(self.core.send_to_device(&args.path, &args.device).await, |delivery| {
+            format!(
+                "Delivered {} ({}) to {}. It landed there as \"{}\" and opened on that device.",
+                args.path,
+                human_bytes(delivery.size),
+                delivery.device,
+                delivery.name
+            )
+        })
     }
 
     #[tool(
@@ -176,19 +166,15 @@ impl VlervMcp {
                        pair_status."
     )]
     async fn pair_device(&self) -> Result<CallToolResult, ErrorData> {
-        match self.core.pair_device().await {
-            Ok(invite) => {
-                let summary = format!(
-                    "Pairing is open for 10 minutes. Ask the user to open this link on the device \
-                     they want to pair:\n{}\n\n{}\n\nNext: {}",
-                    invite.link,
-                    invite.instructions.join("\n"),
-                    invite.fingerprint_hint
-                );
-                ok(summary, &invite)
-            }
-            Err(e) => tool_failure(e),
-        }
+        render(self.core.pair_device().await, |invite| {
+            format!(
+                "Pairing is open for 10 minutes. Ask the user to open this link on the device \
+                 they want to pair:\n{}\n\n{}\n\nNext: {}",
+                invite.link,
+                invite.instructions.join("\n"),
+                invite.fingerprint_hint
+            )
+        })
     }
 
     #[tool(
@@ -241,9 +227,15 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<ConfirmPairingArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.core.confirm_pairing(args.accept, args.node_id.as_deref(), args.scope.as_deref())
-        {
-            Ok(outcome) if outcome.paired => ok(
+        render(
+            self.core.confirm_pairing(args.accept, args.node_id.as_deref(), args.scope.as_deref()),
+            |outcome| {
+                if !outcome.paired {
+                    return format!(
+                        "Pairing with {} was rejected and nothing was written to disk.",
+                        outcome.device
+                    );
+                }
                 format!(
                     "Paired with {}. It may do \"{}\" on this server. For this server to push \
                      files TO it, that device must grant \"{}\" the \"control\" scope in its own \
@@ -251,18 +243,9 @@ impl VlervMcp {
                     outcome.device,
                     outcome.scope.clone().unwrap_or_default(),
                     self.core.device()
-                ),
-                &outcome,
-            ),
-            Ok(outcome) => ok(
-                format!(
-                    "Pairing with {} was rejected and nothing was written to disk.",
-                    outcome.device
-                ),
-                &outcome,
-            ),
-            Err(e) => tool_failure(e),
-        }
+                )
+            },
+        )
     }
 
     #[tool(
@@ -274,24 +257,20 @@ impl VlervMcp {
                        diagnose a failed send or to tell the user which links are still live."
     )]
     async fn server_status(&self) -> Result<CallToolResult, ErrorData> {
-        match self.core.server_status().await {
-            Ok(status) => {
-                let summary = format!(
-                    "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
-                     {}\nactive beam links: {}\nreceived this session: {}",
-                    status.device,
-                    status.node_id_short,
-                    status.identity_dir.display(),
-                    status.booted,
-                    status.uptime_secs,
-                    status.paired_devices,
-                    status.active_offers.len(),
-                    status.received_artifacts.len()
-                );
-                ok(summary, &status)
-            }
-            Err(e) => tool_failure(e),
-        }
+        render(self.core.server_status().await, |status| {
+            format!(
+                "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
+                 {}\nactive beam links: {}\nreceived this session: {}",
+                status.device,
+                status.node_id_short,
+                status.identity_dir.display(),
+                status.booted,
+                status.uptime_secs,
+                status.paired_devices,
+                status.active_offers.len(),
+                status.received_artifacts.len()
+            )
+        })
     }
 }
 
@@ -321,6 +300,25 @@ impl ServerHandler for VlervMcp {
     }
 }
 
+/// The failure convention this module documents, in one place: a core result
+/// becomes either a sentence plus the same facts as structured JSON, or a
+/// TOOL-level failure carrying the core's own message. Every handler that
+/// calls a fallible core method goes through here, so a new tool cannot decide
+/// to raise a protocol error for a device that is merely offline.
+///
+/// `summary` runs only on success, and only once — the model's sentence is
+/// derived from the value that is about to be returned, never from a second
+/// call to the core.
+fn render<T: Serialize>(
+    result: Result<T, String>,
+    summary: impl FnOnce(&T) -> String,
+) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(value) => ok(summary(&value), &value),
+        Err(message) => tool_failure(message),
+    }
+}
+
 /// A successful result: a sentence the model reads, plus the same facts as
 /// structured JSON for a client that renders it.
 fn ok<T: Serialize>(summary: impl Into<String>, value: &T) -> Result<CallToolResult, ErrorData> {
@@ -335,20 +333,6 @@ fn ok<T: Serialize>(summary: impl Into<String>, value: &T) -> Result<CallToolRes
 /// a protocol error would be rendered opaquely instead of reaching the model.
 fn tool_failure(message: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b < KB {
-        format!("{bytes} B")
-    } else if b < KB * KB {
-        format!("{:.1} KB", b / KB)
-    } else if b < KB * KB * KB {
-        format!("{:.1} MB", b / (KB * KB))
-    } else {
-        format!("{:.1} GB", b / (KB * KB * KB))
-    }
 }
 
 /// "in 24 hours" style copy from an absolute expiry, so the model does not
@@ -487,9 +471,11 @@ mod tests {
 
     #[test]
     fn sizes_and_expiries_are_rendered_for_a_person() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.0 KB");
-        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+        // The crate's formatter: KiB/MiB, the same units its own size
+        // refusals use.
+        assert_eq!(human_bytes(512), "1 KiB");
+        assert_eq!(human_bytes(2048), "2 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5 MiB");
         let now = vlerv_remote::peers::now_unix();
         assert_eq!(human_hours(now + 24 * 3600), "24 hours");
         assert_eq!(human_hours(now + 90 * 60), "1 hour");

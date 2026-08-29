@@ -4,11 +4,11 @@
 // provider only sequences IPC commands and `vlerv://remote-*` events.
 //
 // Mounted INSIDE both TabsProvider and WatcherProvider (see App.tsx): it
-// reads the tabs reducer to publish the open-tab list on every commit, and
-// it writes into the watcher bus to turn a wire FileChanged/FileRemoved into
-// the same shape a local filesystem event has, so the tab-reload / scroll-
-// restore machinery downstream never has to know a file lives on another
-// Mac (Fig. 3 of the design).
+// reads the tabs reducer to publish the open-tab list whenever that list
+// changes, and it writes into the watcher bus to turn a wire FileChanged /
+// FileRemoved into the same shape a local filesystem event has, so the
+// tab-reload / scroll-restore machinery downstream never has to know a file
+// lives on another Mac (Fig. 3 of the design).
 import * as React from "react";
 import type {
   IpcSurface,
@@ -21,6 +21,7 @@ import type {
   RemoteTabEntry,
 } from "../ipc";
 import { useTauriEvent } from "../hooks/useTauriEvent";
+import { nowSecs } from "../utils/beam-format";
 import { formatRemoteAddress } from "../utils/remote-address";
 import { applyRemoteTabEvent, toPublishableTabs } from "./remote-tabs";
 import { useWatcherBus } from "./watcher-bus";
@@ -91,10 +92,6 @@ export function useRemoteActions(): RemoteActionsValue {
   return ctx;
 }
 
-function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
 export function RemoteProvider({
   ipc,
   children,
@@ -115,21 +112,18 @@ export function RemoteProvider({
   const [pairingBusy, setPairingBusy] = React.useState(false);
   const [pairingError, setPairingError] = React.useState<string | null>(null);
 
-  const pendingRef = React.useRef(pendingConfirm);
-  pendingRef.current = pendingConfirm;
-
   // ── Peers ──────────────────────────────────────────────────────────────
+  // Every LATER refresh: a `peers-updated` event, a confirmed pairing, an
+  // unpair that failed and has to be rolled back.
   const refreshPeers = React.useCallback(() => {
     ipc.remoteListPeers?.().then(setPeers).catch((e: unknown) => {
       console.error("vlerv: failed to list peers", e);
     });
   }, [ipc]);
 
-  React.useEffect(() => {
-    refreshPeers();
-  }, [refreshPeers]);
-
-  // Launch-time reconnect (design §4's lazy-boot rule, mirrored client-side):
+  // Mount: ONE peer fetch feeds both the list and the launch-time reconnect.
+  //
+  // The reconnect follows design §4's lazy-boot rule, mirrored client-side:
   // ONLY when `preferences.remote_listen` is on do we proactively dial every
   // paired peer to learn who's online — otherwise a paired-but-unvisited
   // peer would never boot the endpoint on its own, and the drawer for it
@@ -137,20 +131,29 @@ export function RemoteProvider({
   // Settings (or opening anything that calls `subscribePeer`) is the action
   // that boots it, same as any other remote command.
   React.useEffect(() => {
-    if (!ipc.getState || !ipc.remoteListPeers) return;
+    if (!ipc.remoteListPeers) return;
     let cancelled = false;
-    Promise.all([ipc.getState(), ipc.remoteListPeers()])
-      .then(([settings, list]) => {
-        if (cancelled || !settings?.preferences?.remote_listen) return;
+    Promise.all([
+      ipc.remoteListPeers(),
+      // A settings read that fails costs us the reconnect, never the peer
+      // list — the preference only decides whether we dial.
+      ipc.getState?.().catch(() => undefined),
+    ])
+      .then(([list, settings]) => {
+        if (cancelled) return;
+        setPeers(list);
+        if (!settings?.preferences?.remote_listen) return;
         list.forEach((p) => subscribePeer(p.node_id));
       })
-      .catch(() => {});
+      .catch((e: unknown) => {
+        console.error("vlerv: failed to list peers", e);
+      });
     return () => {
       cancelled = true;
     };
-    // Mount-only: this is a one-time launch reconnect, not a live setting
-    // toggle — flipping the preference mid-session doesn't retroactively
-    // dial peers it missed.
+    // Mount-only: the reconnect is one-time, not a live setting toggle —
+    // flipping the preference mid-session doesn't retroactively dial peers
+    // it missed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ipc]);
 
@@ -277,15 +280,14 @@ export function RemoteProvider({
 
   const confirmPairing = React.useCallback(
     (accept: boolean, scope?: RemoteScope) => {
-      const pending = pendingRef.current;
-      if (!pending) return;
+      if (!pendingConfirm) return;
       setPendingConfirm(null);
-      const call = ipc.remotePairConfirm?.(pending.node_id, accept, scope);
+      const call = ipc.remotePairConfirm?.(pendingConfirm.node_id, accept, scope);
       call
         ?.then(() => refreshPeers())
         .catch((e: unknown) => setPairingError(String(e)));
     },
-    [ipc, refreshPeers],
+    [ipc, pendingConfirm, refreshPeers],
   );
 
   const unpair = React.useCallback(
@@ -353,21 +355,30 @@ export function RemoteProvider({
     [ipc],
   );
 
-  // ── Host bridge: publish the open-tab list on every tabs commit ─────────
+  // ── Host bridge: publish the open-tab list when that list changes ───────
   // Remote-address tabs are excluded: they aren't real filesystem paths, and
   // the backend's own canonicalize gate would silently drop them anyway
   // (scope.rs `canonical_tabs`) — filtering here just skips the round trip.
-  const publishedKeyRef = React.useRef<string>("");
+  //
+  // Derived from the two fields that can move the list, not from the whole
+  // reducer state: a reload, a zoom step and a scroll commit each produce a
+  // new `tabsState` carrying the SAME open tabs.
+  const publishableTabs = React.useMemo(
+    () => toPublishableTabs(tabsState.tabs, tabsState.activeTabId),
+    [tabsState.tabs, tabsState.activeTabId],
+  );
+  const publishKey = React.useMemo(() => JSON.stringify(publishableTabs), [publishableTabs]);
+
   React.useEffect(() => {
     if (!ipc.remotePublishTabs) return;
-    const tabs = toPublishableTabs(tabsState.tabs, tabsState.activeTabId);
-    const key = JSON.stringify(tabs);
-    if (key === publishedKeyRef.current) return;
-    publishedKeyRef.current = key;
-    void ipc.remotePublishTabs(tabs).catch((e: unknown) => {
+    void ipc.remotePublishTabs(publishableTabs).catch((e: unknown) => {
       console.error("vlerv: failed to publish tabs", e);
     });
-  }, [ipc, tabsState]);
+    // Keyed on the serialized payload, not the array: the array is rebuilt
+    // whenever the tabs array identity changes, and an unchanged key means a
+    // byte-identical payload the host already has.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ipc, publishKey]);
 
   const stateValue = React.useMemo(
     (): RemoteStateValue => ({

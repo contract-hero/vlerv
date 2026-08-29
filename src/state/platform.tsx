@@ -26,6 +26,19 @@ export function parsePlatformOs(raw: unknown): PlatformOs {
   return DEFAULT_PLATFORM_OS;
 }
 
+/** The synchronous first guess, for the render that happens BEFORE the async
+ * `platform_info` probe answers. The user agent is the only platform signal
+ * available at that moment, and on this app it is decisive: the iOS bundle is
+ * the only one a WKWebView reporting an iPhone/iPad/iPod UA ever loads. The
+ * probe stays the source of truth and corrects a wrong guess a tick later, so
+ * the cost of being wrong is one re-render — not a desktop tree flashing on a
+ * phone. This is the ONLY UA sniff in the frontend; `useTheme` calls it too
+ * rather than growing a second copy. */
+export function guessPlatformOs(): PlatformOs {
+  const ua = globalThis.navigator?.userAgent ?? "";
+  return /iPhone|iPad|iPod/.test(ua) ? "ios" : DEFAULT_PLATFORM_OS;
+}
+
 /** Resolve the platform once, swallowing every failure mode: the command
  * doesn't exist on this build (`ipc.platformInfo` absent), it rejects, or it
  * resolves to something unexpected. */
@@ -49,18 +62,12 @@ export interface PlatformContextValue {
   os: PlatformOs;
   isIos: boolean;
   isMacos: boolean;
-  /** True until the first `platform_info` resolution lands. Callers that
-   * must not flash macOS-only chrome before the real answer arrives (there
-   * are none yet — iOS launches straight into its own bundle) can gate on
-   * this; everyone else can ignore it and take the safe `macos` default. */
-  loading: boolean;
 }
 
 const PlatformContext = React.createContext<PlatformContextValue>({
   os: DEFAULT_PLATFORM_OS,
   isIos: false,
   isMacos: true,
-  loading: false,
 });
 
 export function usePlatform(): PlatformContextValue {
@@ -74,16 +81,14 @@ export function PlatformProvider({
   ipc: IpcSurface;
   children: React.ReactNode;
 }): React.ReactElement {
-  const [os, setOs] = React.useState<PlatformOs>(DEFAULT_PLATFORM_OS);
-  const [loading, setLoading] = React.useState(true);
+  // The UA guess covers the first paint; the probe below is authoritative.
+  // Without it every consumer renders the macOS tree once on the phone.
+  const [os, setOs] = React.useState<PlatformOs>(guessPlatformOs);
 
   React.useEffect(() => {
     let cancelled = false;
     resolvePlatformOs(ipc).then((resolved) => {
-      if (!cancelled) {
-        setOs(resolved);
-        setLoading(false);
-      }
+      if (!cancelled) setOs(resolved);
     });
     return () => {
       cancelled = true;
@@ -101,8 +106,8 @@ export function PlatformProvider({
   }, [os]);
 
   const value = React.useMemo(
-    (): PlatformContextValue => ({ os, isIos: os === "ios", isMacos: os === "macos", loading }),
-    [os, loading],
+    (): PlatformContextValue => ({ os, isIos: os === "ios", isMacos: os === "macos" }),
+    [os],
   );
 
   return <PlatformContext.Provider value={value}>{children}</PlatformContext.Provider>;

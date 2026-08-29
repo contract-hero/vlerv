@@ -3,6 +3,7 @@
 // `<html data-theme="dark|light">` as a single source of truth so CSS rules
 // and consumers (Shiki, HTML iframe injection) can both read it.
 import * as React from "react";
+import { guessPlatformOs } from "../state/platform";
 
 export type Theme = "dark" | "light";
 
@@ -46,12 +47,13 @@ export function useTheme(): Theme {
     // Try Tauri first — on macOS only. Tauri's window.theme() is a desktop
     // API; on iOS it reports "light" regardless of the trait collection,
     // which would override the webview's own (correct) media query. The
-    // matchMedia subscription below is the whole mechanism on iOS. UA
-    // sniffing, not the platform-ios body class: that class arrives async
-    // from platform_info and would race this probe.
+    // matchMedia subscription below is the whole mechanism on iOS.
+    // `guessPlatformOs` — the synchronous UA read — not `usePlatform`: the
+    // context's authoritative value arrives async from platform_info and
+    // would race this probe.
     (async () => {
       try {
-        if (/iPhone|iPad|iPod/.test(navigator.userAgent)) return;
+        if (guessPlatformOs() === "ios") return;
         const mod = await import("@tauri-apps/api/window");
         const win = mod.getCurrentWindow();
         const current = await win.theme();

@@ -60,6 +60,10 @@ export function parseCombo(combo: string): ParsedCombo {
   return parsed;
 }
 
+// Deliberately NOT `guessPlatformOs()` from state/platform: this asks a
+// different question. It is true for BOTH macOS and iOS — every Apple
+// keyboard puts the primary modifier on ⌘ (metaKey) — where that helper
+// tells the two apart. One boolean about the modifier layout, not the shell.
 const IS_MAC =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform ?? "");
 

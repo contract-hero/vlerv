@@ -17,6 +17,13 @@ path = "src/main.rs"
 # path gate of its own — it is a second host for the same core the desktop app
 # hosts, which is why `EventSink` / `HostCatalog` / `Dirs` exist.
 vlerv-remote = { path = "../vlerv-remote" }
+# Same version the desktop app uses, so both halves resolve
+# `~/Library/Application Support` through one implementation.
+dirs = "5"
+# Only for `join_all`: `list_devices { probe: true }` dials every paired device
+# at once, so the call bounds at about one PROBE_TIMEOUT rather than one per
+# device.
+futures-util = "0.3"
 # Exact-pinned like the iroh stack next door: the MCP tool macros expand into
 # rmcp's own router types, so a minor bump can change the generated schema.
 rmcp = { version = "=3.1.4", features = ["server", "macros", "schemars", "transport-io"] }

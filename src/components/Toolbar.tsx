@@ -338,8 +338,12 @@ export default function Toolbar({
               jobs; the rule between them is the grouping cue. */}
           <span className="toolbar-sep" aria-hidden />
           <CopyPathButton path={entry.path} />
-          {isMacos ? <ShareButton path={entry.path} /> : null}
-          {isMacos ? <BeamButton path={entry.path} /> : null}
+          {isMacos ? (
+            <>
+              <ShareButton path={entry.path} />
+              <BeamButton path={entry.path} />
+            </>
+          ) : null}
           {slackUrl ? <OpenInSlackButton url={slackUrl} /> : null}
         </>
       ) : null}

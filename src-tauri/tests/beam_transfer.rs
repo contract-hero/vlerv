@@ -13,7 +13,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use iroh::{EndpointAddr, TransportAddr};
 use iroh_blobs::ticket::BlobTicket;
 use src_tauri::remote::{beam, endpoint, Dirs};
 use src_tauri::security::RootSet;
@@ -27,9 +26,9 @@ fn loopback_ticket(ticket: &str) -> String {
         .find(|a| a.is_ipv4())
         .expect("offer ticket carries an IPv4 direct addr")
         .port();
-    let addr = EndpointAddr::from_parts(
+    let addr = endpoint::addr_at_id(
         ticket.addr().id,
-        [TransportAddr::Ip((std::net::Ipv4Addr::LOCALHOST, port).into())],
+        (std::net::Ipv4Addr::LOCALHOST, port).into(),
     );
     BlobTicket::new(addr, ticket.hash(), ticket.format()).to_string()
 }

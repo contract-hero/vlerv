@@ -12,26 +12,44 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bao_tree::io::BaoContentItem;
+use iroh_blobs::api::Tag;
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::provider::events::{
     AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode,
 };
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, Hash};
 use n0_future::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-use crate::endpoint::RemoteNode;
+use crate::endpoint::{self, RemoteNode};
+use crate::paths::{base_name, mtime_secs};
+use crate::peers::now_unix;
+use crate::proto;
 use crate::security::{self, RootSet};
 
 /// Soft warn threshold (receive-dialog copy) and hard cap, per design §5.
 pub const WARN_BYTES: u64 = 20 * 1024 * 1024;
 pub const HARD_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Offer lifetime, and the range any caller-supplied lifetime is clamped into.
+/// The bounds are the policy, not a validation detail: a `0` from a stale
+/// state.json must not mint a dead ticket, and a `u32::MAX` from an MCP client
+/// must not mint a ~490,000-year fetch grant. Consumers that validate a
+/// ttl_hours argument reject against the SAME two numbers.
 pub const DEFAULT_TTL_HOURS: u32 = 24;
+pub const MIN_TTL_HOURS: u32 = 1;
+pub const MAX_TTL_HOURS: u32 = 24 * 30;
+
+/// Longest beam name kept from a link's name hint, in chars. Same bounding
+/// idea as `proto::MAX_DEVICE_CHARS`, on a string that also becomes a filename.
+const MAX_NAME_CHARS: usize = 128;
 
 /// Emit a progress event roughly once per this many received bytes — leaves
 /// arrive every 16 KiB and per-leaf events would flood the webview bridge.
@@ -101,7 +119,7 @@ pub struct TicketInfo {
 
 struct OfferEntry {
     info: OfferInfo,
-    tag: iroh_blobs::api::Tag,
+    tag: Tag,
 }
 
 /// The offers registry. The request gate reads it per incoming request;
@@ -121,7 +139,7 @@ impl Offers {
     /// (same hash, re-beamed) so the caller can delete it — the displaced tag
     /// is a fresh `add_path` tag that would otherwise pin the blob forever,
     /// unreachable by `stop`/`take_expired`.
-    fn insert(&self, hash: Hash, entry: OfferEntry) -> Option<iroh_blobs::api::Tag> {
+    fn insert(&self, hash: Hash, entry: OfferEntry) -> Option<Tag> {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -129,7 +147,7 @@ impl Offers {
             .map(|old| old.tag)
     }
 
-    fn remove(&self, id: &str) -> Option<iroh_blobs::api::Tag> {
+    fn remove(&self, id: &str) -> Option<Tag> {
         // An offer id IS the blob hash in hex (see `offer`), so the key is
         // derivable — no scan. The length guard keeps the parse on the hex
         // path: `Hash::from_str` treats other lengths as base32 and can
@@ -143,7 +161,7 @@ impl Offers {
     }
 
     /// Drop every expired offer, returning their store tags for cleanup.
-    fn take_expired(&self, now: u64) -> Vec<iroh_blobs::api::Tag> {
+    fn take_expired(&self, now: u64) -> Vec<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let expired: Vec<Hash> = map
             .iter()
@@ -267,10 +285,6 @@ impl Offers {
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 /// v1 ticket policy in one place: parse + single-raw-blob check. Shared by
 /// `ticket_info` (dispatch-time validation) and `receive`.
 fn parse_raw_ticket(ticket_str: &str) -> Result<BlobTicket, String> {
@@ -360,10 +374,7 @@ pub fn resolve_offerable(path: &Path, roots: &RootSet) -> Result<OfferCandidate,
             human_bytes(HARD_CAP_BYTES)
         ));
     }
-    let name = canonical
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "artifact".to_string());
+    let name = base_name(&canonical).unwrap_or_else(|| "artifact".to_string());
     Ok(OfferCandidate { canonical, name, size })
 }
 
@@ -377,7 +388,7 @@ pub async fn offer(
 ) -> Result<OfferInfo, String> {
     // Housekeeping: drop expired offers and their tags while we have the
     // store at hand.
-    delete_tags(node, node.offers.take_expired(now_unix())).await;
+    delete_tags(&node.store, node.offers.take_expired(now_unix())).await;
 
     let tag = node
         .store
@@ -401,17 +412,15 @@ pub async fn offer(
         link: build_link(&ticket, &cand.name, cand.size),
         ticket,
         created_at,
-        // Clamp both ends: a state.json 0 must not mint a dead ticket, and a
-        // u32::MAX must not mint a ~490,000-year fetch grant.
-        expires_at: created_at + u64::from(ttl_hours.clamp(1, 24 * 30)) * 3600,
+        // Clamped both ends — see MIN_TTL_HOURS / MAX_TTL_HOURS.
+        expires_at: created_at
+            + u64::from(ttl_hours.clamp(MIN_TTL_HOURS, MAX_TTL_HOURS)) * 3600,
         fetches: 0,
     };
     if let Some(old_tag) = node.offers.insert(tag.hash, OfferEntry { info: info.clone(), tag: tag.name }) {
         // Re-beam of the same content: drop the previous staging tag so its
         // copy of the bytes becomes collectable.
-        if let Err(e) = node.store.tags().delete(old_tag.clone()).await {
-            eprintln!("vlerv: beam: could not delete superseded blob tag {old_tag:?}: {e}");
-        }
+        delete_tags(&node.store, vec![old_tag]).await;
     }
     Ok(info)
 }
@@ -420,18 +429,20 @@ pub async fn offer(
 /// tag is deleted so the staged bytes become garbage-collectable.
 pub async fn stop(node: &RemoteNode, offer_id: &str) {
     if let Some(tag) = node.offers.remove(offer_id) {
-        delete_tags(node, vec![tag]).await;
+        delete_tags(&node.store, vec![tag]).await;
     }
-    delete_tags(node, node.offers.take_expired(now_unix())).await;
+    delete_tags(&node.store, node.offers.take_expired(now_unix())).await;
 }
 
 /// Delete staging tags, logging failures rather than discarding them — a
-/// failed delete leaves a private copy of a beamed file pinned on disk after
-/// the user revoked it, and that should be diagnosable.
-async fn delete_tags(node: &RemoteNode, tags: Vec<iroh_blobs::api::Tag>) {
+/// failed delete leaves a private copy of somebody's file pinned on disk after
+/// the offer or grant that justified it is gone, and that should be
+/// diagnosable. The one tag sweeper: Beam's offers and Scope's grants both
+/// unpin bytes through it, on either side of a push.
+pub(crate) async fn delete_tags(store: &FsStore, tags: Vec<Tag>) {
     for tag in tags {
-        if let Err(e) = node.store.tags().delete(tag.clone()).await {
-            eprintln!("vlerv: beam: could not delete blob tag {tag:?}: {e}");
+        if let Err(e) = store.tags().delete(tag.clone()).await {
+            eprintln!("vlerv: remote: could not delete blob tag {tag:?}: {e}");
         }
     }
 }
@@ -481,6 +492,68 @@ pub(crate) async fn stream_blob_into(
     Ok(written)
 }
 
+/// Serial number for in-flight downloads — see `partial_name`.
+static PARTIAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp file name for one in-flight download. Unique per CALL, not per content
+/// address: two receives of the same blob (two tabs on one remote artifact, or
+/// a live-reload refetch overlapping the first read) run concurrently, and a
+/// shared `<hash><ext>.partial` would let them interleave writes into one file
+/// and make the loser's rename fail. Both still land on the same final path,
+/// which is atomic and idempotent — the bytes are identical, the hash says so.
+///
+/// The ONE partial-name convention: the Beam receive path and the Scope cache
+/// fetch both name their temp file here, so `.partial` means the same thing in
+/// `received/` and in `remote/cache/`.
+pub(crate) fn partial_name(hash_hex: &str, ext: &str) -> String {
+    format!(
+        "{hash_hex}{ext}.{}.{}.partial",
+        std::process::id(),
+        PARTIAL_SEQ.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// Stream one blob into `partial`, flush it, and hand it to `finish`, which
+/// moves it onto its final path and returns that path.
+///
+/// The point of the shape is the SINGLE cleanup: a stream error, a failed
+/// flush and a failed rename all funnel through one `remove_file`, so a
+/// half-written — or even a fully downloaded — blob is never orphaned in a
+/// `.partial` name nothing prunes. A per-arm cleanup ritual had already
+/// drifted once here.
+///
+/// `finish` runs AFTER the bytes land because the Beam receive path only knows
+/// its final name by then: the day directory comes from the current date and
+/// the collision suffix from what is free at that moment. It owns the rename
+/// so each caller keeps its own wording for a failed move.
+pub(crate) async fn download_to(
+    connection: iroh::endpoint::Connection,
+    hash: Hash,
+    hash_hex: &str,
+    partial: &Path,
+    finish: impl FnOnce(&Path) -> Result<PathBuf, String>,
+    on_progress: &mut impl FnMut(&str, u64),
+) -> Result<(u64, PathBuf), String> {
+    let result = async {
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(partial)
+                .map_err(|e| format!("cannot open the incoming file {}: {e}", partial.display()))?,
+        );
+        let written = stream_blob_into(connection, hash, &mut file, hash_hex, on_progress).await?;
+        file.into_inner()
+            .map_err(|e| format!("cannot flush the incoming file: {e}"))?
+            .sync_all()
+            .map_err(|e| format!("cannot flush the incoming file: {e}"))?;
+        Ok::<(u64, PathBuf), String>((written, finish(partial)?))
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    result
+}
+
 /// Dial a ticket and stream the blob into `received_root`, verified chunk by
 /// chunk. `on_progress(hash_hex, received)` fires about once per MiB with the
 /// real measured byte count.
@@ -511,13 +584,13 @@ pub async fn receive_via(
     // never changes during a transfer.
     let hash_hex = hash.to_string();
 
-    let connection = tokio::time::timeout(
-        Duration::from_secs(30),
-        endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
+    let connection = endpoint::dial(
+        endpoint,
+        ticket.addr().clone(),
+        iroh_blobs::ALPN,
+        "sender offline — could not reach the sender",
     )
-    .await
-    .map_err(|_| "sender offline — could not reach the sender (timed out)".to_string())?
-    .map_err(|e| format!("sender offline — could not reach the sender ({e})"))?;
+    .await?;
 
     // Stream into a partial file next to the final location (same volume ⇒
     // atomic rename). Errors carry the operation + path, matching the
@@ -526,50 +599,28 @@ pub async fn receive_via(
     let partials_dir = received_root.join(".partial");
     std::fs::create_dir_all(&partials_dir)
         .map_err(|e| format!("cannot prepare the received folder {}: {e}", partials_dir.display()))?;
-    // Unique per attempt: two concurrent receives of the same hash must not
-    // interleave writes into one partial file.
-    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let partial_path = partials_dir.join(format!("{hash_hex}.{attempt}"));
+    let partial_path = partials_dir.join(partial_name(&hash_hex, ""));
 
-    // The stream loop AND the finalize live in an inner future so every early
-    // exit — stream error or a failed rename — funnels through ONE
-    // partial-file cleanup below (a per-arm cleanup ritual had already drifted
-    // once, and the finalize used to sit past the cleanup entirely).
-    let stream_result: Result<(u64, PathBuf, String), String> = async {
-        let mut file = std::io::BufWriter::new(
-            std::fs::File::create(&partial_path)
-                .map_err(|e| format!("cannot open the incoming file {}: {e}", partial_path.display()))?,
-        );
-        let written =
-            stream_blob_into(connection, hash, &mut file, &hash_hex, &mut on_progress).await?;
-        file.into_inner()
-            .map_err(|e| format!("cannot flush the incoming file: {e}"))?
-            .sync_all()
-            .map_err(|e| format!("cannot flush the incoming file: {e}"))?;
-
-        // Finalize INSIDE the guarded block so a create_dir/rename failure
-        // funnels through the same one cleanup as any stream error — a fully
-        // downloaded blob must not be orphaned in .partial/ (list_received
-        // hides dot-dirs and nothing else prunes them).
-        let name = sanitize_beam_name(name_hint, &hash_hex);
-        let day_dir = received_root.join(civil_date_string(now_unix()));
-        std::fs::create_dir_all(&day_dir)
-            .map_err(|e| format!("cannot create {}: {e}", day_dir.display()))?;
-        let target = unique_target_path(&day_dir, &name);
-        std::fs::rename(&partial_path, &target)
-            .map_err(|e| format!("cannot move the received file into place: {e}"))?;
-        Ok((written, target, name))
-    }
-    .await;
-
-    let (written, target, name) = match stream_result {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(e);
-        }
-    };
+    // The final name is only knowable once the bytes are down: it depends on
+    // today's date and on which collision suffix is free right then.
+    let name = sanitize_beam_name(name_hint, &hash_hex);
+    let (written, target) = download_to(
+        connection,
+        hash,
+        &hash_hex,
+        &partial_path,
+        |partial| {
+            let day_dir = received_root.join(civil_date_string(now_unix()));
+            std::fs::create_dir_all(&day_dir)
+                .map_err(|e| format!("cannot create {}: {e}", day_dir.display()))?;
+            let target = unique_target_path(&day_dir, &name);
+            std::fs::rename(partial, &target)
+                .map_err(|e| format!("cannot move the received file into place: {e}"))?;
+            Ok(target)
+        },
+        &mut on_progress,
+    )
+    .await?;
     on_progress(&hash_hex, written);
 
     Ok(ReceivedFile { path: target, name, size: written, hash: hash_hex })
@@ -582,24 +633,13 @@ pub fn sanitize_beam_name(hint: Option<&str>, hash_hex: &str) -> String {
     let fallback = || format!("beam-{}", &hash_hex[..8.min(hash_hex.len())]);
     let Some(hint) = hint else { return fallback() };
 
-    // Last path segment only — either separator convention.
+    // Last path segment only — either separator convention. Everything after
+    // it is the shared strip set (the hint is both the display string in the
+    // confirm dialog and the on-disk filename, so a U+202E extension-spoof is
+    // the whole risk) plus this caller's own rule: no leading dot, because a
+    // hint must never land a hidden file.
     let base = hint.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = base
-        .chars()
-        // Cc control chars AND the Cf bidi / zero-width set: the hint is the
-        // display string in the confirm dialog and the on-disk filename, so a
-        // U+202E extension-spoof (report<RLO>gnp.html → reporthtml.png) is the
-        // whole risk.
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c,
-                    '\u{200B}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{FEFF}')
-        })
-        .take(128)
-        .collect();
+    let cleaned = proto::strip_spoofing_chars(base, MAX_NAME_CHARS);
     let trimmed = cleaned.trim().trim_start_matches('.').trim();
     if trimmed.is_empty() {
         return fallback();
@@ -648,17 +688,12 @@ pub fn list_received(received_root: &Path) -> Vec<ReceivedEntry> {
             if !meta.is_file() {
                 continue;
             }
-            let received_at = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let path = f.path();
             day_entries.push(ReceivedEntry {
-                path: f.path(),
-                name: f.file_name().to_string_lossy().into_owned(),
+                name: base_name(&path).unwrap_or_default(),
+                path,
                 size: meta.len(),
-                received_at,
+                received_at: mtime_secs(&meta),
             });
         }
         day_entries.sort_by(|a, b| b.received_at.cmp(&a.received_at));
@@ -687,7 +722,11 @@ pub fn civil_date_string(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn human_bytes(n: u64) -> String {
+/// Byte counts as this subsystem states them to a human: MiB above a
+/// megabyte, KiB rounded up below it. Public because the size in a "file is X
+/// — beam v1 caps at Y" refusal and the size a consumer shows beside a landed
+/// artifact must read the same; a second formatter is how they stop matching.
+pub fn human_bytes(n: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     if n >= MIB {
         format!("{} MiB", n / MIB)
@@ -854,7 +893,7 @@ mod tests {
                 expires_at,
                 fetches: 0,
             },
-            tag: iroh_blobs::api::Tag::from("test-tag"),
+            tag: Tag::from("test-tag"),
         }
     }
 
@@ -947,9 +986,30 @@ mod tests {
     fn ttl_clamp_bounds_both_ends() {
         // The clamp lives inline in `offer` (needs a node), but the arithmetic
         // is what matters: 0 → 1 h, huge → 30 days.
-        let clamp = |h: u32| u64::from(h.clamp(1, 24 * 30)) * 3600;
+        let clamp = |h: u32| u64::from(h.clamp(MIN_TTL_HOURS, MAX_TTL_HOURS)) * 3600;
         assert_eq!(clamp(0), 3600);
-        assert_eq!(clamp(24), 24 * 3600);
+        assert_eq!(clamp(DEFAULT_TTL_HOURS), 24 * 3600);
         assert_eq!(clamp(u32::MAX), 24 * 30 * 3600);
+        // The default must be inside the range consumers validate against.
+        assert!((MIN_TTL_HOURS..=MAX_TTL_HOURS).contains(&DEFAULT_TTL_HOURS));
+    }
+
+    // ── Partial download names ──────────────────────────────────────────────
+
+    #[test]
+    fn every_in_flight_download_gets_its_own_temp_name() {
+        let hash = "a".repeat(64);
+        let first = partial_name(&hash, ".html");
+        let second = partial_name(&hash, ".html");
+        // Two fetches of the SAME content address must not share a temp file:
+        // they would interleave writes and one rename would fail.
+        assert_ne!(first, second);
+        for name in [&first, &second] {
+            assert!(name.starts_with(&format!("{hash}.html.")), "{name} keeps hash and ext");
+            assert!(name.ends_with(".partial"), "{name} stays a partial");
+        }
+        // The Beam receive path passes no extension and still gets a partial
+        // that `list_received` never mistakes for a landed artifact.
+        assert!(partial_name(&hash, "").ends_with(".partial"));
     }
 }

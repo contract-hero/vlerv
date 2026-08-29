@@ -2,13 +2,12 @@
 // target / Remote pairing (design §6: "finally a concrete reason to mount
 // the Settings surface").
 import * as React from "react";
-import { Check, Copy } from "lucide-react";
 import { useSettings } from "../hooks/useSettings";
 import type { UseSettingsState } from "../hooks/useSettings";
 import { defaultIpc } from "../ipc";
 import type { RemoteScope } from "../ipc";
 import { useRemoteActions, useRemoteState } from "../state/remote";
-import { useCopyFeedback } from "../hooks/useCopyFeedback";
+import CopyLinkButton from "./CopyLinkButton";
 
 export interface SettingsProps {
   ipc?: typeof defaultIpc;
@@ -19,16 +18,6 @@ const SCOPE_LABEL: Record<RemoteScope, string> = {
   browse: "Browse",
   control: "Control",
 };
-
-function CopyPairLinkButton({ link }: { link: string }): React.ReactElement {
-  const { copied, copy } = useCopyFeedback();
-  return (
-    <button type="button" className="button" onClick={() => copy(link)}>
-      {copied ? <Check size={13} strokeWidth={2.5} /> : <Copy size={13} strokeWidth={2} />}
-      {copied ? "Copied" : "Copy link"}
-    </button>
-  );
-}
 
 function RemoteSettings({
   state,
@@ -73,7 +62,7 @@ function RemoteSettings({
               same six words — confirm they match there before accepting.
             </p>
             <div className="beam-actions">
-              <CopyPairLinkButton link={invite.link} />
+              <CopyLinkButton link={invite.link} />
               <button type="button" className="button button-secondary" onClick={dismissInvite}>
                 Done
               </button>

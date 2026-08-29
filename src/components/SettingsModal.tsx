@@ -6,6 +6,7 @@
 import * as React from "react";
 import { X } from "lucide-react";
 import type { IpcSurface } from "../ipc";
+import { useEscape } from "../hooks/useEscape";
 import Settings from "./Settings";
 
 export default function SettingsModal({
@@ -15,16 +16,7 @@ export default function SettingsModal({
   ipc: IpcSurface;
   onClose: () => void;
 }): React.ReactElement {
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  useEscape(onClose);
 
   return (
     <div

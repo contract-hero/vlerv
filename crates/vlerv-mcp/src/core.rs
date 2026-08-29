@@ -24,25 +24,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use serde::Serialize;
 use vlerv_remote::host::{EmptyCatalog, EventSink, HostSignal};
-use vlerv_remote::peers::{self, Pairing, Peer, PeerStore, PendingPair, Scope};
+use vlerv_remote::peers::{self, short_id, Pairing, Peer, PeerStore, PendingPair, Scope};
 use vlerv_remote::scope::{ClientSession, ScopeState, TabsCache};
 use vlerv_remote::security::{self, RootSet};
 use vlerv_remote::{beam, endpoint, Dirs};
 
 use crate::args;
-use crate::devices::{self, label, short_id};
+use crate::devices::{self, label};
 
 /// How long `list_devices { probe: true }` waits on one device before calling
 /// it offline. Short on purpose: presence is a hint, not a fact, and a caller
 /// with six paired devices must not wait a minute for a list.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// Shortest node-id prefix `confirm_pairing` accepts. Pairing is the step that
-/// writes trust to disk, so the argument that picks WHICH pairing must name
-/// one — four hex characters is the same floor `devices::resolve_device` uses.
-const MIN_PAIR_ID_CHARS: usize = 4;
 
 /// Shortest content-hash prefix `stop_beam` accepts for ONE link. Revoking
 /// the wrong link is recoverable (mint another); revoking by a one-character
@@ -299,6 +295,10 @@ impl McpCore {
         &self.device
     }
 
+    /// Test seam: the integration test writes both peer stores by hand, the
+    /// way `confirm_pairing` writes them, so a two-endpoint proof does not
+    /// have to drive a human fingerprint comparison. No tool reads this.
+    #[doc(hidden)]
     pub fn peer_store(&self) -> &Arc<PeerStore> {
         &self.peers
     }
@@ -340,7 +340,9 @@ impl McpCore {
         self.node.lock().await.clone()
     }
 
-    /// Resolve a caller-supplied path AND confine it to this server's roots.
+    /// Resolve a caller-supplied path, confine it to this server's roots, and
+    /// hand back the candidate the send path stages — the WHOLE gate, run
+    /// once per tool call.
     ///
     /// The desktop share sheet may send a file that lies outside every root,
     /// because a human picked that file in a dialog. Here the caller is a
@@ -350,15 +352,17 @@ impl McpCore {
     /// `canonicalize_and_check_root`, the same check every remote read
     /// passes: `VLERV_MCP_ROOTS` (or the working directory) is a real
     /// boundary, not a hint, and a link minted here can only ever address a
-    /// file the operator put inside it.
+    /// file the operator put inside it. `beam::resolve_offerable` then applies
+    /// the share sheet's own policy — regular files only, under the hard cap.
     ///
     /// One refusal string for "does not exist", "outside the roots" and "no
     /// roots configured" — the share module's no-existence-leak convention,
     /// unchanged.
-    fn gate_arg_path(&self, raw: &str) -> Result<PathBuf, String> {
+    fn gate_arg_path(&self, raw: &str) -> Result<beam::OfferCandidate, String> {
         let path = args::resolve_arg_path(raw, &self.cwd, self.home.as_deref())?;
-        security::canonicalize_and_check_root(&path, &self.roots)
-            .map_err(|_| "path not found or out of root".to_string())
+        let confined = security::canonicalize_and_check_root(&path, &self.roots)
+            .map_err(|_| "path not found or out of root".to_string())?;
+        beam::resolve_offerable(&confined, &self.roots)
     }
 
     // ── beam_artifact ──────────────────────────────────────────────────────
@@ -370,11 +374,10 @@ impl McpCore {
         raw_path: &str,
         ttl_hours: Option<u32>,
     ) -> Result<BeamLink, String> {
-        let path = self.gate_arg_path(raw_path)?;
         let ttl = args::validate_ttl(ttl_hours)?;
         // Policy first, sockets second: a file that cannot be sent must not
         // boot the network stack to find that out.
-        let cand = beam::resolve_offerable(&path, &self.roots)?;
+        let cand = self.gate_arg_path(raw_path)?;
         let node = self.node().await?;
         let info = beam::offer(&node, &cand, ttl).await?;
         Ok(BeamLink {
@@ -404,17 +407,20 @@ impl McpCore {
             None => live,
             Some(raw) => {
                 let raw = raw.trim();
-                if raw.len() < MIN_HASH_CHARS {
-                    return Err(format!(
+                // The same prefix pass a device or a pairing argument takes,
+                // with this argument's own floor. Unlike those two, every
+                // match is revoked: revoking one link too many is recoverable.
+                let needle = devices::needle(raw, MIN_HASH_CHARS).ok_or_else(|| {
+                    format!(
                         "hash must be at least {MIN_HASH_CHARS} characters — server_status \
                          reports the hash of every live link"
-                    ));
-                }
-                let needle = raw.to_lowercase();
-                let matched: Vec<beam::OfferInfo> = live
-                    .into_iter()
-                    .filter(|o| o.id.to_lowercase().starts_with(&needle))
-                    .collect();
+                    )
+                })?;
+                let matched: Vec<beam::OfferInfo> =
+                    devices::by_prefix(&live, &needle, |o| o.id.as_str())
+                        .into_iter()
+                        .cloned()
+                        .collect();
                 if matched.is_empty() {
                     return Err(format!("no live beam link matches {raw:?}"));
                 }
@@ -436,10 +442,16 @@ impl McpCore {
     /// this process already holds.
     pub async fn list_devices(&self, probe: bool) -> Vec<DeviceInfo> {
         let peers = self.peers.list();
-        let mut out = Vec::with_capacity(peers.len());
-        for peer in peers {
-            let presence = self.presence(&peer, probe).await;
-            out.push(DeviceInfo {
+        // The probes run TOGETHER. Dialed one after another, a fleet where
+        // three devices are asleep costs three PROBE_TIMEOUTs before the list
+        // comes back; concurrently the whole call bounds at about one, however
+        // many devices are paired.
+        let presence =
+            join_all(peers.iter().map(|peer| self.presence(peer, probe))).await;
+        peers
+            .into_iter()
+            .zip(presence)
+            .map(|(peer, presence)| DeviceInfo {
                 node_id_short: short_id(&peer.node_id),
                 device: peer.device,
                 node_id: peer.node_id,
@@ -447,9 +459,8 @@ impl McpCore {
                 paired_at: peer.paired_at,
                 last_seen: peer.last_seen,
                 presence,
-            });
-        }
-        out
+            })
+            .collect()
     }
 
     async fn presence(&self, peer: &Peer, probe: bool) -> &'static str {
@@ -472,11 +483,10 @@ impl McpCore {
     /// Resolve `device` to one paired peer and push `raw_path` to it.
     pub async fn send_to_device(&self, raw_path: &str, device: &str) -> Result<Delivery, String> {
         let query = args::validate_device_query(device)?;
-        let path = self.gate_arg_path(raw_path)?;
+        // Same order as `beam_artifact`: one gate pass, and an unsendable file
+        // is refused before any socket opens.
+        let cand = self.gate_arg_path(raw_path)?;
         let peer = devices::resolve_device(&self.peers.list(), query).map_err(|e| e.to_string())?;
-        // Same order as `beam_artifact`: refuse an unsendable file before any
-        // socket opens.
-        beam::resolve_offerable(&path, &self.roots)?;
 
         // The scope in the handshake is what the DEVICE granted this server.
         // Checking it here turns the host's one deliberately vague refusal
@@ -501,9 +511,11 @@ impl McpCore {
             ));
         }
 
+        // The canonical path the gate resolved, not the caller's string: the
+        // push re-applies the same policy, and it must see the same file.
         let pushed = match self.own_loopback().await {
-            Some(own) => session.push_artifact_at(&path, &self.roots, own).await?,
-            None => session.push_artifact(&path, &self.roots).await?,
+            Some(own) => session.push_artifact_at(&cand.canonical, &self.roots, own).await?,
+            None => session.push_artifact(&cand.canonical, &self.roots).await?,
         };
         Ok(Delivery {
             device: peer.device,
@@ -566,18 +578,16 @@ impl McpCore {
         // the same-network case. Same policy the app's pairing uses.
         let _ = tokio::time::timeout(Duration::from_secs(10), node.endpoint.online()).await;
 
-        let ticket = peers::PairTicket {
-            addr: node.endpoint.addr(),
-            token: self.pairing.mint(),
-            device: self.device.clone(),
-        }
-        .to_string();
-        let node_id = node.endpoint.id().to_string();
+        // The crate mints it: one place decides the token, the ticket, the
+        // link shape and the TTL, so this server cannot hand out a link and
+        // then describe it with a different expiry or node id.
+        let invite = peers::mint_invite(node.endpoint.addr(), &self.pairing, &self.device);
+        let node_id = invite.node_id;
         Ok(PairingInvite {
-            link: peers::build_pair_link(&ticket),
-            ticket,
-            device: self.device.clone(),
-            expires_at: peers::now_unix() + peers::PAIR_TOKEN_TTL_SECS,
+            link: invite.link,
+            ticket: invite.ticket,
+            device: invite.device,
+            expires_at: invite.expires_at,
             fingerprint_hint: format!(
                 "Six words appear on BOTH screens once the device opens the link. Call \
                  pair_status to read this server's six words and compare them with the device's \
@@ -606,62 +616,12 @@ impl McpCore {
         node_id: Option<&str>,
         scope: Option<&str>,
     ) -> Result<PairingOutcome, String> {
+        // The scope is checked FIRST, so a typo is refused before a parked
+        // pairing is consumed.
         let granted = args::validate_scope(scope)?;
         let parked = self.pairing.parked();
-        let target = match node_id {
-            Some(id) => {
-                // `starts_with` on an unchecked argument used to accept an
-                // empty string and pick whichever pairing came first — the
-                // one step that writes trust to disk must never guess. A
-                // prefix has to be long enough to mean something, and two
-                // matches is an error, not a coin flip.
-                let id = id.trim();
-                if id.len() < MIN_PAIR_ID_CHARS {
-                    return Err(format!(
-                        "node_id must be at least {MIN_PAIR_ID_CHARS} characters — pass the \
-                         node id from pair_status"
-                    ));
-                }
-                let needle = id.to_lowercase();
-                let matches: Vec<&PendingPair> = parked
-                    .iter()
-                    .filter(|p| p.node_id.to_lowercase().starts_with(&needle))
-                    .collect();
-                match matches.as_slice() {
-                    [one] => one.node_id.clone(),
-                    [] => return Err(format!("no pairing is waiting for {id:?}")),
-                    many => {
-                        return Err(format!(
-                            "{id:?} matches {} waiting pairings: {}. Pass the full node id",
-                            many.len(),
-                            many.iter()
-                                .map(|p| format!("{} ({})", p.device, short_id(&p.node_id)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
-                    }
-                }
-            }
-            None => match parked.len() {
-                0 => {
-                    return Err("no pairing is waiting for confirmation — call pair_device and \
-                                open the link on the other device first"
-                        .to_string())
-                }
-                1 => parked[0].node_id.clone(),
-                _ => {
-                    return Err(format!(
-                        "{} pairings are waiting; pass node_id to say which one: {}",
-                        parked.len(),
-                        parked
-                            .iter()
-                            .map(|p| format!("{} ({})", p.device, short_id(&p.node_id)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                }
-            },
-        };
+        let target = devices::resolve_pending(&parked, node_id)?.node_id.clone();
+        drop(parked);
 
         let Some(pending) = self.pairing.take(&target) else {
             return Err("no pairing is waiting for confirmation".to_string());
@@ -728,31 +688,23 @@ pub fn device_name() -> String {
 /// Where this server keeps its identity, peer store and blobs. Its OWN
 /// subdirectory: the desktop app's `remote/` must not be shared, because the
 /// two are different peers with different keys.
+///
+/// Precedence, as README-MCP.md documents it: `VLERV_MCP_STATE_DIR` names the
+/// directory outright; otherwise `VLERV_STATE_DIR` (or the platform config
+/// directory plus `Vlerv`) names the app's base and this server takes its
+/// `mcp/` subdirectory. The platform lookup is `dirs::config_dir`, the same
+/// one `state_store::state_dir` uses on the app side, so the two agree about
+/// where `~/Library/Application Support` is without either of them spelling
+/// it out.
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("VLERV_MCP_STATE_DIR") {
         return PathBuf::from(dir);
     }
     let base = match std::env::var_os("VLERV_STATE_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => config_dir().join("Vlerv"),
+        None => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("Vlerv"),
     };
     base.join("mcp")
-}
-
-fn config_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if cfg!(target_os = "macos") {
-        if let Some(home) = home {
-            return home.join("Library").join("Application Support");
-        }
-    }
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(dir);
-    }
-    match home {
-        Some(home) => home.join(".config"),
-        None => PathBuf::from("."),
-    }
 }
 
 /// The root set a sent file is resolved against: `VLERV_MCP_ROOTS` (a

@@ -10,6 +10,13 @@ describe("basename / dirname", () => {
     expect(basename("/file")).toBe("file");
     expect(dirname("/file")).toBe("/");
   });
+  // The phone title band leans on this: the strip is greedy, so a
+  // `vlerv-remote://` address yields the filename as seen on the HOST
+  // without anyone having to parse the scheme first.
+  it("yields the host-side filename of a remote address", () => {
+    expect(basename("vlerv-remote://abc123/home/v/report.html")).toBe("report.html");
+    expect(basename("vlerv-remote://nopath")).toBe("nopath");
+  });
 });
 
 describe("isUnderRoot", () => {

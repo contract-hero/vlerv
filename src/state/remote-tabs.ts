@@ -38,12 +38,6 @@ export function activeTabPath(tabs: RemoteTabEntry[]): string | null {
 }
 
 /**
- * Follow mode's whole decision: open/focus the new active path only when
- * following THIS peer and the active path actually changed. Isolated as a
- * pure predicate so "does follow mode fire" is testable without mounting
- * the drawer or faking a live session.
- */
-/**
  * The host bridge's whole payload shape (design §6: "a thin effect publishes
  * the open-tab list to the backend on every commit"). Pure so the shape is
  * testable without a provider or a fake IPC surface: remote-address tabs are
@@ -52,15 +46,21 @@ export function activeTabPath(tabs: RemoteTabEntry[]): string | null {
  * exactly one entry is `active`, the current entry of the active tab.
  */
 export function toPublishableTabs(tabs: Tab[], activeTabId: string): RemoteTabEntry[] {
-  return tabs
-    .map((t) => ({ entry: currentEntry(t), active: t.id === activeTabId }))
-    .filter(
-      (x): x is { entry: NonNullable<ReturnType<typeof currentEntry>>; active: boolean } =>
-        x.entry !== null && !isRemoteAddress(x.entry.path),
-    )
-    .map((x) => ({ path: x.entry.path, active: x.active }));
+  // flatMap, so dropping a tab and shaping one are the same step: returning
+  // [] is the filter.
+  return tabs.flatMap((t) => {
+    const entry = currentEntry(t);
+    if (!entry || isRemoteAddress(entry.path)) return [];
+    return [{ path: entry.path, active: t.id === activeTabId }];
+  });
 }
 
+/**
+ * Follow mode's whole decision: open/focus the new active path only when
+ * following THIS peer and the active path actually changed. Isolated as a
+ * pure predicate so "does follow mode fire" is testable without mounting
+ * the drawer or faking a live session.
+ */
 export function shouldFollowNavigate(
   previousActivePath: string | null,
   nextActivePath: string | null,
