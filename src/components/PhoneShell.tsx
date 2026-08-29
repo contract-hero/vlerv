@@ -70,6 +70,9 @@ export default function PhoneShell({
     return () => {
       unsubscribe();
       if (pulseTimer.current) window.clearTimeout(pulseTimer.current);
+      // A path change inside the pulse window clears the timer before it can
+      // fire, so reset here or the dot stays lit on the next artifact.
+      setPulsing(false);
     };
   }, [bus, activePath]);
 

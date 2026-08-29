@@ -281,11 +281,25 @@ export function RemoteProvider({
   const confirmPairing = React.useCallback(
     (accept: boolean, scope?: RemoteScope) => {
       if (!pendingConfirm) return;
-      setPendingConfirm(null);
       const call = ipc.remotePairConfirm?.(pendingConfirm.node_id, accept, scope);
+      if (!call) {
+        setPairingError("Remote pairing is not available in this build.");
+        return;
+      }
+      // Keep the dialog mounted until the call settles — it is the only
+      // surface that renders `pairingError`, so clearing it up front would
+      // hide a failed confirm and read as success while nothing was paired.
+      setPairingBusy(true);
       call
-        ?.then(() => refreshPeers())
-        .catch((e: unknown) => setPairingError(String(e)));
+        .then(() => {
+          setPendingConfirm(null);
+          setPairingBusy(false);
+          refreshPeers();
+        })
+        .catch((e: unknown) => {
+          setPairingBusy(false);
+          setPairingError(`Pairing did not complete: ${String(e)}. The device is NOT paired.`);
+        });
     },
     [ipc, pendingConfirm, refreshPeers],
   );
@@ -336,9 +350,17 @@ export function RemoteProvider({
     (peer: string) => {
       if (subscribedRef.current.has(peer)) return;
       subscribedRef.current.add(peer);
-      ipc.remoteSubscribe?.(peer).catch((e: unknown) => {
-        console.error("vlerv: failed to subscribe to peer", peer, e);
-      });
+      const pending = ipc.remoteSubscribe?.(peer);
+      if (!pending) {
+        subscribedRef.current.delete(peer);
+      } else {
+        pending.catch((e: unknown) => {
+          // Drop the optimistic entry so a later click can retry, instead of
+          // short-circuiting on the poisoned set and leaving Connect dead.
+          subscribedRef.current.delete(peer);
+          console.error("vlerv: failed to subscribe to peer", peer, e);
+        });
+      }
       ipc.remoteListTabs?.(peer)
         .then((tabs) => setTabsByPeer((prev) => ({ ...prev, [peer]: tabs })))
         .catch((e: unknown) => console.error("vlerv: failed to list peer tabs", peer, e));

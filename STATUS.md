@@ -24,7 +24,7 @@
 - **Share** (merged from #22): native macOS share sheet + Open-in-Slack live in the Toolbar next to the star/copy buttons (they were in the removed Preview header). ("Open in Default App" was dropped in review: it required `opener:allow-open-path **`, an arbitrary-program-launch grant reachable from webview IPC.)
 
 ### Beam (remote-control-design.html — v1)
-- **P2P artifact transfer between Vlervcode instances** over [iroh](https://iroh.computer) (QUIC, hole-punched, encrypted relay fallback; exact-version pinned, all iroh types quarantined in `src-tauri/src/remote/`). Lazy boot: zero sockets until the first beam action.
+- **P2P artifact transfer between Vlervcode instances** over [iroh](https://iroh.computer) (QUIC, hole-punched, encrypted relay fallback; exact-version pinned, all iroh types quarantined in `crates/vlerv-remote/`, behind the `src-tauri/src/remote.rs` facade). Lazy boot: zero sockets until the first beam action.
 - **Send**: toolbar ⚡ button (or `vlerv beam <path>`, or a `vlerv://beam?path=…` link — link-initiated sends show a confirm face first). Stages the file into a content-addressed store (`ImportMode::Copy` — the ticket pins bytes at mint time), mints a `vlerv://receive?ticket=…&name=…&size=…` link. Path policy = the share module's (`canonicalize_allow_external`, conservative on empty roots).
 - **Serve**: a per-request gate (`iroh-blobs` provider events) intercepts every request kind and admits only a plain full-blob GET whose hash is an active, unexpired offer — get-many / push / observe are refused explicitly. **Stop and TTL expiry revoke the in-memory offer instantly** (the staged bytes are unpinned but linger until blob GC lands — see Open items). Fetch counts come from the same gate. Offers live in the toolbar ⚡ indicator (name, fetches, expiry, Stop) with a Received section.
 - **Receive**: deep link → confirm dialog (sanitized name — bidi/format chars stripped, size claim, sender NodeId fingerprint) → BLAKE3-verified stream (256 MiB hard cap enforced on actual bytes, 20 MiB warn) → lands under `Application Support/Vlerv/received/<date>/`, opens in a tab with a **beamed** badge. "Sender offline" is retryable from the dialog.
@@ -43,7 +43,7 @@
 
 ### MCP server (crates/vlerv-mcp)
 - Stdio MCP server named `vlerv-mcp` (rmcp 3.1.4) that exposes Remote Control to external agents: `beam_artifact`, `list_devices`, `send_to_device`, `pair_device`, `pair_status`, `confirm_pairing`, `stop_beam`, `server_status`.
-- Configured via env: `VLERV_MCP_ROOTS`, `VLERV_MCP_STATE_DIR`.
+- Configured via env: `VLERV_MCP_ROOTS`, `VLERV_MCP_STATE_DIR`, `VLERV_STATE_DIR`.
 - Built on the Tauri-free `crates/vlerv-remote` core, so the MCP binary carries no Tauri dependency.
 - Documented in `README-MCP.md`.
 - Known gap: no per-peer push quota on `send_to_device` / `beam_artifact`.

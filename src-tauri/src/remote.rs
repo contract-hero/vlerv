@@ -41,7 +41,7 @@ pub use vlerv_remote::{Dirs, EmptyCatalog, HostCatalog, HostSignal};
 /// Where this app keeps the remote subsystem's files. The crate hardcodes no
 /// directory: every path below derives from the app's own state dir, so a
 /// headless consumer of the same crate lands its blobs somewhere else.
-fn dirs() -> Dirs {
+pub(crate) fn dirs() -> Dirs {
     Dirs::new(crate::state_store::state_dir())
 }
 
@@ -783,7 +783,14 @@ async fn session(
     if state.peers.get(peer).is_none() {
         return Err("unknown peer".to_string());
     }
-    if let Some(existing) = state.sessions.lock().await.get(peer) {
+    // Hold the sessions lock across the whole dial. The drawer opens several
+    // remote commands for one peer in the same tick (subscribe, list-tabs,
+    // list-bookmarks, list-recents); without this, each misses the map and
+    // dials its own ClientSession, and every loser's `on_closed` then reports
+    // a live peer offline. A dial is bounded by the connect timeout, and this
+    // app pairs a handful of peers, so serializing dials is the right cost.
+    let mut sessions = state.sessions.lock().await;
+    if let Some(existing) = sessions.get(peer) {
         if !existing.is_closed() {
             return Ok(existing.clone());
         }
@@ -822,7 +829,7 @@ async fn session(
         Some(session.scope.clone()),
         None,
     );
-    state.sessions.lock().await.insert(peer.to_string(), session.clone());
+    sessions.insert(peer.to_string(), session.clone());
     Ok(session)
 }
 

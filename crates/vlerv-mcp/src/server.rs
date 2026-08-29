@@ -342,9 +342,9 @@ fn human_hours(expires_at: u64) -> String {
     let left = expires_at.saturating_sub(now);
     match left {
         0 => "less than a minute".to_string(),
-        s if s < 3600 => format!("{} minutes", s / 60),
+        s if s < 3600 => format!("{} minutes", s.div_ceil(60)),
         s if s < 2 * 3600 => "1 hour".to_string(),
-        s => format!("{} hours", s / 3600),
+        s => format!("{} hours", s.div_ceil(3600)),
     }
 }
 

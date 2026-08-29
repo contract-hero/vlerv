@@ -23,7 +23,7 @@
  * machine of the author's choosing. Neither has a legitimate use inside an
  * imported markdown fragment or an inline SVG. `<style>` deliberately stays:
  * a styled SVG is ordinary content and cannot navigate. */
-const FORBIDDEN_TAGS = /^(SCRIPT|IFRAME|OBJECT|EMBED|BASE|META|LINK)$/;
+const FORBIDDEN_TAGS = /^(SCRIPT|IFRAME|OBJECT|EMBED|BASE|META|LINK|ANIMATE|SET|ANIMATETRANSFORM)$/;
 
 /** Attributes that can carry a URL — the ones a `javascript:` value arms. */
 const URL_ATTRS = new Set(["href", "src", "xlink:href", "srcset", "formaction", "action", "data"]);

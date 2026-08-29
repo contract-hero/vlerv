@@ -6,8 +6,6 @@ import type { FilePayload } from "../ipc";
 import { renderByExtension, isHtmlPath } from "../render/router";
 import HtmlRenderer from "../render/html";
 import { scrollKeyFor, useScrollMemory } from "../state/scroll-memory";
-import { useBeamActions } from "../state/beam";
-import { isUnderRoot } from "../utils/path";
 import { isRemoteAddress } from "../utils/remote-address";
 
 export interface PreviewProps {
@@ -18,19 +16,18 @@ export interface PreviewProps {
 
 export default function Preview({ payload, tabId, zoom }: PreviewProps): React.ReactElement {
   const memory = useScrollMemory();
-  const { receivedDir } = useBeamActions();
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
   const rafRef = React.useRef<number | null>(null);
   const scrollKey = scrollKeyFor(tabId, payload.path);
   // Beamed HTML and a remote peer's HTML are both untrusted (authored by
   // whoever minted the ticket, or by the user of another machine — not this
   // one), so both render in a hardened, origin-isolated iframe — see
-  // HtmlRenderer.isolate. `payload.path` for a Scope v2 tab is the
-  // `vlerv-remote://` address (ipc.ts overwrites it after the cache fetch),
-  // never the local `remote/cache/<hash>` file, so this is a plain prefix
-  // check like the beam one.
-  const isolate =
-    isRemoteAddress(payload.path) || (receivedDir != null && isUnderRoot(payload.path, receivedDir));
+  // HtmlRenderer.isolate. `payload.untrusted` is stamped by the Rust reader
+  // from the received/ and cache/ dirs, so the decision is known on the FIRST
+  // render and never fails open while an async lookup is still pending. The
+  // remote-address check stays as a belt-and-braces guard for Scope tabs,
+  // whose `payload.path` is the `vlerv-remote://` address.
+  const isolate = payload.untrusted === true || isRemoteAddress(payload.path);
 
   // Restore scroll after the content for this (tab, path) renders. Markdown
   // fills its container asynchronously — MdRenderer re-signals via

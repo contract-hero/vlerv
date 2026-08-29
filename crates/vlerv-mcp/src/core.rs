@@ -38,7 +38,10 @@ use crate::devices::{self, label};
 /// How long `list_devices { probe: true }` waits on one device before calling
 /// it offline. Short on purpose: presence is a hint, not a fact, and a caller
 /// with six paired devices must not wait a minute for a list.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+// A probe covers the dial plus the handshake once the endpoint is up. It must
+// clear the handshake budget (HANDSHAKE_TIMEOUT = 10s in vlerv-remote); the
+// cold-boot cost is paid once, before the probe loop, not inside this window.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Shortest content-hash prefix `stop_beam` accepts for ONE link. Revoking
 /// the wrong link is recoverable (mint another); revoking by a one-character
@@ -442,6 +445,12 @@ impl McpCore {
     /// this process already holds.
     pub async fn list_devices(&self, probe: bool) -> Vec<DeviceInfo> {
         let peers = self.peers.list();
+        // Pay the lazy endpoint boot ONCE, outside the per-device probe budget.
+        // Otherwise the first probe on a cold server spends its whole timeout
+        // on bind + relay + store load and reports a reachable device offline.
+        if probe {
+            let _ = self.node().await;
+        }
         // The probes run TOGETHER. Dialed one after another, a fleet where
         // three devices are asleep costs three PROBE_TIMEOUTs before the list
         // comes back; concurrently the whole call bounds at about one, however

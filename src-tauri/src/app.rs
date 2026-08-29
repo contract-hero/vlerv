@@ -219,13 +219,23 @@ fn watch_external_paths(
 
         std::thread::spawn(move || {
             for change in rx {
-                let path = originals
-                    .get(&change.path)
-                    .cloned()
-                    .unwrap_or(change.path);
-                let event = crate::watcher::FileChange { kind: change.kind, path };
-                crate::remote::note_file_change(&app, event.clone());
-                let _ = app.emit("vlerv://file-changed", event);
+                // The scope bridge keys its interest set on the CANONICAL path.
+                // A remove cannot re-canonicalize (the file is gone), so hand
+                // it the already-canonical watcher path, not the caller's
+                // original — otherwise `/tmp` vs `/private/tmp` never matches
+                // and the peer never hears the delete.
+                let canonical = crate::watcher::FileChange {
+                    kind: change.kind.clone(),
+                    path: change.path.clone(),
+                };
+                // The webview event keeps the caller's original path so an
+                // open external tab (addressed by that path) reloads.
+                let display = crate::watcher::FileChange {
+                    kind: change.kind,
+                    path: originals.get(&change.path).cloned().unwrap_or(change.path),
+                };
+                crate::remote::note_file_change(&app, canonical);
+                let _ = app.emit("vlerv://file-changed", display);
             }
         });
     }

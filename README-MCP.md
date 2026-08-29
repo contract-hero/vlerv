@@ -74,7 +74,7 @@ Check it:
 claude mcp list
 ```
 
-Inside Claude Code, `/mcp` shows the server and its seven tools.
+Inside Claude Code, `/mcp` shows the server and its eight tools.
 
 ### Optional environment
 

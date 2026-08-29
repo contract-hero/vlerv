@@ -134,6 +134,11 @@ struct PeersDoc {
 pub struct PeerStore {
     path: PathBuf,
     inner: Mutex<Vec<Peer>>,
+    /// Set when `load` read a file it could not parse (corrupt, or a newer
+    /// schema). While true the store holds no peers AND `save` refuses to
+    /// write, so one later pairing cannot replace the real file with a
+    /// one-entry document. `None` on a fresh install (no file) or a clean load.
+    load_error: Option<String>,
 }
 
 impl PeerStore {
@@ -143,29 +148,38 @@ impl PeerStore {
     /// on the machine without telling anyone.
     pub fn load(dir: &Path) -> Self {
         let path = dir.join("peers.json");
-        let peers = match std::fs::read_to_string(&path) {
+        let (peers, load_error) = match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<PeersDoc>(&raw) {
-                Ok(doc) if doc.v == PEERS_SCHEMA => doc.peers,
+                Ok(doc) if doc.v == PEERS_SCHEMA => (doc.peers, None),
                 Ok(doc) => {
-                    eprintln!(
-                        "vlerv: remote: peers.json is schema v{} (this build reads v{PEERS_SCHEMA}) — \
-                         ignoring it, and NOT overwriting it",
+                    let msg = format!(
+                        "peers.json is schema v{} but this build reads v{PEERS_SCHEMA}",
                         doc.v
                     );
-                    Vec::new()
+                    eprintln!("vlerv: remote: {msg} — ignoring it, and NOT overwriting it");
+                    (Vec::new(), Some(msg))
                 }
                 Err(e) => {
-                    eprintln!("vlerv: remote: peers.json is unreadable ({e}) — no peers are trusted");
-                    Vec::new()
+                    let msg = format!("peers.json is unreadable ({e})");
+                    eprintln!("vlerv: remote: {msg} — no peers are trusted, and it is NOT overwritten");
+                    (Vec::new(), Some(msg))
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
             Err(e) => {
-                eprintln!("vlerv: remote: cannot read {path:?}: {e}");
-                Vec::new()
+                let msg = format!("cannot read {path:?}: {e}");
+                eprintln!("vlerv: remote: {msg}");
+                (Vec::new(), Some(msg))
             }
         };
-        Self { path, inner: Mutex::new(peers) }
+        Self { path, inner: Mutex::new(peers), load_error }
+    }
+
+    /// Why the on-disk store did not load, if it did not. A caller can surface
+    /// this so the user knows their pairings are hidden, not gone — and that
+    /// re-pairing would overwrite the real file (which `save` now refuses).
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, Vec<Peer>> {
@@ -260,6 +274,16 @@ impl PeerStore {
     /// Atomic write (tmp + rename), 0600 — the file names the machines this
     /// install trusts.
     fn save(&self) -> Result<(), String> {
+        // A store that did not load holds no peers; writing it would replace a
+        // corrupt-but-real file with an empty (or one-entry) document and lose
+        // every pairing. Refuse, and tell the caller where the file is.
+        if let Some(reason) = &self.load_error {
+            return Err(format!(
+                "refusing to overwrite {:?}: it did not load ({reason}). \
+                 Move the file aside to start a fresh peer list.",
+                self.path
+            ));
+        }
         let doc = PeersDoc { v: PEERS_SCHEMA, peers: self.guard().clone() };
         let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
         if let Some(parent) = self.path.parent() {

@@ -24,6 +24,10 @@ export interface FilePayload {
   /** How `content` is encoded: UTF-8 text or base64 (raster images). */
   encoding?: "text" | "base64";
   content: string | null;
+  /** Authored by another machine (a beam/push landing or a Scope fetch under
+   * the app's received/ or cache/ dirs). The renderer isolates it. Set by the
+   * Rust reader, so the trust decision never races an async lookup. */
+  untrusted?: boolean;
 }
 
 /** Flat recursive file index returned by `list_files_recursive` (⌘P). */

@@ -582,10 +582,21 @@ impl ScopeServer {
     }
 
     fn peers_holding(&self, path: &Path) -> Vec<EndpointId> {
+        // The interest set only grows, so a view-open peer that CLOSED the tab
+        // still `holds` the path — but the path has left its published set.
+        // Re-gate each holder against its current scope so we stop re-staging
+        // and pushing a new content address the peer may no longer fetch.
+        let wire = path.to_string_lossy();
         let sessions = self.state.sessions();
         sessions
             .iter()
             .filter(|s| s.handles.is_subscribed() && s.handles.holds(path))
+            .filter(|s| {
+                self.state
+                    .peers
+                    .get(&s.peer)
+                    .is_some_and(|peer| self.state.gate_for(&peer, &wire).is_ok())
+            })
             .filter_map(|s| s.peer.parse::<EndpointId>().ok())
             .collect()
     }
