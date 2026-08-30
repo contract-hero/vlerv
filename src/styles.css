@@ -1448,7 +1448,13 @@ pre {
 .beam-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  /* Above .settings-backdrop (100), not level with it. A `vlerv://pair` link
+     can arrive while Settings is open — in fact that is the common case,
+     since Settings is where the link was minted — and the six-word
+     fingerprint step is the one thing that must never be obscured: the user
+     cannot compare words they cannot see. DOM order alone decided this
+     before, and Settings mounts last. */
+  z-index: 150;
   background: var(--overlay-scrim);
   display: flex;
   align-items: flex-start;
@@ -1732,15 +1738,6 @@ pre {
   padding: 2px 8px;
   border-radius: var(--r-sm);
 }
-.remote-peer-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) 0;
-}
-.remote-peer-info { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; }
-.remote-peer-name { font-size: var(--text-body-sm); color: var(--fg); }
-.remote-peer-meta { font-size: var(--text-caption); color: var(--fg-muted); }
 .settings-backdrop {
   position: fixed;
   inset: 0;
@@ -1760,6 +1757,219 @@ pre {
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-overlay), var(--edge-highlight);
   overflow: hidden;
+}
+
+/* The panel itself. One markup for both hosts — the desktop dialog above and
+   the phone sheet (SettingsModal branches on the platform) — so the two
+   cannot drift apart. Sections are hairline cards; every row is label-left,
+   control-right, which is the grammar a thumb needs and the desktop reads
+   fine in. The panel carries its own padding because neither host has any. */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-4);
+}
+.settings-section { display: flex; flex-direction: column; }
+.settings-section-title {
+  margin: 0;
+  font-size: var(--text-body-sm);
+  font-weight: 600;
+  letter-spacing: var(--track-headline);
+  color: var(--heading-fg);
+}
+.settings-section-hint {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-caption);
+  line-height: 1.5;
+  color: var(--fg-muted);
+}
+.settings-section-hint code {
+  padding: 1px 4px;
+  border-radius: var(--r-xs);
+  background: var(--badge-bg);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.settings-subhead {
+  margin: var(--space-4) 0 0;
+  font-size: var(--text-caption);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.settings-block { margin-top: var(--space-3); }
+.settings-empty {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-caption);
+  color: var(--fg-muted);
+}
+
+/* Roots, globs and peers all live in the same hairline-bounded list, so
+   three different collections read as one kind of object. */
+.settings-list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.settings-list > li { border-bottom: 1px solid var(--border); }
+.settings-list > li:last-child { border-bottom: 0; }
+.settings-list-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 34px;
+  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-3);
+}
+.settings-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--fg-path);
+}
+
+/* A single preference: text on the left, one control on the right. The row
+   is a <label>, so the whole card is the hit target. */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 40px;
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.settings-row-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-row-label { font-size: var(--text-body-sm); color: var(--fg); }
+.settings-row-hint { font-size: var(--text-caption); color: var(--fg-muted); }
+
+/* The switch — a checkbox wearing the platform's affordance, in place of a
+   13px tick box no thumb can hit. */
+.settings-switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  margin: 0;
+  border-radius: var(--r-pill);
+  background: var(--border-strong);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+.settings-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--on-accent);
+  transition: transform var(--dur) var(--ease);
+}
+.settings-switch:checked { background: var(--accent); }
+.settings-switch:checked::after { transform: translateX(16px); }
+.settings-switch:focus-visible {
+  outline: 2px solid var(--input-border-focus);
+  outline-offset: 2px;
+}
+
+.settings-choice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 30px;
+  margin-top: var(--space-2);
+  font-size: var(--text-body-sm);
+  color: var(--fg);
+  cursor: pointer;
+}
+.settings-input {
+  width: 100%;
+  margin-top: var(--space-2);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: var(--text-body-sm);
+  color: var(--fg);
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  outline: none;
+}
+.settings-input:focus { border-color: var(--input-border-focus); }
+.settings-select {
+  padding: 4px 6px;
+  font: inherit;
+  font-size: var(--text-caption);
+  color: var(--fg);
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+/* Wraps instead of overflowing: Copy + Share + Done do not fit one phone
+   line. `.button` carries its own --space-1 margins, so the negative side
+   margins here pull the row back flush with the section above it. */
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: var(--space-2) calc(var(--space-1) * -1) 0;
+}
+/* Unpair and Remove destroy something; a secondary button that looks exactly
+   like Connect is a mis-tap waiting to happen on a touch screen. */
+.button-danger { color: var(--error-fg); }
+.button-danger:hover { background: var(--bg-row-hover); border-color: var(--error-fg); }
+
+/* Peer row: identity on one side, the scope menu and the two actions on the
+   other. One line on the desktop; the iOS block below drops the actions to
+   their own line, because a name plus a menu plus two buttons never fit
+   390pt. */
+.settings-peer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+.settings-peer-info {
+  flex: 1 1 160px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-peer-name {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-body-sm);
+  color: var(--fg);
+}
+.settings-peer-meta { font-size: var(--text-caption); color: var(--fg-muted); }
+.settings-peer-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 /* ── iOS companion (PRODUCT.md: read-only companion, no desktop chrome) ──
@@ -1956,6 +2166,45 @@ body.platform-ios .remote-follow-toggle {
   -webkit-overflow-scrolling: touch;
   min-height: 120px;
 }
+/* Settings is the one sheet with more content than a list of rows, so it
+   takes the taller stop. The scrim stays visible above it — the sheet is
+   still a sheet, not a second screen. */
+.phone-sheet-tall { max-height: 92%; }
+
+/* Settings on the phone: the same panel as the desktop, at thumb scale.
+   Nothing here changes what the panel says, only what it takes to hit. */
+body.platform-ios .settings-panel {
+  gap: var(--space-6);
+  padding: var(--space-3) var(--space-4) var(--space-5);
+}
+body.platform-ios .settings-section-title { font-size: var(--text-body); }
+/* One step up for every explanatory line too: 12px is a desktop caption size
+   and reads as fine print at arm's length. */
+body.platform-ios .settings-row-label { font-size: var(--text-body); }
+body.platform-ios .settings-section-hint,
+body.platform-ios .settings-row-hint,
+body.platform-ios .settings-peer-meta,
+body.platform-ios .settings-empty,
+body.platform-ios .settings-panel .beam-hint {
+  font-size: var(--text-body-sm);
+}
+body.platform-ios .settings-peer-name { font-size: var(--text-body); }
+body.platform-ios .settings-row,
+body.platform-ios .settings-list-row,
+body.platform-ios .settings-choice {
+  min-height: var(--tap-min);
+}
+/* 16px is also what stops iOS from zooming the viewport when a field takes
+   focus, so the reading size and the no-zoom size are the same number. */
+body.platform-ios .settings-panel .button,
+body.platform-ios .settings-input,
+body.platform-ios .settings-select {
+  min-height: var(--tap-min);
+  font-size: var(--text-body);
+}
+/* Own line, full width: the scope menu is the widest control in the row. */
+body.platform-ios .settings-peer-actions { flex: 1 0 100%; }
+body.platform-ios .settings-peer-actions .settings-select { flex: 1 1 auto; }
 
 .phone-tab-list {
   list-style: none;

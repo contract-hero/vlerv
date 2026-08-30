@@ -35,6 +35,8 @@
 
 ### Scope (remote-control-design.html — v2)
 - **Pairing**: `vlerv://pair?ticket=…` deep link (or QR-scannable equivalent) mints a one-time pairing token; both sides confirm a **six-word fingerprint** derived from both NodeIds before the peer is persisted. Peers live in `remote/peers.json` (NodeId, device name, granted scope, paired-at, last-seen); revocation is deleting the entry.
+- **Getting the invite to the other device**: Settings offers Copy link *and* Share. Share opens the native sheet — AirDrop, Messages, Mail — with the link as a URL, so the recipient taps it and the `vlerv://` handler opens it. macOS routes through the `share_link` command (NSSharingServicePicker, scheme-checked to `vlerv://` in `share.rs`); iOS has no UIKit bindings in this build and uses the WKWebView Web Share API (`src/utils/share-link.ts`). Where neither route exists the button does not render.
+- **Fingerprint dialog stacking**: `RemotePairDialog` sits above the Settings surface (`.beam-backdrop` z-index 150 vs `.settings-backdrop` 100). A pair link normally arrives while Settings is open, and six words that a dialog covers cannot be compared.
 - **Scope server/client** under ALPN `vlerv/scope/0`, multiplexed on the same iroh endpoint as Beam's blob ALPN. Scopes: `view-open`, `browse`, `control`.
 - **Remote sidebar drawers**: a paired, online peer appears as a fourth drawer beside Bookmarks/Recent/Files — live tab list, lazy workspace tree under `browse`.
 - **Live-follow**: a drawer toggle mirrors the host's active tab as it switches.
@@ -85,12 +87,12 @@
 
 ## Open items
 
-- **Beam follow-ups** (remote-control-design.html M6): blob-store GC for stopped/expired offers (tags are deleted; bytes linger in `remote/blobs/` until a GC pass exists), single-fetch mode, lock-to-peer beams, native share sheet / Open-in-Slack for the beam *link* (Copy link ships), Settings UI for `beam_ttl_hours`, macOS application-firewall prompt doc for unnotarized inbound. `endpoint.online()` waits up to 10 s before minting when relays are unreachable (e.g. behind some VPNs) — the ticket still carries direct addrs.
+- **Beam follow-ups** (remote-control-design.html M6): blob-store GC for stopped/expired offers (tags are deleted; bytes linger in `remote/blobs/` until a GC pass exists), single-fetch mode, lock-to-peer beams, Open-in-Slack for the beam *link* and wiring `ShareLinkButton` into `BeamDialog` (the `share_link` command ships and the pairing invite already uses it; BeamDialog is still Copy-link only), Settings UI for `beam_ttl_hours`, macOS application-firewall prompt doc for unnotarized inbound. `endpoint.online()` waits up to 10 s before minting when relays are unreachable (e.g. behind some VPNs) — the ticket still carries direct addrs.
 - **Scope follow-ups**: `remote_set_scope` narrowing an existing peer's scope does not revoke grants already minted under the wider scope (valid up to 1 h after narrowing); no per-peer push quota on MCP/Scope pushes.
 - **iOS companion follow-ups**: device name shows the Mac hostname on the simulator instead of a real iOS device name. **Container-relative persistence**: received entries, tab history and `peers.json` paths persist as absolute container paths, but iOS moves the app container UUID on every app update — persisted tabs then 404 and pairing state is orphaned (observed on simulator reinstall). Persist paths relative to the Application Support root and re-resolve at load.
 - Deep-link `line=N` reaches the frontend but no renderer scrolls to a line yet.
 - Recents list is push-only from opens; no backend broadcast event (StartPage refreshes on mount).
-- `preferences.ignore_globs` / `drag_out_mode` still unwired (the hardcoded `DEFAULT_IGNORED` covers the real use). `Settings.tsx` exists and holds the Slack-target field but is still not mounted anywhere — set `preferences.slack_target` via state.json until it is (product decision deferred in #22).
+- `preferences.ignore_globs` / `drag_out_mode` still unwired at the backend (the hardcoded `DEFAULT_IGNORED` covers the real use), though `Settings.tsx` now edits both. Settings is mounted on both platforms: a centered dialog from the sidebar gear on macOS, a bottom sheet from the Library sheet on iOS. The phone owns no files (read-only companion), so it shows the Remote section only — roots, ignore set, drag-out and the Slack target are desktop-only.
 - Markdown auto-reload re-runs mermaid/KaTeX from scratch — a large doc may flash briefly on reload.
 - DMG bundling still fails in `bundle_dmg.sh` (Finder permission); `.app` bundles fine, `cp -R` to `/Applications/`.
 

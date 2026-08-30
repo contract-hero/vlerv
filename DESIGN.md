@@ -618,6 +618,28 @@ disambiguates two files with the same name. Start-page recents can be absolute
 paths sharing a long `/Users/…/workspace/` prefix, so there the head is the part
 worth dropping.
 
+### Settings
+
+One panel, two hosts. On macOS it is a centered dialog over the scrim, opened
+from the sidebar gear; on iOS it is the same bottom sheet the Library and the
+tab list use, opened from the Library sheet. The markup does not fork — only
+the host and the section list do — so the two shapes cannot drift apart.
+
+Inside, every section is a hairline card with a title, an optional caption of
+explanation, and rows that read label-left / control-right. Lists of roots,
+globs and peers all sit in the same bordered list, so three different
+collections read as one kind of object. The only new control is the switch: a
+checkbox wearing the platform's affordance, because a 13px tick box is not a
+touch target.
+
+Destructive actions (Remove, Unpair) are secondary buttons in
+`{colors.error-fg}`. They are the only place the error hue appears outside an
+error message, and the reason is the phone: a mis-tap there costs a pairing.
+
+The phone shows the Remote section and nothing else. Roots, the ignore set,
+drag-out and the Slack target all act on a local workspace or a macOS share
+sheet, and the companion has neither.
+
 ### Start page
 
 A brand mark and a wordmark, then actions, then bookmarks and recents. The mark
@@ -675,8 +697,6 @@ rows use.
   reports success as a state yet.
 - Framing the iframe in a 16px panel would complete Linear's product-screenshot
   idiom, but it costs reading width, so the scale stops at 12px.
-- `src/components/Settings.tsx` is not mounted by any route and carries no
-  styles. It is outside this system until it ships.
 - Shiki keeps `github-dark` / `github-light` for syntax highlighting, so the
   token hues inside a code block are GitHub's, not Linear's. Shiki writes an
   inline `background-color`, which beats any selector, so both paths force the
