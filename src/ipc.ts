@@ -228,6 +228,13 @@ export interface IpcSurface {
    */
   watchExternalPaths?(paths: string[]): Promise<void>;
   shareFile?(paths: string[], anchor: ShareAnchor): Promise<void>;
+  /**
+   * Hand a `vlerv://` link (a pairing or beam ticket) to the native share
+   * sheet, anchored like `shareFile`. macOS only — the iOS companion shares
+   * links through the WKWebView Web Share API instead, because this build
+   * carries no UIKit bindings.
+   */
+  shareLink?(link: string, anchor: ShareAnchor): Promise<void>;
   /** Stage a file and mint its beam ticket (boots the endpoint lazily). */
   beamOffer?(path: string): Promise<BeamOffer>;
   /** Revoke an active offer — the ticket dies instantly. */
@@ -403,6 +410,10 @@ class TauriIpc implements IpcSurface {
 
   async shareFile(paths: string[], anchor: ShareAnchor): Promise<void> {
     await invoke<void>("share_file", { paths, anchor });
+  }
+
+  async shareLink(link: string, anchor: ShareAnchor): Promise<void> {
+    await invoke<void>("share_link", { link, anchor });
   }
 
   async beamOffer(path: string): Promise<BeamOffer> {

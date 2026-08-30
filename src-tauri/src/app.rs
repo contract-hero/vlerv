@@ -300,6 +300,7 @@ pub fn run() {
             remove_bookmark,
             reorder_bookmarks,
             crate::share::share_file,
+            crate::share::share_link,
             crate::remote::beam_offer,
             crate::remote::beam_stop,
             crate::remote::beam_list_offers,

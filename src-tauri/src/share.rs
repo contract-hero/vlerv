@@ -1,7 +1,33 @@
 // macOS share sheet via NSSharingServicePicker. The picker is anchored at a
 // webview-relative client rect so the popover opens from the Share button.
+//
+// Two things reach it: files (Preview's Share button) and links (the
+// `vlerv://` pairing / beam tickets). They share the picker and the anchor;
+// only the pasteboard item and the admission check differ.
 
 use crate::security::{self, RootSet};
+
+/// The one scheme `share_link` hands to the OS. Every link the UI offers to
+/// share is a `vlerv://pair?…` or `vlerv://receive?…` ticket, so a one-entry
+/// allowlist costs nothing and keeps a mis-wired caller from pushing
+/// `file://` (a path leak) or `javascript:` into the share sheet.
+const LINK_SCHEME: &str = "vlerv://";
+
+/// Admit a link to the share sheet. Scheme-checked, and rejected outright if
+/// it carries whitespace or control characters — those cannot survive a round
+/// trip through a message body, so the recipient would get a link that no
+/// longer opens. Pure, so it is unit-testable without AppKit.
+fn validate_link(link: &str) -> Result<&str, String> {
+    let trimmed = link.trim();
+    let rejected = "link is not shareable";
+    if !trimmed.starts_with(LINK_SCHEME) || trimmed.len() == LINK_SCHEME.len() {
+        return Err(rejected.into());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(rejected.into());
+    }
+    Ok(trimmed)
+}
 
 /// Anchor rect in webview client coordinates, straight from
 /// `getBoundingClientRect()`. WKWebView is a flipped NSView, so CSS px map
@@ -57,28 +83,21 @@ mod macos {
             const { RefCell::new(None) };
     }
 
+    /// Pop a picker for `items` at `anchor`. The half both entry points
+    /// below share; only the pasteboard items differ.
+    ///
     /// # Safety
     /// Must be called on the main thread with a valid WKWebView pointer
     /// (WKWebView is an NSView subclass). NSSharingServicePicker is not
     /// marked MainThreadOnly in objc2-app-kit, so the compiler cannot
     /// enforce the threading requirement — the caller must.
-    pub unsafe fn show_picker(
+    unsafe fn present(
         ns_view: *mut std::ffi::c_void,
-        paths: &[String],
+        items: &[Retained<AnyObject>],
         anchor: AnchorRect,
     ) {
         let view: &NSView = &*(ns_view as *const NSView);
-
-        let urls: Vec<Retained<AnyObject>> = paths
-            .iter()
-            .map(|p| {
-                // Plain filesystem path, never a file:// string — NSURL
-                // conforms to NSPasteboardWriting, which initWithItems needs.
-                let url = NSURL::fileURLWithPath(&NSString::from_str(p));
-                Retained::into_super(Retained::into_super(url))
-            })
-            .collect();
-        let items: Retained<NSArray<AnyObject>> = NSArray::from_retained_slice(&urls);
+        let items: Retained<NSArray<AnyObject>> = NSArray::from_retained_slice(items);
 
         let picker =
             NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items);
@@ -97,6 +116,46 @@ mod macos {
         // space (y-up), so the popover opens from the button's visual bottom.
         picker.showRelativeToRect_ofView_preferredEdge(rect, view, NSRectEdge::NSMinYEdge);
         LIVE_PICKER.with(|slot| *slot.borrow_mut() = Some(picker));
+    }
+
+    /// # Safety
+    /// Same contract as `present`.
+    pub unsafe fn show_file_picker(
+        ns_view: *mut std::ffi::c_void,
+        paths: &[String],
+        anchor: AnchorRect,
+    ) {
+        let urls: Vec<Retained<AnyObject>> = paths
+            .iter()
+            .map(|p| {
+                // Plain filesystem path, never a file:// string — NSURL
+                // conforms to NSPasteboardWriting, which initWithItems needs.
+                let url = NSURL::fileURLWithPath(&NSString::from_str(p));
+                Retained::into_super(Retained::into_super(url))
+            })
+            .collect();
+        present(ns_view, &urls, anchor);
+    }
+
+    /// A link, not a file. NSURL is the item AirDrop and Messages want — the
+    /// recipient gets something tappable that the `vlerv://` handler opens.
+    /// If NSURL will not parse the string, the NSString goes on the
+    /// pasteboard instead: a link the user can still paste beats a share
+    /// sheet that opens with nothing in it.
+    ///
+    /// # Safety
+    /// Same contract as `present`.
+    pub unsafe fn show_link_picker(
+        ns_view: *mut std::ffi::c_void,
+        link: &str,
+        anchor: AnchorRect,
+    ) {
+        let text = NSString::from_str(link);
+        let item: Retained<AnyObject> = match NSURL::URLWithString(&text) {
+            Some(url) => Retained::into_super(Retained::into_super(url)),
+            None => Retained::into_super(Retained::into_super(text)),
+        };
+        present(ns_view, &[item], anchor);
     }
 }
 
@@ -121,7 +180,7 @@ pub async fn share_file(
         // hands over the WKWebView pointer — both things the picker needs.
         webview
             .with_webview(move |wv| unsafe {
-                macos::show_picker(wv.inner() as *mut std::ffi::c_void, &resolved, anchor);
+                macos::show_file_picker(wv.inner() as *mut std::ffi::c_void, &resolved, anchor);
             })
             .map_err(|e| e.to_string())
     }
@@ -136,9 +195,40 @@ pub async fn share_file(
     }
 }
 
+/// Share a `vlerv://` link (a pairing or beam ticket) via the native macOS
+/// share sheet, anchored like `share_file`. AirDrop, Messages and Mail all
+/// take a URL, which is the whole point: the link has to reach the other
+/// device before it can be opened there.
+///
+/// Fire-and-forget, same as `share_file`: the picker's outcome is not
+/// reported back. iOS has no NSSharingServicePicker and this crate carries
+/// no UIKit bindings, so the companion uses the WKWebView Web Share API from
+/// the frontend and never calls this command.
+#[tauri::command]
+pub async fn share_link(
+    webview: tauri::WebviewWindow,
+    link: String,
+    anchor: AnchorRect,
+) -> Result<(), String> {
+    let validated = validate_link(&link)?.to_string();
+    #[cfg(target_os = "macos")]
+    {
+        webview
+            .with_webview(move |wv| unsafe {
+                macos::show_link_picker(wv.inner() as *mut std::ffi::c_void, &validated, anchor);
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (webview, anchor, validated);
+        Err("share sheet is not available on this platform".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_paths;
+    use super::{resolve_paths, validate_link};
     use crate::security::RootSet;
 
     fn root_and_file() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -227,5 +317,35 @@ mod tests {
             a.canonicalize().unwrap().to_string_lossy().into_owned(),
             b.canonicalize().unwrap().to_string_lossy().into_owned(),
         ]);
+    }
+
+    #[test]
+    fn accepts_the_two_link_shapes_the_ui_mints() {
+        assert_eq!(validate_link("vlerv://pair?ticket=ABC").unwrap(), "vlerv://pair?ticket=ABC");
+        assert_eq!(validate_link("vlerv://receive?t=ABC").unwrap(), "vlerv://receive?t=ABC");
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(validate_link("  vlerv://pair?ticket=ABC\n").unwrap(), "vlerv://pair?ticket=ABC");
+    }
+
+    #[test]
+    fn rejects_every_other_scheme() {
+        for link in ["file:///etc/passwd", "javascript:alert(1)", "https://example.com", "pair?ticket=A"] {
+            assert!(validate_link(link).is_err(), "{link} must not reach the share sheet");
+        }
+    }
+
+    #[test]
+    fn rejects_a_bare_scheme_with_no_ticket() {
+        assert!(validate_link("vlerv://").is_err());
+    }
+
+    #[test]
+    fn rejects_interior_whitespace_and_control_characters() {
+        // A link that cannot survive a message body is worse than no link.
+        assert!(validate_link("vlerv://pair?ticket=A B").is_err());
+        assert!(validate_link("vlerv://pair?ticket=A\nB").is_err());
     }
 }
