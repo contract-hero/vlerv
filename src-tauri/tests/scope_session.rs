@@ -151,10 +151,10 @@ async fn scope_pairs_then_serves_under_the_granted_scope() {
 
     // Each side persists the other only after its own user confirmed.
     host_peers
-        .upsert(&guest_id.to_string(), "MacBook", Scope::ViewOpen)
+        .seed(&guest_id.to_string(), "MacBook", Scope::ViewOpen)
         .unwrap();
     guest_peers
-        .upsert(&host_id.to_string(), "Mac Studio", Scope::Browse)
+        .seed(&host_id.to_string(), "Mac Studio", Scope::Browse)
         .unwrap();
 
     // ── The session, under view-open ────────────────────────────────────────

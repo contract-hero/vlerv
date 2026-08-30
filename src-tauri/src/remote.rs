@@ -362,6 +362,12 @@ pub async fn remote_pair_confirm(
     accept: bool,
     scope: Option<String>,
 ) -> Result<Option<Peer>, String> {
+    // The scope is parsed BEFORE the pairing is taken, the way
+    // `McpCore::confirm_pairing` does it: `take` consumes the parked entry,
+    // and nothing can re-park it, so a refusal after the take would strand the
+    // dialog — every one of its exits calls this command again and would then
+    // fail with "no pairing is waiting for confirmation".
+    let granted = Scope::parse_optional(scope.as_deref())?;
     let Some(pending) = state.pairing.take(&node_id) else {
         return Err("no pairing is waiting for confirmation".to_string());
     };
@@ -370,10 +376,17 @@ pub async fn remote_pair_confirm(
     }
     // A named scope is the human's explicit grant, so it must land on disk
     // even when it NARROWS a device already in the store; naming none leaves
-    // an existing grant where it is. `confirm` expresses that difference —
-    // `upsert`, the passive handshake path, never moves a grant at all.
-    let granted = Scope::parse_optional(scope.as_deref())?;
-    let peer = state.peers.confirm(&pending.node_id, &pending.device, granted)?;
+    // an existing grant where it is.
+    let peer = match state.peers.confirm(&pending.node_id, &pending.device, granted) {
+        Ok(peer) => peer,
+        Err(e) => {
+            // Put it back. The human is still standing in front of the six
+            // words, and a store that could not be written is a reason to
+            // retry, not a reason to lose the pairing.
+            state.pairing.park(pending);
+            return Err(e);
+        }
+    };
     let _ = app.emit("vlerv://remote-event", RemoteEvent::PeersUpdated);
     Ok(Some(peer))
 }

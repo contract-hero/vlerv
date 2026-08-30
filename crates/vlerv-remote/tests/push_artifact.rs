@@ -78,7 +78,7 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
     let guest_roots = RootSet::new(vec![workspace.path().to_path_buf()]);
 
     // Paired, but only up to `browse` — the scope a colleague's machine gets.
-    host_peers.upsert(&guest_id, "MacBook", Scope::Browse).unwrap();
+    host_peers.seed(&guest_id, "MacBook", Scope::Browse).unwrap();
 
     let session = ClientSession::connect(&guest, host_addr.clone(), "MacBook".to_string(), |_| {}, || {})
         .await

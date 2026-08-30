@@ -29,7 +29,7 @@ use vlerv_remote::beam::human_bytes;
 use crate::args::{
     BeamArtifactArgs, ConfirmPairingArgs, ListDevicesArgs, SendToDeviceArgs, StopBeamArgs,
 };
-use crate::core::McpCore;
+use crate::core::{McpCore, ServerStatus};
 
 /// The rmcp handler. Holds the core behind an `Arc` because rmcp clones the
 /// service per connection.
@@ -223,7 +223,10 @@ impl VlervMcp {
                        fingerprint words match on both screens. Never call this with accept true \
                        before the user has actually compared the words. The optional scope \
                        argument says what the NEW DEVICE may do on this server (\"view-open\", \
-                       \"browse\", \"control\"; the default is \"view-open\"). It does not decide \
+                       \"browse\", \"control\"; a device new to this server defaults to \
+                       \"view-open\"). For a device that is ALREADY paired, naming a scope \
+                       replaces its grant, including narrowing it, and omitting the argument \
+                       keeps the grant it already has. It does not decide \
                        what this server may do on the device — for send_to_device to work, the \
                        device must grant this server \"control\" on its own side."
     )]
@@ -261,29 +264,34 @@ impl VlervMcp {
                        diagnose a failed send or to tell the user which links are still live."
     )]
     async fn server_status(&self) -> Result<CallToolResult, ErrorData> {
-        render(self.core.server_status().await, |status| {
-            // Say so when the list is shorter than the count, rather than
-            // letting the reader take the listed entries for all of them.
-            let listed = if status.received_total as usize > status.received_artifacts.len() {
-                format!(" (listing the last {})", status.received_artifacts.len())
-            } else {
-                String::new()
-            };
-            format!(
-                "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
-                 {}\nactive beam links: {}\nreceived this session: {}{}",
-                status.device,
-                status.node_id_short,
-                status.identity_dir.display(),
-                status.booted,
-                status.uptime_secs,
-                status.paired_devices,
-                status.active_offers.len(),
-                status.received_total,
-                listed
-            )
-        })
+        render(self.core.server_status().await, status_summary)
     }
+}
+
+/// The sentence `server_status` returns. A free function, not a closure, so a
+/// test can assert the truncation clause — the whole reason `received_total`
+/// exists — without booting a server.
+fn status_summary(status: &ServerStatus) -> String {
+    // Say so when the list is shorter than the count, rather than letting the
+    // reader take the listed entries for all of them.
+    let listed = if status.received_total as usize > status.received_artifacts.len() {
+        format!(" (listing the last {})", status.received_artifacts.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
+         {}\nactive beam links: {}\nreceived this session: {}{}",
+        status.device,
+        status.node_id_short,
+        status.identity_dir.display(),
+        status.booted,
+        status.uptime_secs,
+        status.paired_devices,
+        status.active_offers.len(),
+        status.received_total,
+        listed
+    )
 }
 
 #[tool_handler]
@@ -334,15 +342,24 @@ fn render<T: Serialize>(
 /// A successful result: a sentence the model reads, plus the same facts as
 /// structured JSON for a client that renders it.
 ///
-/// MCP says `structuredContent` is a RECORD. A tool that hands this a bare
-/// array gets its whole call rejected by the client before the model sees a
-/// word of it, so a list-shaped result must name its array under a key. The
-/// assertion below is what stops the next such tool from shipping — three
-/// handlers reached this with a `Vec` before it existed.
+/// MCP types `structuredContent` as a JSON object. A client that validates
+/// the field rejects an array-shaped result before the model reads a word of
+/// it, so a list-shaped tool must name its array under a key — three handlers
+/// reached this with a bare `Vec` before the check below existed.
+///
+/// The check runs in RELEASE too, on purpose. A `debug_assert!` here would be
+/// absent from the binary `README-MCP.md` tells people to build, and would
+/// fire only for a handler some test happens to call; a wrong shape already
+/// breaks the call at the client, so failing loudly here costs nothing and
+/// turns an opaque protocol error into a message the model can report.
 fn ok<T: Serialize>(summary: impl Into<String>, value: &T) -> Result<CallToolResult, ErrorData> {
     let json = serde_json::to_value(value)
         .map_err(|e| ErrorData::internal_error(format!("cannot serialize result: {e}"), None))?;
-    debug_assert!(json.is_object(), "structuredContent must be a record, got: {json}");
+    if !json.is_object() {
+        return tool_failure(format!(
+            "internal: structuredContent must be a record, got: {json}"
+        ));
+    }
     let mut result = CallToolResult::structured(json);
     result.content = vec![ContentBlock::text(summary.into())];
     Ok(result)
@@ -374,6 +391,50 @@ mod tests {
 
     fn router() -> ToolRouter<VlervMcp> {
         VlervMcp::tool_router()
+    }
+
+    fn status_with(total: u64, listed: usize) -> ServerStatus {
+        ServerStatus {
+            node_id: "ab".repeat(32),
+            node_id_short: "abababab".to_string(),
+            device: "Claude Code @ test".to_string(),
+            identity_dir: "/tmp/x/remote".into(),
+            state_dir: "/tmp/x".into(),
+            booted: true,
+            uptime_secs: 1,
+            paired_devices: 0,
+            active_offers: Vec::new(),
+            received_artifacts: (0..listed)
+                .map(|i| crate::core::ReceivedArtifact {
+                    from: "cd".repeat(32),
+                    name: format!("a{i}.html"),
+                    path: format!("/tmp/a{i}.html").into(),
+                    size: 1,
+                    hash: format!("{i:064x}"),
+                })
+                .collect(),
+            received_total: total,
+            roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_truncated_received_list_says_so_and_a_complete_one_does_not() {
+        // The whole reason `received_total` exists: once the cap drops the
+        // oldest arrivals, the count and the list disagree, and a reader who
+        // is not told that takes the listed entries for all of them.
+        let truncated = status_summary(&status_with(105, 100));
+        assert!(truncated.contains("received this session: 105"), "{truncated}");
+        assert!(truncated.contains("(listing the last 100)"), "{truncated}");
+
+        // When they agree, the clause must not appear at all.
+        let complete = status_summary(&status_with(3, 3));
+        assert!(complete.contains("received this session: 3"), "{complete}");
+        assert!(!complete.contains("listing"), "{complete}");
+
+        // The boundary: exactly at the cap, nothing was dropped.
+        let at_cap = status_summary(&status_with(100, 100));
+        assert!(!at_cap.contains("listing"), "{at_cap}");
     }
 
     #[test]
@@ -493,10 +554,13 @@ mod tests {
         // `structuredContent` must be a record. A handler that returns a
         // `Vec` directly makes the client reject the whole call, so both
         // list-shaped tools name their array under a key.
+        // A real temp dir, like every other test here: a fixed path is shared
+        // across runs, worktrees and parallel invocations.
+        let dir = tempfile::TempDir::new().unwrap();
         let core = Arc::new(McpCore::new(
-            "/tmp/vlerv-mcp-test".into(),
+            dir.path().to_path_buf(),
             vec![],
-            "/tmp".into(),
+            dir.path().to_path_buf(),
             None,
         ));
         let server = VlervMcp::new(core);

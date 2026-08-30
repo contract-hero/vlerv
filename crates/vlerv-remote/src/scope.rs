@@ -857,7 +857,23 @@ impl ProtocolHandler for ScopeServer {
         };
         // The device name travels in every handshake (design §4): keep the
         // stored name current without touching the granted scope.
-        let _ = self.state.peers.upsert(&node_id, &device, peer.scope);
+        //
+        // This runs AFTER the allowlist check at the top, with an await in
+        // between (the peer chooses when to send `Hello`, up to
+        // HANDSHAKE_TIMEOUT). `refresh_device` never inserts, so a peer the
+        // operator revoked inside that window cannot write itself back into
+        // the store — and we refuse it here rather than registering a session
+        // it would otherwise keep. A write failure is not a reason to drop a
+        // connection the allowlist already admitted, so only `Ok(false)`,
+        // "the peer is gone", closes it.
+        match self.state.peers.refresh_device(&node_id, &device) {
+            Ok(true) => {}
+            Ok(false) => {
+                connection.close(VarInt::from_u32(CLOSE_REFUSED), b"not a paired peer");
+                return Err(refused("peer was revoked during the handshake"));
+            }
+            Err(e) => eprintln!("vlerv: remote: cannot persist peers.json: {e}"),
+        }
 
         let (tx, mut rx) = mpsc::channel::<Frame>(SESSION_QUEUE);
         let handles = Arc::new(SessionHandles::new());

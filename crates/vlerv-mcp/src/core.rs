@@ -570,6 +570,15 @@ impl McpCore {
         self.sessions.lock().await.len()
     }
 
+    /// Test seam: the identity of the session cached for `node_id`, as the
+    /// address of its `Arc`. A count cannot tell reuse from re-dialling —
+    /// the map is keyed by node id, so it holds one entry per peer either
+    /// way — but a stable identity across calls can.
+    #[doc(hidden)]
+    pub async fn cached_session_id(&self, node_id: &str) -> Option<usize> {
+        self.sessions.lock().await.get(node_id).map(|s| Arc::as_ptr(s) as usize)
+    }
+
     /// Drop a cached session so the next call re-handshakes.
     async fn forget_session(&self, node_id: &str) {
         self.sessions.lock().await.remove(node_id);
@@ -906,8 +915,10 @@ mod tests {
         assert_eq!(wide.scope.as_deref(), Some("control"));
 
         // The whole point: the operator re-pairs the SAME device and names a
-        // narrower scope. Reporting "view-open" while "control" stays on disk
-        // would be a grant the human believes they took away.
+        // narrower scope. Before `confirm`, this answered "control" AND left
+        // "control" on disk — the report agreed with the store, and the
+        // narrowing the human asked for was dropped with no error at all.
+        // Both halves are asserted here: what was reported, and what landed.
         park(&core, &node, "Val's iPhone");
         let narrow = core.confirm_pairing(true, None, Some("view-open")).unwrap();
         assert_eq!(narrow.scope.as_deref(), Some("view-open"));
