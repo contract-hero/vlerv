@@ -64,7 +64,9 @@ pub struct ConfirmPairingArgs {
     #[serde(default)]
     pub node_id: Option<String>,
     /// What the new device may do on THIS server: "view-open", "browse" or
-    /// "control". Defaults to "view-open", the narrowest grant.
+    /// "control". A new device defaults to "view-open", the narrowest grant.
+    /// Naming a scope for a device that is already paired REPLACES its grant,
+    /// including narrowing it; omitting it leaves that grant unchanged.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -120,14 +122,23 @@ pub fn validate_device_query(raw: &str) -> Result<&str, String> {
     Ok(trimmed)
 }
 
-/// Parse an optional scope string, defaulting to the narrowest grant. Unknown
-/// strings are refused rather than defaulted: a typo must not silently pick a
-/// scope the human did not ask for.
-pub fn validate_scope(raw: Option<&str>) -> Result<Scope, String> {
-    // The crate owns the "omitted means DEFAULT_SCOPE" rule, so this server
-    // and the app's IPC layer cannot end up defaulting to different grants.
-    Scope::parse_or_default(raw.map(str::trim))
-        .map_err(|e| format!("{e} — use \"view-open\", \"browse\" or \"control\""))
+/// Parse an optional scope string, KEEPING the difference between "the
+/// caller named a scope" and "the caller named none". Unknown strings are
+/// refused rather than defaulted: a typo must not silently pick a scope the
+/// human did not ask for, and `None` must not silently become the narrowest
+/// grant here — `PeerStore::confirm` owns that rule, so an omitted argument
+/// can still mean "leave an existing peer's grant alone".
+pub fn validate_optional_scope(raw: Option<&str>) -> Result<Option<Scope>, String> {
+    match raw {
+        None => Ok(None),
+        Some(named) => Scope::parse(named.trim()).map(Some).map_err(scope_help),
+    }
+}
+
+/// One refusal string for every scope argument, so a typo reads the same
+/// wherever it is made.
+fn scope_help(e: String) -> String {
+    format!("{e} — use \"view-open\", \"browse\" or \"control\"")
 }
 
 #[cfg(test)]
@@ -202,13 +213,18 @@ mod tests {
     }
 
     #[test]
-    fn scope_defaults_to_the_narrowest_grant_and_refuses_typos() {
-        assert_eq!(validate_scope(None).unwrap(), Scope::ViewOpen);
-        assert_eq!(validate_scope(Some("control")).unwrap(), Scope::Control);
-        assert_eq!(validate_scope(Some(" browse ")).unwrap(), Scope::Browse);
-        // A typo must never widen or narrow a grant silently.
-        assert!(validate_scope(Some("Control")).is_err());
-        assert!(validate_scope(Some("admin")).is_err());
-        assert!(validate_scope(Some("")).is_err());
+    fn an_optional_scope_keeps_the_difference_between_none_and_a_named_grant() {
+        // `None` must stay `None` all the way to the peer store: it is what
+        // tells `confirm` to leave an existing grant where it is.
+        assert_eq!(validate_optional_scope(None).unwrap(), None);
+        assert_eq!(validate_optional_scope(Some(" control ")).unwrap(), Some(Scope::Control));
+        assert_eq!(validate_optional_scope(Some("view-open")).unwrap(), Some(Scope::ViewOpen));
+        assert_eq!(validate_optional_scope(Some("browse")).unwrap(), Some(Scope::Browse));
+        // A typo is a refusal, not a default — it must never widen or narrow
+        // a grant silently. Case matters: the wire spelling is lower-kebab.
+        assert!(validate_optional_scope(Some("")).is_err());
+        assert!(validate_optional_scope(Some("Control")).is_err());
+        assert!(validate_optional_scope(Some("admin")).is_err());
     }
+
 }

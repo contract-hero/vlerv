@@ -48,7 +48,12 @@
     "deep-link": {
       "desktop": {
         "schemes": ["vlerv"]
-      }
+      },
+      "mobile": [
+        {
+          "scheme": ["vlerv"]
+        }
+      ]
     }
   }
 }

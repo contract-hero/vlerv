@@ -21,6 +21,7 @@ function PairLinkFace({
 }: {
   arrival: RemotePairLinkArrival;
 }): React.ReactElement {
+  const { pairingBusy, pairingError } = useRemoteState();
   const { completePairing, dismissPairLink } = useRemoteActions();
   useEscape(dismissPairLink);
 
@@ -56,13 +57,15 @@ function PairLinkFace({
           . Nothing is dialed until you proceed, and nothing is trusted until
           you compare the six words on both screens.
         </p>
+        {pairingError ? <p className="beam-error" role="alert">{pairingError}</p> : null}
         <div className="beam-actions">
           <button
             type="button"
             className="button"
+            disabled={pairingBusy}
             onClick={() => completePairing(arrival.ticket)}
           >
-            Continue
+            {pairingBusy ? "Connecting…" : "Continue"}
           </button>
           <button type="button" className="button button-secondary" autoFocus onClick={dismissPairLink}>
             Decline

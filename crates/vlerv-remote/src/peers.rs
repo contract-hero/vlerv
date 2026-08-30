@@ -63,17 +63,6 @@ impl Scope {
         }
     }
 
-    /// `parse`, with `None` meaning "the caller said nothing" rather than
-    /// "the caller said something unknown". Every IPC and MCP entry point that
-    /// takes an OPTIONAL scope resolves it here, so an omitted argument lands
-    /// on `DEFAULT_SCOPE` and a typo is still rejected.
-    pub fn parse_or_default(s: Option<&str>) -> Result<Self, String> {
-        match s {
-            Some(raw) => Self::parse(raw),
-            None => Ok(DEFAULT_SCOPE),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::ViewOpen => "view-open",
@@ -220,6 +209,46 @@ impl PeerStore {
                         node_id: node_id.to_string(),
                         device: device.to_string(),
                         scope,
+                        paired_at: now,
+                        last_seen: now,
+                    };
+                    peers.push(peer.clone());
+                    peer
+                }
+            }
+        };
+        self.save()?;
+        Ok(peer)
+    }
+
+    /// Persist a pairing a human just confirmed, applying the grant that
+    /// human chose. `grant` REPLACES an existing entry's scope in either
+    /// direction, so re-pairing a trusted device at a narrower scope actually
+    /// narrows it. `None` means the operator named no scope: keep an existing
+    /// entry's grant, and give a new entry `DEFAULT_SCOPE`.
+    ///
+    /// This is the difference from `upsert`, which is the PASSIVE path — a
+    /// handshake refreshing a device name — and never moves a grant at all.
+    /// A confirm path that called `upsert` would report the scope the human
+    /// picked while writing the wider one already on disk.
+    pub fn confirm(&self, node_id: &str, device: &str, grant: Option<Scope>) -> Result<Peer, String> {
+        let now = now_unix();
+        let peer = {
+            let mut peers = self.guard();
+            match peers.iter_mut().find(|p| p.node_id == node_id) {
+                Some(existing) => {
+                    existing.device = device.to_string();
+                    existing.last_seen = now;
+                    if let Some(scope) = grant {
+                        existing.scope = scope;
+                    }
+                    existing.clone()
+                }
+                None => {
+                    let peer = Peer {
+                        node_id: node_id.to_string(),
+                        device: device.to_string(),
+                        scope: grant.unwrap_or(DEFAULT_SCOPE),
                         paired_at: now,
                         last_seen: now,
                     };
@@ -606,6 +635,35 @@ mod tests {
     }
 
     #[test]
+    fn confirm_applies_the_grant_the_human_picked_in_both_directions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = store(&dir);
+        // A new peer with no named scope lands on the narrowest grant.
+        assert_eq!(s.confirm("nodeA", "iPhone", None).unwrap().scope, DEFAULT_SCOPE);
+        // Widening, then NARROWING — the case `upsert` cannot express. A
+        // re-pair at "view-open" must not leave "control" on disk.
+        assert_eq!(s.confirm("nodeA", "iPhone", Some(Scope::Control)).unwrap().scope, Scope::Control);
+        assert_eq!(s.confirm("nodeA", "iPhone", Some(Scope::ViewOpen)).unwrap().scope, Scope::ViewOpen);
+        assert_eq!(store(&dir).get("nodeA").unwrap().scope, Scope::ViewOpen, "the narrowing is persisted");
+        // No scope named ⇒ the operator said nothing about the grant, so an
+        // existing one is left where it is rather than reset to the default.
+        s.confirm("nodeA", "iPhone", Some(Scope::Browse)).unwrap();
+        let kept = s.confirm("nodeA", "iPhone (renamed)", None).unwrap();
+        assert_eq!(kept.scope, Scope::Browse);
+        assert_eq!(kept.device, "iPhone (renamed)");
+        assert_eq!(s.list().len(), 1, "confirm must not duplicate");
+    }
+
+    #[test]
+    fn confirm_preserves_the_original_pairing_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = store(&dir);
+        let first = s.confirm("nodeA", "iPhone", Some(Scope::Browse)).unwrap();
+        let again = s.confirm("nodeA", "iPhone", Some(Scope::Control)).unwrap();
+        assert_eq!(again.paired_at, first.paired_at, "re-pairing is not a new pairing");
+    }
+
+    #[test]
     fn revocation_is_deleting_the_entry() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = store(&dir);
@@ -838,16 +896,6 @@ mod tests {
         assert_eq!(pairing.live_tokens(), 1);
         assert!(pairing.consume(&decoded.token));
         assert!(!pairing.consume(&decoded.token));
-    }
-
-    // ── Optional-scope parsing ─────────────────────────────────────────────
-
-    #[test]
-    fn an_omitted_scope_is_the_default_and_a_typo_is_still_refused() {
-        assert_eq!(Scope::parse_or_default(None).unwrap(), DEFAULT_SCOPE);
-        assert_eq!(Scope::parse_or_default(Some("control")).unwrap(), Scope::Control);
-        assert!(Scope::parse_or_default(Some("admin")).is_err());
-        assert!(Scope::parse_or_default(Some("")).is_err());
     }
 
     // ── Short ids ──────────────────────────────────────────────────────────
