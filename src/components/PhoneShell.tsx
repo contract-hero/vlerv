@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import type { IpcSurface } from "../ipc";
 import TabView from "./TabView";
+import PhoneSheet from "./PhoneSheet";
 import RemoteDrawerList from "./RemoteDrawer";
 import ReceivedDrawer from "./ReceivedDrawer";
 import { useActiveTab, useTabs, useTabsDispatch } from "../state/TabsProvider";
@@ -153,15 +154,6 @@ export default function PhoneShell({
         </button>
       </nav>
 
-      {sheet ? (
-        <button
-          type="button"
-          className="phone-scrim"
-          aria-label="Dismiss"
-          onClick={closeSheet}
-        />
-      ) : null}
-
       {sheet === "library" ? (
         <PhoneSheet
           label="Library"
@@ -243,44 +235,6 @@ export default function PhoneShell({
           </ul>
         </PhoneSheet>
       ) : null}
-    </div>
-  );
-}
-
-/** The chrome both bottom sheets share: grab handle, head, and the scrolling
- *  body. Close is always present and always last, so the dismiss target sits
- *  in the same place in both sheets; `actions` is whatever that sheet adds
- *  before it. `label` is the accessible name, which can say more than the
- *  visible title has room for — the tabs sheet reads "Open tabs". */
-function PhoneSheet({
-  label,
-  title,
-  actions,
-  onClose,
-  children,
-}: {
-  label: string;
-  title: string;
-  actions?: React.ReactNode;
-  onClose: () => void;
-  children: React.ReactNode;
-}): React.ReactElement {
-  return (
-    <div className="phone-sheet" role="dialog" aria-label={label}>
-      <div className="phone-sheet-grab" aria-hidden />
-      <div className="phone-sheet-head">
-        <span className="phone-sheet-title">{title}</span>
-        {actions}
-        <button
-          type="button"
-          className="phone-sheet-action"
-          aria-label="Close"
-          onClick={onClose}
-        >
-          <X size={17} strokeWidth={1.8} />
-        </button>
-      </div>
-      <div className="phone-sheet-body">{children}</div>
     </div>
   );
 }

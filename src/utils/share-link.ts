@@ -3,7 +3,17 @@
 // command; the iOS companion carries no UIKit bindings, so it goes through
 // WKWebView's Web Share API instead. Both decisions live here, away from
 // React, so they can be tested without a webview.
-import type { IpcSurface } from "../ipc";
+import type { IpcSurface, ShareAnchor } from "../ipc";
+
+/** Where the native popover should point. Both share commands take one, so
+ *  the rect-to-anchor mapping lives here rather than once per button.
+ *
+ *  Callers must read this synchronously in the click handler: the rect is
+ *  viewport-relative and goes stale the moment the pane behind it scrolls. */
+export function shareAnchorFrom(el: Element): ShareAnchor {
+  const r = el.getBoundingClientRect();
+  return { x: r.x, y: r.y, width: r.width, height: r.height };
+}
 
 /** How this build can put a link in a share sheet. `unavailable` is a real
  *  answer: the caller hides the button rather than offering one that does

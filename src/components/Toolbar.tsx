@@ -28,6 +28,7 @@ import { slackUrlFromTarget } from "../utils/slack";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
 import { useSettings } from "../hooks/useSettings";
 import { tauriIpc } from "../ipc";
+import { shareAnchorFrom } from "../utils/share-link";
 
 export interface ToolbarProps {
   addressBarRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -45,11 +46,8 @@ function ShareButton({ path }: { path: string }): React.ReactElement {
   const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    // Capture the rect synchronously — it's viewport-relative and goes stale
-    // if the pane scrolls between click and native display.
-    const r = e.currentTarget.getBoundingClientRect();
     void tauriIpc
-      .shareFile?.([path], { x: r.x, y: r.y, width: r.width, height: r.height })
+      .shareFile?.([path], shareAnchorFrom(e.currentTarget))
       .catch(() => {
         // Share errors (path vanished, non-macOS) fail silently, matching
         // CopyPathButton's clipboard fallback.

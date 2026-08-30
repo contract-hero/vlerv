@@ -14,7 +14,7 @@ import * as React from "react";
 import { useSettings } from "../hooks/useSettings";
 import type { UseSettingsState } from "../hooks/useSettings";
 import { defaultIpc } from "../ipc";
-import type { RemoteScope } from "../ipc";
+import type { RemotePresenceEvent, RemoteScope } from "../ipc";
 import { useRemoteActions, useRemoteState } from "../state/remote";
 import { usePlatform } from "../state/platform";
 import CopyLinkButton from "./CopyLinkButton";
@@ -30,7 +30,7 @@ const SCOPE_LABEL: Record<RemoteScope, string> = {
   control: "Control",
 };
 
-const PRESENCE_LABEL: Record<string, string> = {
+const PRESENCE_LABEL: Record<RemotePresenceEvent["state"], string> = {
   online: "Online",
   connecting: "Connecting…",
   offline: "Offline",
@@ -91,12 +91,12 @@ function RemoteSettings({
   setStateField,
 }: {
   ipc: typeof defaultIpc;
-  state: UseSettingsState | null;
+  state: UseSettingsState;
   setStateField: (key: string, value: unknown) => Promise<void>;
 }): React.ReactElement {
   const { peers, presence, invite, pairingBusy, pairingError } = useRemoteState();
   const { beginPairing, dismissInvite, unpair, setScope, subscribePeer } = useRemoteActions();
-  const listenOn = state?.preferences?.remote_listen ?? false;
+  const listenOn = state.preferences?.remote_listen ?? false;
 
   return (
     <Section
@@ -133,7 +133,7 @@ function RemoteSettings({
             </p>
             <div className="settings-actions">
               <CopyLinkButton link={invite.link} />
-              <ShareLinkButton ipc={ipc} link={invite.link} title="Vlervtifacts pairing link" />
+              <ShareLinkButton ipc={ipc} link={invite.link} sheetTitle="Vlervtifacts pairing link" />
               <button type="button" className="button button-secondary" onClick={dismissInvite}>
                 Done
               </button>
@@ -164,12 +164,12 @@ function RemoteSettings({
                       className={`remote-presence-dot remote-presence-${peerPresence}`}
                       aria-hidden
                     />
-                    {peer.device}
+                    <span className="settings-peer-label">{peer.device}</span>
                   </span>
                   {/* The dot alone carries presence only in a tooltip, which
                       a touch device never shows — so the word is here too. */}
                   <span className="settings-peer-meta" title={peer.node_id}>
-                    {PRESENCE_LABEL[peerPresence] ?? peerPresence} · {peer.node_id.slice(0, 12)}…
+                    {PRESENCE_LABEL[peerPresence]} · {peer.node_id.slice(0, 12)}…
                   </span>
                 </div>
                 <div className="settings-peer-actions">

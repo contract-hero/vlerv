@@ -611,6 +611,12 @@ Quick Open, the context menu and the toast share one shape: `{colors.bg-elevated
 fill, 12px corners, `{colors.border-strong}` hairline, shadow, edge highlight.
 The scrim behind Quick Open is pure black — 60% in dark, 25% in light.
 
+Their order is a scale, not a set of numbers: `--z-sheet` (the iOS bottom
+sheets) → `--z-overlay` (app-modal: Quick Open, Settings) → `--z-popover`
+(anchored to its trigger) → `--z-overlay-raised` (an overlay that must be
+readable OVER another one — the pairing dialog, which arrives while Settings
+is open) → `--z-menu`. A new overlay picks a token, never a fresh number.
+
 Quick Open truncates paths at the **tail**; the start page truncates at the
 **head**. The difference is not decoration. Quick Open paths are relative to the
 workspace root, so the leading segment is the repo name — the one part that

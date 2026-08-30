@@ -7,20 +7,19 @@
 // silently does nothing on tap is worse than no button (see `shareLinkRoute`).
 import * as React from "react";
 import { Share } from "lucide-react";
-import { tauriIpc } from "../ipc";
 import type { IpcSurface } from "../ipc";
 import { usePlatform } from "../state/platform";
-import { shareLinkRoute, shareLinkViaWebShare } from "../utils/share-link";
+import { shareAnchorFrom, shareLinkRoute, shareLinkViaWebShare } from "../utils/share-link";
 
 export default function ShareLinkButton({
   link,
-  title,
-  ipc = tauriIpc,
+  sheetTitle,
+  ipc,
 }: {
   link: string;
-  /** Names the sheet on iOS, and the button for a screen reader. */
-  title: string;
-  ipc?: IpcSurface;
+  /** Names the sheet on iOS. The button's own name is its visible label. */
+  sheetTitle: string;
+  ipc: IpcSurface;
 }): React.ReactElement | null {
   const { isIos } = usePlatform();
   const route = shareLinkRoute(isIos, ipc, globalThis.navigator);
@@ -30,15 +29,10 @@ export default function ShareLinkButton({
     if (route === "web-share") {
       // Share failures stay silent, matching Preview's Share button: the OS
       // sheet already reported anything the user needs to see.
-      void shareLinkViaWebShare(globalThis.navigator, link, title).catch(() => {});
+      void shareLinkViaWebShare(globalThis.navigator, link, sheetTitle).catch(() => {});
       return;
     }
-    // The anchor is viewport-relative and goes stale if the panel scrolls
-    // between click and native display, so read it synchronously.
-    const r = e.currentTarget.getBoundingClientRect();
-    void ipc
-      .shareLink?.(link, { x: r.x, y: r.y, width: r.width, height: r.height })
-      .catch(() => {});
+    void ipc.shareLink?.(link, shareAnchorFrom(e.currentTarget)).catch(() => {});
   };
 
   return (
@@ -47,7 +41,6 @@ export default function ShareLinkButton({
       className="button button-secondary"
       data-testid="share-link"
       title="Share…"
-      aria-label={title}
       onClick={handleClick}
     >
       <Share size={13} strokeWidth={2} />
