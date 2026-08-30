@@ -21,8 +21,11 @@ export function shareAnchorFrom(el: Element): ShareAnchor {
 export type ShareLinkRoute = "native" | "web-share" | "unavailable";
 
 /** The subset of `navigator` this module uses. Narrow on purpose: it is the
- *  seam the tests substitute. */
+ *  seam the tests substitute. `canShare` matters as much as `share` here —
+ *  it is the only way to test a payload without spending the one-shot user
+ *  activation that `share` consumes. */
 export interface WebShareTarget {
+  canShare?(data: { title?: string; text?: string; url?: string }): boolean;
   share?(data: { title?: string; text?: string; url?: string }): Promise<void>;
 }
 
@@ -42,13 +45,18 @@ export function isShareAbort(err: unknown): boolean {
 }
 
 /**
- * Share `link` through the Web Share sheet.
+ * Share `link` through the Web Share sheet, in exactly ONE `share()` call.
  *
- * `url` goes first because it is what puts AirDrop in the sheet — the
- * recipient gets something tappable that the `vlerv://` handler opens. WebKit
- * rejects a `url` whose scheme it will not build a URL from, so a rejection
- * retries the same link as text, which is what Messages and Mail transmit
- * anyway. A dismissal is not retried.
+ * `url` is the payload that puts AirDrop in the sheet, so it wins wherever the
+ * webview will take it. But `share()` requires transient user activation and
+ * CONSUMES it: a second call after a rejection always fails with
+ * NotAllowedError, so the choice has to happen BEFORE the first call, not
+ * after. `canShare` answers exactly that — it runs the same URL validation and
+ * spends nothing. Where `canShare` is missing, `url` is the better guess: it is
+ * the payload this feature exists for.
+ *
+ * A dismissal rejects with AbortError and is not a failure. Anything else
+ * reaches the caller, which is what puts it in front of the user.
  */
 export async function shareLinkViaWebShare(
   nav: WebShareTarget | undefined,
@@ -57,10 +65,11 @@ export async function shareLinkViaWebShare(
 ): Promise<void> {
   const share = nav?.share?.bind(nav);
   if (!share) throw new Error("share-link: Web Share is unavailable in this webview");
+  const asUrl = { title, url: link };
+  const data = nav?.canShare && !nav.canShare(asUrl) ? { title, text: link } : asUrl;
   try {
-    await share({ title, url: link });
+    await share(data);
   } catch (err) {
-    if (isShareAbort(err)) return;
-    await share({ title, text: link });
+    if (!isShareAbort(err)) throw err;
   }
 }

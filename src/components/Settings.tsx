@@ -312,7 +312,7 @@ function DesktopSettings({
         </div>
       </Section>
 
-      <Section title="Ignore Set" hint="Artifacts matching these globs stay out of the tree.">
+      <Section title="Ignore Set" hint="Saved, but not applied yet — the tree still filters on the built-in set.">
         {ignoreGlobs.length === 0 ? (
           <p className="settings-empty">Nothing ignored beyond the built-in set.</p>
         ) : (

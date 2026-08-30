@@ -50,25 +50,52 @@ describe("isShareAbort", () => {
 describe("shareLinkViaWebShare", () => {
   it("shares the link as a URL, which is what offers AirDrop", async () => {
     const share = vi.fn().mockResolvedValue(undefined);
-    await shareLinkViaWebShare({ share } as WebShareTarget, LINK, "Pair");
+    const canShare = vi.fn().mockReturnValue(true);
+    await shareLinkViaWebShare({ canShare, share } as WebShareTarget, LINK, "Pair");
     expect(share).toHaveBeenCalledTimes(1);
     expect(share).toHaveBeenCalledWith({ title: "Pair", url: LINK });
   });
 
-  it("retries as text when the webview rejects the scheme", async () => {
-    const share = vi
-      .fn()
-      .mockRejectedValueOnce(new TypeError("unsupported URL"))
-      .mockResolvedValueOnce(undefined);
-    await shareLinkViaWebShare({ share } as WebShareTarget, LINK, "Pair");
-    expect(share).toHaveBeenCalledTimes(2);
-    expect(share).toHaveBeenLastCalledWith({ title: "Pair", text: LINK });
+  it("falls back to text when the webview will not take the scheme as a URL", async () => {
+    const share = vi.fn().mockResolvedValue(undefined);
+    const canShare = vi.fn().mockReturnValue(false);
+    await shareLinkViaWebShare({ canShare, share } as WebShareTarget, LINK, "Pair");
+    expect(canShare).toHaveBeenCalledWith({ title: "Pair", url: LINK });
+    expect(share).toHaveBeenCalledTimes(1);
+    expect(share).toHaveBeenCalledWith({ title: "Pair", text: LINK });
   });
 
-  it("does not retry after the user dismisses the sheet", async () => {
+  it("never calls share twice — the second call would have no user activation", async () => {
+    // The regression this guards: share() consumes transient activation, so a
+    // retry after a rejection always fails with NotAllowedError. One click,
+    // one call, whatever the outcome.
+    const share = vi.fn().mockRejectedValue(new TypeError("unsupported URL"));
+    const canShare = vi.fn().mockReturnValue(true);
+    await expect(
+      shareLinkViaWebShare({ canShare, share } as WebShareTarget, LINK, "Pair"),
+    ).rejects.toThrow(TypeError);
+    expect(share).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the URL when the webview cannot be asked", async () => {
+    // No canShare: url is the payload the feature exists for, so it is the
+    // better guess.
+    const share = vi.fn().mockResolvedValue(undefined);
+    await shareLinkViaWebShare({ share } as WebShareTarget, LINK, "Pair");
+    expect(share).toHaveBeenCalledWith({ title: "Pair", url: LINK });
+  });
+
+  it("treats a dismissal as success, so the button reports nothing", async () => {
     const share = vi.fn().mockRejectedValue(abortError());
     await shareLinkViaWebShare({ share } as WebShareTarget, LINK, "Pair");
     expect(share).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates every other failure so the caller can surface it", async () => {
+    const share = vi.fn().mockRejectedValue(new DOMException("no activation", "NotAllowedError"));
+    await expect(
+      shareLinkViaWebShare({ share } as WebShareTarget, LINK, "Pair"),
+    ).rejects.toThrow(/no activation/);
   });
 
   it("rejects when the webview has no Web Share at all", async () => {
