@@ -99,8 +99,8 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
     // Both peer stores, written the way `confirm_pairing` writes them. The
     // scope on each side governs what the OTHER machine may do there.
     let mcp_id = core.node_id().unwrap();
-    core.peer_store().upsert(&host.node_id(), "Val's iPhone", Scope::ViewOpen).unwrap();
-    host.peers.upsert(&mcp_id, core.device(), Scope::Browse).unwrap();
+    core.peer_store().seed(&host.node_id(), "Val's iPhone", Scope::ViewOpen).unwrap();
+    host.peers.seed(&mcp_id, core.device(), Scope::Browse).unwrap();
 
     // ── Without the control grant, the send is refused with an instruction ──
     let err = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap_err();
@@ -122,6 +122,11 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
     assert_eq!(delivery.size, body.len() as u64, "the receiver reports the bytes it measured");
     assert_eq!(delivery.device, "Val's iPhone");
     assert_eq!(delivery.node_id, host.node_id());
+
+    // The session this first successful send established. Every later send
+    // must reuse it — checked once the sends are done.
+    let first_session = core.cached_session_id(&host.node_id()).await;
+    assert!(first_session.is_some(), "the send cached its session");
 
     let landed = host.received();
     assert_eq!(landed.len(), 1, "the host surfaced exactly one artifact");
@@ -153,8 +158,17 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
         "only files can be beamed"
     );
 
-    // ── Four sends over one device are still ONE session ──────────────────
-    assert_eq!(core.cached_sessions().await, 1, "sessions are reused, not stacked");
+    // ── Four sends over one device reuse ONE session ──────────────────────
+    // Identity, not count: the map is keyed by node id, so its length is 1
+    // whether or not the cache-hit path works. Only a stable `Arc` across the
+    // sends shows the connection was reused instead of re-dialled each time.
+    assert_eq!(core.cached_sessions().await, 1);
+    let reused = core.cached_session_id(&host.node_id()).await;
+    assert!(reused.is_some(), "the successful sends left a cached session");
+    assert_eq!(
+        reused, first_session,
+        "every send after the control grant reused one session, and did not re-handshake"
+    );
 
     // ── Revocation on the device takes effect on the next call ─────────────
     host.peers.remove(&mcp_id).unwrap();
@@ -260,8 +274,8 @@ async fn list_devices_and_server_status_report_what_the_tools_did() {
     assert!(core.stop_beam(None).await.unwrap().is_empty());
 
     // ── Presence: unknown until something dials ────────────────────────────
-    core.peer_store().upsert(&host.node_id(), "Mac Studio", Scope::ViewOpen).unwrap();
-    host.peers.upsert(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
+    core.peer_store().seed(&host.node_id(), "Mac Studio", Scope::ViewOpen).unwrap();
+    host.peers.seed(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
     let quiet = core.list_devices(false).await;
     assert_eq!(quiet.len(), 1);
     assert_eq!(quiet[0].device, "Mac Studio");
@@ -302,7 +316,7 @@ async fn a_send_to_a_device_that_is_not_there_never_opens_a_socket() {
     assert_eq!(err, ResolveError::NotPaired.to_string());
 
     // Paired but misnamed: the error lists the names that ARE valid.
-    core.peer_store().upsert(&"ab".repeat(32), "Mac Studio", Scope::Control).unwrap();
+    core.peer_store().seed(&"ab".repeat(32), "Mac Studio", Scope::Control).unwrap();
     let err = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap_err();
     assert!(err.contains("Mac Studio (ababababab)"), "{err}");
 

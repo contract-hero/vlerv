@@ -183,6 +183,10 @@ export function RemoteProvider({
         break;
       case "pair-pending":
         setPairingBusy(false);
+        // A new pairing starts clean. `pairingError` is shared by both faces
+        // of the dialog, so a leftover from an earlier failed dial would
+        // otherwise render above this fingerprint as if it belonged to it.
+        setPairingError(null);
         setPendingConfirm({
           node_id: event.peer,
           device: event.device,
@@ -276,7 +280,12 @@ export function RemoteProvider({
     [ipc],
   );
 
-  const dismissPairLink = React.useCallback(() => setPairLinkArrival(null), []);
+  const dismissPairLink = React.useCallback(() => {
+    setPairLinkArrival(null);
+    // Clear the error with the dialog that owns it, or it reappears on the
+    // next pairing surface.
+    setPairingError(null);
+  }, []);
 
   const confirmPairing = React.useCallback(
     (accept: boolean, scope?: RemoteScope) => {

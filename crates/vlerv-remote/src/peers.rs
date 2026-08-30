@@ -203,7 +203,11 @@ impl PeerStore {
     /// Insert or update a peer, preserving `paired_at` and the granted scope
     /// of an existing entry — re-pairing an already-trusted machine must not
     /// silently widen or reset its grant.
-    pub fn upsert(&self, node_id: &str, device: &str, scope: Scope) -> Result<Peer, String> {
+    /// Seed a peer directly. Test and fixture use only — production pairs
+    /// through `confirm` and refreshes through `refresh_device`, so that no
+    /// live path can create a peer without a human confirming it.
+    #[doc(hidden)]
+    pub fn seed(&self, node_id: &str, device: &str, scope: Scope) -> Result<Peer, String> {
         self.write(node_id, device, scope, None)
     }
 
@@ -213,10 +217,12 @@ impl PeerStore {
     /// narrows it. `None` means the operator named no scope: keep an existing
     /// entry's grant, and give a new entry `DEFAULT_SCOPE`.
     ///
-    /// This is the difference from `upsert`, which is the PASSIVE path — a
-    /// handshake refreshing a device name — and never moves a grant at all.
-    /// A confirm path that called `upsert` would report the scope the human
-    /// picked while writing the wider one already on disk.
+    /// This is the difference from `refresh_device`, the PASSIVE path — a
+    /// handshake keeping a stored name current — which never moves a grant.
+    /// A confirm path that used the passive writer would silently DISCARD the
+    /// grant the human picked: the store keeps the wider scope, and every
+    /// caller echoes back the scope the store returned, so the narrowing
+    /// disappears with no error anywhere.
     pub fn confirm(&self, node_id: &str, device: &str, grant: Option<Scope>) -> Result<Peer, String> {
         self.write(node_id, device, grant.unwrap_or(DEFAULT_SCOPE), grant)
     }
@@ -236,76 +242,120 @@ impl PeerStore {
         regrant: Option<Scope>,
     ) -> Result<Peer, String> {
         let now = now_unix();
-        let peer = {
-            let mut peers = self.guard();
-            match peers.iter_mut().find(|p| p.node_id == node_id) {
-                Some(existing) => {
-                    existing.device = device.to_string();
-                    existing.last_seen = now;
-                    if let Some(scope) = regrant {
-                        existing.scope = scope;
-                    }
-                    existing.clone()
+        // DISK FIRST, then memory. The in-memory list IS the handshake
+        // allowlist (`get`, read by `ScopeServer::accept`), so mutating it
+        // before the write lands would leave a device trusted for the life of
+        // the process after `save_list` refused — while the caller returned an
+        // error saying it was not paired. The guard is held across the write so
+        // no other writer can interleave between the save and the commit.
+        let mut peers = self.guard();
+        let mut next = peers.clone();
+        let peer = match next.iter_mut().find(|p| p.node_id == node_id) {
+            Some(existing) => {
+                existing.device = device.to_string();
+                existing.last_seen = now;
+                if let Some(scope) = regrant {
+                    existing.scope = scope;
                 }
-                None => {
-                    let peer = Peer {
-                        node_id: node_id.to_string(),
-                        device: device.to_string(),
-                        scope: on_insert,
-                        paired_at: now,
-                        last_seen: now,
-                    };
-                    peers.push(peer.clone());
-                    peer
-                }
+                existing.clone()
+            }
+            None => {
+                let peer = Peer {
+                    node_id: node_id.to_string(),
+                    device: device.to_string(),
+                    scope: on_insert,
+                    paired_at: now,
+                    last_seen: now,
+                };
+                next.push(peer.clone());
+                peer
             }
         };
-        self.save()?;
+        self.save_list(&next)?;
+        *peers = next;
         Ok(peer)
     }
 
-    /// Revocation. Returns true when an entry actually went away.
-    pub fn remove(&self, node_id: &str) -> Result<bool, String> {
-        let removed = {
-            let mut peers = self.guard();
-            let before = peers.len();
-            peers.retain(|p| p.node_id != node_id);
-            peers.len() != before
-        };
-        if removed {
-            self.save()?;
+    /// Refresh a peer this store ALREADY trusts: its announced device name and
+    /// `last_seen`, never its grant, and never an entry that is not there.
+    /// Returns false when the peer is gone.
+    ///
+    /// The handshake path runs this after its allowlist check, with an await
+    /// in between. An insert-or-update writer there would let a peer revoked
+    /// inside that window write itself back into the store with its old scope,
+    /// which is a revocation the peer itself can undo by stalling its `Hello`.
+    pub fn refresh_device(&self, node_id: &str, device: &str) -> Result<bool, String> {
+        let mut peers = self.guard();
+        if !peers.iter().any(|p| p.node_id == node_id) {
+            return Ok(false);
         }
-        Ok(removed)
+        let mut next = peers.clone();
+        if let Some(existing) = next.iter_mut().find(|p| p.node_id == node_id) {
+            existing.device = device.to_string();
+            existing.last_seen = now_unix();
+        }
+        self.save_list(&next)?;
+        *peers = next;
+        Ok(true)
     }
 
+    /// Revocation. Returns true when an entry actually went away.
+    ///
+    /// MEMORY FIRST here, unlike every other writer, and deliberately: this is
+    /// the one operation whose safe failure mode is to take effect anyway. The
+    /// peer stops being trusted the moment it leaves the list, and a refused
+    /// write costs the revocation only on the next restart — whereas saving
+    /// first would leave a peer the operator just revoked trusted in memory.
+    /// The `Err` still reaches the caller, so the failure is not silent.
+    pub fn remove(&self, node_id: &str) -> Result<bool, String> {
+        let mut peers = self.guard();
+        let before = peers.len();
+        peers.retain(|p| p.node_id != node_id);
+        if peers.len() == before {
+            return Ok(false);
+        }
+        self.save_list(&peers)?;
+        Ok(true)
+    }
+
+    /// Move a peer's grant. Disk before memory, for the same reason as
+    /// `write`: a refused write must not leave a WIDENED grant live in the
+    /// allowlist while the caller is told the change failed.
     pub fn set_scope(&self, node_id: &str, scope: Scope) -> Result<(), String> {
-        {
-            let mut peers = self.guard();
-            let Some(peer) = peers.iter_mut().find(|p| p.node_id == node_id) else {
-                return Err("unknown peer".to_string());
-            };
+        let mut peers = self.guard();
+        if !peers.iter().any(|p| p.node_id == node_id) {
+            return Err("unknown peer".to_string());
+        }
+        let mut next = peers.clone();
+        if let Some(peer) = next.iter_mut().find(|p| p.node_id == node_id) {
             peer.scope = scope;
         }
-        self.save()
+        self.save_list(&next)?;
+        *peers = next;
+        Ok(())
     }
 
     /// Record activity. Best-effort: a failed write must not fail a request.
+    /// `last_seen` carries no authority, so this one may diverge from disk.
     pub fn touch(&self, node_id: &str) {
-        {
-            let mut peers = self.guard();
-            let Some(peer) = peers.iter_mut().find(|p| p.node_id == node_id) else {
-                return;
-            };
-            peer.last_seen = now_unix();
-        }
-        if let Err(e) = self.save() {
+        let mut peers = self.guard();
+        let Some(peer) = peers.iter_mut().find(|p| p.node_id == node_id) else {
+            return;
+        };
+        peer.last_seen = now_unix();
+        if let Err(e) = self.save_list(&peers) {
             eprintln!("vlerv: remote: cannot persist peers.json: {e}");
         }
     }
 
     /// Atomic write (tmp + rename), 0600 — the file names the machines this
     /// install trusts.
-    fn save(&self) -> Result<(), String> {
+    ///
+    /// Takes the list to write rather than reading `self.inner`, so a caller
+    /// can persist a CANDIDATE list before committing it to memory. That
+    /// ordering is what keeps a refused write from leaving a peer trusted —
+    /// see `write`. Never locks: the caller already holds the guard.
+    fn save_list(&self, peers: &[Peer]) -> Result<(), String> {
         // A store that did not load holds no peers; writing it would replace a
         // corrupt-but-real file with an empty (or one-entry) document and lose
         // every pairing. Refuse, and tell the caller where the file is.
@@ -316,7 +366,7 @@ impl PeerStore {
                 self.path
             ));
         }
-        let doc = PeersDoc { v: PEERS_SCHEMA, peers: self.guard().clone() };
+        let doc = PeersDoc { v: PEERS_SCHEMA, peers: peers.to_vec() };
         let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
@@ -612,7 +662,7 @@ mod tests {
         assert!(s.list().is_empty());
         assert!(s.is_empty());
 
-        s.upsert("nodeA", "Mac Studio", Scope::Browse).unwrap();
+        s.seed("nodeA", "Mac Studio", Scope::Browse).unwrap();
         assert_eq!(s.list().len(), 1);
 
         // A fresh load sees the persisted entry — this is what survives a
@@ -625,16 +675,63 @@ mod tests {
     }
 
     #[test]
-    fn upsert_keeps_the_granted_scope_of_an_existing_peer() {
+    fn refresh_device_updates_the_name_and_never_the_grant() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = store(&dir);
-        s.upsert("nodeA", "Mac Studio", Scope::Control).unwrap();
-        // Re-pairing must not silently reset the grant in either direction.
-        s.upsert("nodeA", "Mac Studio (renamed)", Scope::ViewOpen).unwrap();
+        s.seed("nodeA", "Mac Studio", Scope::Control).unwrap();
+        assert!(s.refresh_device("nodeA", "Mac Studio (renamed)").unwrap());
         let peer = s.get("nodeA").unwrap();
-        assert_eq!(peer.scope, Scope::Control);
+        assert_eq!(peer.scope, Scope::Control, "the passive path never moves a grant");
         assert_eq!(peer.device, "Mac Studio (renamed)");
-        assert_eq!(s.list().len(), 1, "upsert must not duplicate");
+        assert_eq!(s.list().len(), 1, "refresh must not duplicate");
+    }
+
+    #[test]
+    fn a_revoked_peer_is_never_re_created_by_a_handshake_refresh() {
+        // The revocation race: `ScopeServer::accept` checks the allowlist,
+        // then awaits the peer's `Hello` for up to HANDSHAKE_TIMEOUT, then
+        // refreshes the stored name. An insert-or-update writer there let a
+        // peer revoked inside that window write itself back with its old
+        // scope — a revocation the peer could undo by stalling its `Hello`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = store(&dir);
+        s.seed("nodeA", "iPhone", Scope::Control).unwrap();
+        assert!(s.remove("nodeA").unwrap());
+
+        assert!(
+            !s.refresh_device("nodeA", "iPhone").unwrap(),
+            "a refresh must report the peer is gone, not re-create it"
+        );
+        assert!(s.get("nodeA").is_none(), "still revoked in memory");
+        assert!(store(&dir).get("nodeA").is_none(), "and still revoked on disk");
+    }
+
+    #[test]
+    fn a_write_that_cannot_reach_disk_grants_nothing_in_memory_either() {
+        // The in-memory list IS the handshake allowlist, so a refused write
+        // must not leave a device trusted while the caller is told it failed.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("peers.json"), "{not json").unwrap();
+        let s = store(&dir);
+        assert!(s.load_error().is_some(), "the store must have refused to load");
+
+        assert!(s.confirm("nodeA", "iPhone", Some(Scope::Control)).is_err());
+        assert!(s.get("nodeA").is_none(), "a failed confirm trusts nobody");
+        assert!(s.list().is_empty());
+
+        // And the narrower case that this branch newly made reachable: a
+        // failed write must not WIDEN a peer that is already there.
+        let clean = tempfile::TempDir::new().unwrap();
+        let good = store(&clean);
+        good.seed("nodeB", "iPad", Scope::ViewOpen).unwrap();
+        std::fs::write(clean.path().join("peers.json"), "{not json").unwrap();
+        let reloaded = store(&clean);
+        assert!(reloaded.confirm("nodeB", "iPad", Some(Scope::Control)).is_err());
+        assert!(reloaded.set_scope("nodeB", Scope::Control).is_err());
+        assert!(
+            reloaded.get("nodeB").is_none(),
+            "a store that did not load trusts nobody, widened or otherwise"
+        );
     }
 
     #[test]
@@ -670,7 +767,7 @@ mod tests {
     fn revocation_is_deleting_the_entry() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = store(&dir);
-        s.upsert("nodeA", "Mac Studio", Scope::Browse).unwrap();
+        s.seed("nodeA", "Mac Studio", Scope::Browse).unwrap();
         assert!(s.remove("nodeA").unwrap());
         assert!(s.get("nodeA").is_none(), "a revoked peer fails the allowlist check");
         assert!(!s.remove("nodeA").unwrap(), "removing twice is not an error");
@@ -682,7 +779,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let s = store(&dir);
         assert!(s.set_scope("ghost", Scope::Control).is_err());
-        s.upsert("nodeA", "d", Scope::ViewOpen).unwrap();
+        s.seed("nodeA", "d", Scope::ViewOpen).unwrap();
         s.set_scope("nodeA", Scope::Control).unwrap();
         assert_eq!(store(&dir).get("nodeA").unwrap().scope, Scope::Control);
     }
@@ -710,7 +807,7 @@ mod tests {
     fn peers_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        store(&dir).upsert("nodeA", "d", Scope::ViewOpen).unwrap();
+        store(&dir).seed("nodeA", "d", Scope::ViewOpen).unwrap();
         let mode = std::fs::metadata(dir.path().join("peers.json")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
