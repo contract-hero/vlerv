@@ -70,6 +70,23 @@
      at least this tall; widths still vary with the control. */
   --tap-min: 44px;
 
+  /* Layer order, lowest first. Every overlay picks from this scale instead of
+     a fresh number, so the ordering reads on one screen rather than out of a
+     dozen rules 500 lines apart.
+       sheet   — the iOS bottom sheets, inside the phone shell
+       overlay — app-modal surfaces: Quick Open, Settings
+       popover — anchored to a trigger, above the surface it belongs to
+       raised  — an overlay that must survive OVER another overlay. The
+                 pairing dialog is the case: it arrives while Settings is
+                 open (Settings is where the link was minted) and six
+                 fingerprint words behind a dialog cannot be compared.
+       menu    — the context menu, which can open from anything above */
+  --z-sheet: 40;
+  --z-overlay: 100;
+  --z-popover: 120;
+  --z-overlay-raised: 150;
+  --z-menu: 200;
+
   /* motion */
   --dur-fast: 80ms;
   --dur: 160ms;
@@ -1267,7 +1284,7 @@ html, body, #root {
 .quick-open-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-overlay);
   background: var(--overlay-scrim);
   display: flex;
   align-items: flex-start;
@@ -1351,7 +1368,7 @@ html, body, #root {
 /* ── Context menu ─────────────────────────────────────────────────────── */
 .context-menu {
   position: fixed;
-  z-index: 200;
+  z-index: var(--z-menu);
   min-width: 180px;
   background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
@@ -1448,13 +1465,10 @@ pre {
 .beam-backdrop {
   position: fixed;
   inset: 0;
-  /* Above .settings-backdrop (100), not level with it. A `vlerv://pair` link
-     can arrive while Settings is open — in fact that is the common case,
-     since Settings is where the link was minted — and the six-word
-     fingerprint step is the one thing that must never be obscured: the user
-     cannot compare words they cannot see. DOM order alone decided this
-     before, and Settings mounts last. */
-  z-index: 150;
+  /* Raised, not level with Settings: the pairing dialog has to be readable
+     over it (see the --z-* scale). DOM order alone decided this before, and
+     Settings mounts last. */
+  z-index: var(--z-overlay-raised);
   background: var(--overlay-scrim);
   display: flex;
   align-items: flex-start;
@@ -1552,19 +1566,25 @@ pre {
   margin-top: var(--space-4);
   /* .button carries --space-1 margins; the row only aligns them. */
 }
-.beam-link-input {
+/* The field box, shared with .settings-input further down (both render in
+   the Settings panel). Only the type and the top margin differ per class. */
+.beam-link-input,
+.settings-input {
   width: 100%;
-  margin-top: var(--space-3);
   padding: 7px 10px;
-  font-family: var(--font-mono);
-  font-size: var(--text-caption);
   color: var(--fg);
   background: var(--bg-chrome);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   outline: none;
 }
-.beam-link-input:focus { border-color: var(--input-border-focus); }
+.beam-link-input:focus,
+.settings-input:focus { border-color: var(--input-border-focus); }
+.beam-link-input {
+  margin-top: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+}
 .beam-progress {
   margin-top: var(--space-4);
   height: 4px;
@@ -1616,12 +1636,12 @@ pre {
   transition: background var(--dur-fast) var(--ease);
 }
 .beam-indicator:hover { background: var(--button-hover-bg); }
-.beam-popover-scrim { position: fixed; inset: 0; z-index: 119; }
+.beam-popover-scrim { position: fixed; inset: 0; z-index: calc(var(--z-popover) - 1); }
 .beam-popover {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  z-index: 120;
+  z-index: var(--z-popover);
   width: 280px;
   padding: var(--space-2);
   background: var(--bg-elevated);
@@ -1741,7 +1761,7 @@ pre {
 .settings-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-overlay);
   background: var(--overlay-scrim);
   display: flex;
   align-items: flex-start;
@@ -1778,12 +1798,17 @@ pre {
   letter-spacing: var(--track-headline);
   color: var(--heading-fg);
 }
-.settings-section-hint {
-  margin: var(--space-1) 0 0;
+/* The panel's caption voice: every explanatory line under a heading, a
+   control or a row. One rule, so the iOS size bump has one place to reach. */
+.settings-section-hint,
+.settings-row-hint,
+.settings-peer-meta,
+.settings-empty {
   font-size: var(--text-caption);
   line-height: 1.5;
   color: var(--fg-muted);
 }
+.settings-section-hint { margin: var(--space-1) 0 0; }
 .settings-section-hint code {
   padding: 1px 4px;
   border-radius: var(--r-xs);
@@ -1799,11 +1824,7 @@ pre {
   color: var(--fg-muted);
 }
 .settings-block { margin-top: var(--space-3); }
-.settings-empty {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-caption);
-  color: var(--fg-muted);
-}
+.settings-empty { margin: var(--space-2) 0 0; }
 
 /* Roots, globs and peers all live in the same hairline-bounded list, so
    three different collections read as one kind of object. */
@@ -1856,7 +1877,6 @@ pre {
   gap: 2px;
 }
 .settings-row-label { font-size: var(--text-body-sm); color: var(--fg); }
-.settings-row-hint { font-size: var(--text-caption); color: var(--fg-muted); }
 
 /* The switch — a checkbox wearing the platform's affordance, in place of a
    13px tick box no thumb can hit. */
@@ -1901,19 +1921,8 @@ pre {
   color: var(--fg);
   cursor: pointer;
 }
-.settings-input {
-  width: 100%;
-  margin-top: var(--space-2);
-  padding: 7px 10px;
-  font: inherit;
-  font-size: var(--text-body-sm);
-  color: var(--fg);
-  background: var(--bg-chrome);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  outline: none;
-}
-.settings-input:focus { border-color: var(--input-border-focus); }
+/* Box comes from the shared rule beside .beam-link-input. */
+.settings-input { margin-top: var(--space-2); font: inherit; font-size: var(--text-body-sm); }
 .settings-select {
   padding: 4px 6px;
   font: inherit;
@@ -1958,13 +1967,18 @@ pre {
 .settings-peer-name {
   display: flex;
   align-items: center;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
   font-size: var(--text-body-sm);
   color: var(--fg);
 }
-.settings-peer-meta { font-size: var(--text-caption); color: var(--fg-muted); }
+/* text-overflow does nothing on the flex row above, so the device name — the
+   one part long enough to overflow a phone — truncates in its own box. */
+.settings-peer-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .settings-peer-actions {
   flex: 0 0 auto;
   display: flex;
@@ -2100,7 +2114,7 @@ body.platform-ios .remote-follow-toggle {
 .phone-scrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: var(--z-sheet);
   border: none;
   padding: 0;
   background: var(--overlay-scrim);
@@ -2110,7 +2124,7 @@ body.platform-ios .remote-follow-toggle {
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 41;
+  z-index: calc(var(--z-sheet) + 1);
   max-height: 78%;
   display: flex;
   flex-direction: column;
@@ -2177,27 +2191,29 @@ body.platform-ios .settings-panel {
   gap: var(--space-6);
   padding: var(--space-3) var(--space-4) var(--space-5);
 }
-body.platform-ios .settings-section-title { font-size: var(--text-body); }
+body.platform-ios .settings-section-title,
+body.platform-ios .settings-row-label,
+body.platform-ios .settings-peer-name {
+  font-size: var(--text-body);
+}
 /* One step up for every explanatory line too: 12px is a desktop caption size
-   and reads as fine print at arm's length. */
-body.platform-ios .settings-row-label { font-size: var(--text-body); }
-body.platform-ios .settings-section-hint,
-body.platform-ios .settings-row-hint,
-body.platform-ios .settings-peer-meta,
-body.platform-ios .settings-empty,
-body.platform-ios .settings-panel .beam-hint {
+   and reads as fine print at arm's length. Scoped to the panel, because
+   `.beam-hint` also belongs to the Beam dialogs, which keep their size. */
+body.platform-ios .settings-panel :is(
+  .settings-section-hint,
+  .settings-row-hint,
+  .settings-peer-meta,
+  .settings-empty,
+  .beam-hint
+) {
   font-size: var(--text-body-sm);
 }
-body.platform-ios .settings-peer-name { font-size: var(--text-body); }
-body.platform-ios .settings-row,
-body.platform-ios .settings-list-row,
-body.platform-ios .settings-choice {
-  min-height: var(--tap-min);
-}
+/* Only the controls the phone actually renders: the desktop-only sections
+   (roots, globs, drag-out, Slack) never mount here. */
+body.platform-ios .settings-row { min-height: var(--tap-min); }
 /* 16px is also what stops iOS from zooming the viewport when a field takes
    focus, so the reading size and the no-zoom size are the same number. */
 body.platform-ios .settings-panel .button,
-body.platform-ios .settings-input,
 body.platform-ios .settings-select {
   min-height: var(--tap-min);
   font-size: var(--text-body);

@@ -5,28 +5,28 @@
 // `vlerv://` pairing / beam tickets). They share the picker and the anchor;
 // only the pasteboard item and the admission check differ.
 
+use crate::deeplink::DeepLinkIntent;
 use crate::security::{self, RootSet};
 
-/// The one scheme `share_link` hands to the OS. Every link the UI offers to
-/// share is a `vlerv://pair?…` or `vlerv://receive?…` ticket, so a one-entry
-/// allowlist costs nothing and keeps a mis-wired caller from pushing
-/// `file://` (a path leak) or `javascript:` into the share sheet.
-const LINK_SCHEME: &str = "vlerv://";
-
-/// Admit a link to the share sheet. Scheme-checked, and rejected outright if
-/// it carries whitespace or control characters — those cannot survive a round
-/// trip through a message body, so the recipient would get a link that no
-/// longer opens. Pure, so it is unit-testable without AppKit.
+/// Admit a link to the share sheet.
+///
+/// `deeplink::parse` owns the question "is this a link a Vlervtifacts can
+/// open", so this defers to it instead of growing a second, looser rule that
+/// is free to drift: a link the recipient's app would refuse must never leave
+/// this machine. Parsing also brings the ticket charset check along, which
+/// rejects whitespace, NUL and quoting tricks inside the ticket.
+///
+/// Only the two ticket verbs are shareable. `open`, `reveal` and `beam` carry
+/// a local filesystem path, which is this machine's business and nobody
+/// else's — sending one would leak a path and arrive as a dead link.
+///
+/// Pure, so it is unit-testable without AppKit.
 fn validate_link(link: &str) -> Result<&str, String> {
     let trimmed = link.trim();
-    let rejected = "link is not shareable";
-    if !trimmed.starts_with(LINK_SCHEME) || trimmed.len() == LINK_SCHEME.len() {
-        return Err(rejected.into());
+    match crate::deeplink::parse(trimmed) {
+        Ok(DeepLinkIntent::Pair { .. } | DeepLinkIntent::Receive { .. }) => Ok(trimmed),
+        _ => Err("link is not shareable".into()),
     }
-    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(rejected.into());
-    }
-    Ok(trimmed)
 }
 
 /// Anchor rect in webview client coordinates, straight from
@@ -321,8 +321,11 @@ mod tests {
 
     #[test]
     fn accepts_the_two_link_shapes_the_ui_mints() {
-        assert_eq!(validate_link("vlerv://pair?ticket=ABC").unwrap(), "vlerv://pair?ticket=ABC");
-        assert_eq!(validate_link("vlerv://receive?t=ABC").unwrap(), "vlerv://receive?t=ABC");
+        // Exactly what peers::build_pair_link and beam::build_link produce.
+        let pair = "vlerv://pair?ticket=ABC";
+        let receive = "vlerv://receive?ticket=ABC&name=report.html&size=12";
+        assert_eq!(validate_link(pair).unwrap(), pair);
+        assert_eq!(validate_link(receive).unwrap(), receive);
     }
 
     #[test]
@@ -338,13 +341,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_bare_scheme_with_no_ticket() {
-        assert!(validate_link("vlerv://").is_err());
+    fn rejects_the_verbs_that_carry_a_local_path() {
+        // Parseable, but they name a file on THIS machine — sharing one leaks
+        // a path and lands as a dead link.
+        for link in ["vlerv://open?path=/etc/passwd", "vlerv://reveal?path=/etc", "vlerv://beam?path=/etc/passwd"] {
+            assert!(validate_link(link).is_err(), "{link} must not reach the share sheet");
+        }
     }
 
     #[test]
-    fn rejects_interior_whitespace_and_control_characters() {
-        // A link that cannot survive a message body is worse than no link.
+    fn rejects_a_bare_scheme_and_a_ticketless_verb() {
+        assert!(validate_link("vlerv://").is_err());
+        assert!(validate_link("vlerv://pair").is_err());
+        assert!(validate_link("vlerv://receive?t=ABC").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_and_control_characters_inside_a_ticket() {
+        // A link that cannot survive a message body is worse than no link;
+        // deeplink's alphanumeric ticket rule is what catches these.
         assert!(validate_link("vlerv://pair?ticket=A B").is_err());
         assert!(validate_link("vlerv://pair?ticket=A\nB").is_err());
     }
