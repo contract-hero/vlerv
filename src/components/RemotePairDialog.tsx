@@ -81,7 +81,7 @@ function FingerprintFace({
 }: {
   pending: RemotePendingPair;
 }): React.ReactElement {
-  const { pairingError } = useRemoteState();
+  const { pairingBusy, pairingError } = useRemoteState();
   const { confirmPairing } = useRemoteActions();
   const [scope, setScope] = React.useState<RemoteScope>("view-open");
   useEscape(() => confirmPairing(false));
@@ -137,8 +137,14 @@ function FingerprintFace({
         </label>
         {pairingError ? <p className="beam-error" role="alert">{pairingError}</p> : null}
         <div className="beam-actions">
-          <button type="button" className="button" onClick={() => confirmPairing(true, scope)}>
-            <Check size={13} strokeWidth={2.5} /> The words match — pair
+          <button
+            type="button"
+            className="button"
+            disabled={pairingBusy}
+            onClick={() => confirmPairing(true, scope)}
+          >
+            <Check size={13} strokeWidth={2.5} />{" "}
+            {pairingBusy ? "Pairing…" : "The words match — pair"}
           </button>
           <button
             type="button"

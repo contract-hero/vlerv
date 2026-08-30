@@ -153,10 +153,7 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
         "only files can be beamed"
     );
 
-    // ── A session that dies evicts its own cache entry ────────────────────
-    // The MCP server is long-lived and probes every paired device, so a
-    // session that is never dropped is one dead connection per device for the
-    // life of the process. Four sends over one device is still ONE session.
+    // ── Four sends over one device are still ONE session ──────────────────
     assert_eq!(core.cached_sessions().await, 1, "sessions are reused, not stacked");
 
     // ── Revocation on the device takes effect on the next call ─────────────

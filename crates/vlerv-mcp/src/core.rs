@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -190,6 +189,15 @@ pub struct ServerStatus {
     pub roots: Vec<PathBuf>,
 }
 
+/// The pushed-artifact log: the last `MAX_RECEIVED` arrivals, and how many
+/// arrived in all. One structure under one lock — a separate counter beside
+/// the vector could be read a push out of step with it.
+#[derive(Default)]
+struct Received {
+    items: Vec<ReceivedArtifact>,
+    total: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReceivedArtifact {
     pub from: String,
@@ -205,8 +213,7 @@ pub struct ReceivedArtifact {
 /// log. Stdout is the JSON-RPC channel and is never written to here.
 struct McpSink {
     pairing: Arc<Pairing>,
-    received: Arc<Mutex<Vec<ReceivedArtifact>>>,
-    received_total: Arc<AtomicU64>,
+    received: Arc<Mutex<Received>>,
 }
 
 impl EventSink for McpSink {
@@ -237,16 +244,14 @@ impl EventSink for McpSink {
             HostSignal::ArtifactReceived { peer, path, name, size, hash } => {
                 eprintln!("vlerv-mcp: {} pushed {name} to {}", short_id(&peer), path.display());
                 let mut received = self.received.lock().unwrap_or_else(|p| p.into_inner());
-                // Counted under the same lock as the push, so the count and
-                // the list never disagree about an arrival in flight.
-                self.received_total.fetch_add(1, Ordering::Relaxed);
-                // Drop from the front so the list stays the LAST MAX_RECEIVED
-                // arrivals rather than the first — an operator asking what
-                // just landed wants the newest.
-                if let Some(overflow) = (received.len() + 1).checked_sub(MAX_RECEIVED) {
-                    received.drain(..overflow);
+                received.total += 1;
+                received.items.push(ReceivedArtifact { from: peer, name, path, size, hash });
+                // Drop from the FRONT, so the list stays the last
+                // MAX_RECEIVED arrivals rather than the first — an operator
+                // asking what just landed wants the newest.
+                if received.items.len() > MAX_RECEIVED {
+                    received.items.remove(0);
                 }
-                received.push(ReceivedArtifact { from: peer, name, path, size, hash });
             }
         }
     }
@@ -261,8 +266,7 @@ pub struct McpCore {
     home: Option<PathBuf>,
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
-    received: Arc<Mutex<Vec<ReceivedArtifact>>>,
-    received_total: Arc<AtomicU64>,
+    received: Arc<Mutex<Received>>,
     node: tokio::sync::Mutex<Option<Arc<endpoint::RemoteNode>>>,
     /// Live sessions, one per peer. `Arc` because a session that closes
     /// evicts its own entry from here — see `session`.
@@ -284,8 +288,7 @@ impl McpCore {
             device: device_name(),
             peers: Arc::new(PeerStore::load(&dirs.remote())),
             pairing: Arc::new(Pairing::new()),
-            received: Arc::new(Mutex::new(Vec::new())),
-            received_total: Arc::new(AtomicU64::new(0)),
+            received: Arc::new(Mutex::new(Received::default())),
             roots: RootSet::new(roots),
             cwd,
             home,
@@ -356,11 +359,7 @@ impl McpCore {
             // Headless: no bookmarks, no recents, no open tabs. A view-open
             // peer is therefore told about nothing and may fetch nothing.
             Arc::new(EmptyCatalog),
-            McpSink {
-                pairing: self.pairing.clone(),
-                received: self.received.clone(),
-                received_total: self.received_total.clone(),
-            },
+            McpSink { pairing: self.pairing.clone(), received: self.received.clone() },
         ));
         let node = Arc::new(endpoint::boot(&self.dirs, Some(state), |_| {}).await?);
         *guard = Some(node.clone());
@@ -724,6 +723,10 @@ impl McpCore {
             Some(n) => n.endpoint.id().to_string(),
             None => self.node_id()?,
         };
+        let received = {
+            let log = self.received.lock().unwrap_or_else(|p| p.into_inner());
+            Received { items: log.items.clone(), total: log.total }
+        };
         Ok(ServerStatus {
             node_id_short: short_id(&node_id),
             node_id,
@@ -734,12 +737,8 @@ impl McpCore {
             uptime_secs: self.started.elapsed().as_secs(),
             paired_devices: self.peers.list().len(),
             active_offers,
-            received_artifacts: self
-                .received
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone(),
-            received_total: self.received_total.load(Ordering::Relaxed),
+            received_artifacts: received.items,
+            received_total: received.total,
             roots: self.roots.roots(),
         })
     }
@@ -948,13 +947,8 @@ mod tests {
 
     #[test]
     fn the_received_list_is_bounded_and_still_reports_the_true_count() {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let total = Arc::new(AtomicU64::new(0));
-        let sink = McpSink {
-            pairing: Arc::new(Pairing::new()),
-            received: received.clone(),
-            received_total: total.clone(),
-        };
+        let received = Arc::new(Mutex::new(Received::default()));
+        let sink = McpSink { pairing: Arc::new(Pairing::new()), received: received.clone() };
         let pushes = MAX_RECEIVED + 5;
         for i in 0..pushes {
             sink.emit(HostSignal::ArtifactReceived {
@@ -966,11 +960,11 @@ mod tests {
             });
         }
         let kept = received.lock().unwrap();
-        assert_eq!(kept.len(), MAX_RECEIVED, "the vector never grows past the cap");
+        assert_eq!(kept.items.len(), MAX_RECEIVED, "the vector never grows past the cap");
         // The OLDEST entries go, so what is listed is what just landed.
-        assert_eq!(kept.first().unwrap().name, format!("a{}.html", pushes - MAX_RECEIVED));
-        assert_eq!(kept.last().unwrap().name, format!("a{}.html", pushes - 1));
-        assert_eq!(total.load(Ordering::Relaxed), pushes as u64, "the count is not capped");
+        assert_eq!(kept.items.first().unwrap().name, format!("a{}.html", pushes - MAX_RECEIVED));
+        assert_eq!(kept.items.last().unwrap().name, format!("a{}.html", pushes - 1));
+        assert_eq!(kept.total, pushes as u64, "the count is not capped");
     }
 
     #[test]

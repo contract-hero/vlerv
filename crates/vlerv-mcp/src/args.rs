@@ -122,23 +122,13 @@ pub fn validate_device_query(raw: &str) -> Result<&str, String> {
     Ok(trimmed)
 }
 
-/// Parse an optional scope string, KEEPING the difference between "the
-/// caller named a scope" and "the caller named none". Unknown strings are
-/// refused rather than defaulted: a typo must not silently pick a scope the
-/// human did not ask for, and `None` must not silently become the narrowest
-/// grant here — `PeerStore::confirm` owns that rule, so an omitted argument
-/// can still mean "leave an existing peer's grant alone".
+/// The crate's optional-scope rule, plus the list of valid values. The
+/// PARSING lives in `Scope::parse_optional`, so this server and the app's
+/// command layer cannot drift on trimming or on what an omitted argument
+/// means; only the wording of the refusal belongs to this server.
 pub fn validate_optional_scope(raw: Option<&str>) -> Result<Option<Scope>, String> {
-    match raw {
-        None => Ok(None),
-        Some(named) => Scope::parse(named.trim()).map(Some).map_err(scope_help),
-    }
-}
-
-/// One refusal string for every scope argument, so a typo reads the same
-/// wherever it is made.
-fn scope_help(e: String) -> String {
-    format!("{e} — use \"view-open\", \"browse\" or \"control\"")
+    Scope::parse_optional(raw)
+        .map_err(|e| format!("{e} — use \"view-open\", \"browse\" or \"control\""))
 }
 
 #[cfg(test)]

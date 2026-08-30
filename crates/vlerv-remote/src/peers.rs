@@ -63,6 +63,15 @@ impl Scope {
         }
     }
 
+    /// `parse` for an argument that may be absent, keeping "the caller named
+    /// no scope" (`None`) distinct from "the caller named something unknown"
+    /// (an error). Every IPC and MCP entry point that takes an OPTIONAL scope
+    /// resolves it here, so the two hosts cannot drift on trimming or on what
+    /// an omitted argument means — `PeerStore::confirm` owns the latter.
+    pub fn parse_optional(s: Option<&str>) -> Result<Option<Self>, String> {
+        s.map(|raw| Self::parse(raw.trim())).transpose()
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::ViewOpen => "view-open",
@@ -195,30 +204,7 @@ impl PeerStore {
     /// of an existing entry — re-pairing an already-trusted machine must not
     /// silently widen or reset its grant.
     pub fn upsert(&self, node_id: &str, device: &str, scope: Scope) -> Result<Peer, String> {
-        let now = now_unix();
-        let peer = {
-            let mut peers = self.guard();
-            match peers.iter_mut().find(|p| p.node_id == node_id) {
-                Some(existing) => {
-                    existing.device = device.to_string();
-                    existing.last_seen = now;
-                    existing.clone()
-                }
-                None => {
-                    let peer = Peer {
-                        node_id: node_id.to_string(),
-                        device: device.to_string(),
-                        scope,
-                        paired_at: now,
-                        last_seen: now,
-                    };
-                    peers.push(peer.clone());
-                    peer
-                }
-            }
-        };
-        self.save()?;
-        Ok(peer)
+        self.write(node_id, device, scope, None)
     }
 
     /// Persist a pairing a human just confirmed, applying the grant that
@@ -232,6 +218,23 @@ impl PeerStore {
     /// A confirm path that called `upsert` would report the scope the human
     /// picked while writing the wider one already on disk.
     pub fn confirm(&self, node_id: &str, device: &str, grant: Option<Scope>) -> Result<Peer, String> {
+        self.write(node_id, device, grant.unwrap_or(DEFAULT_SCOPE), grant)
+    }
+
+    /// The one writer behind `upsert` and `confirm`. It always refreshes the
+    /// device name and `last_seen`; the two scope parameters are the whole
+    /// difference between its callers. `on_insert` is the grant a peer this
+    /// store has never seen is created with. `regrant` is what to do to an
+    /// EXISTING peer's grant: `Some` replaces it in either direction, `None`
+    /// leaves it alone — which is why `upsert` can never move a grant and
+    /// `confirm` can.
+    fn write(
+        &self,
+        node_id: &str,
+        device: &str,
+        on_insert: Scope,
+        regrant: Option<Scope>,
+    ) -> Result<Peer, String> {
         let now = now_unix();
         let peer = {
             let mut peers = self.guard();
@@ -239,7 +242,7 @@ impl PeerStore {
                 Some(existing) => {
                     existing.device = device.to_string();
                     existing.last_seen = now;
-                    if let Some(scope) = grant {
+                    if let Some(scope) = regrant {
                         existing.scope = scope;
                     }
                     existing.clone()
@@ -248,7 +251,7 @@ impl PeerStore {
                     let peer = Peer {
                         node_id: node_id.to_string(),
                         device: device.to_string(),
-                        scope: grant.unwrap_or(DEFAULT_SCOPE),
+                        scope: on_insert,
                         paired_at: now,
                         last_seen: now,
                     };
@@ -896,6 +899,21 @@ mod tests {
         assert_eq!(pairing.live_tokens(), 1);
         assert!(pairing.consume(&decoded.token));
         assert!(!pairing.consume(&decoded.token));
+    }
+
+    #[test]
+    fn an_optional_scope_keeps_none_distinct_and_trims_the_same_on_every_surface() {
+        // `None` must survive to the peer store: it is what tells `confirm`
+        // to leave an existing grant where it is.
+        assert_eq!(Scope::parse_optional(None).unwrap(), None);
+        assert_eq!(Scope::parse_optional(Some("control")).unwrap(), Some(Scope::Control));
+        // Trimming lives here, not in one host — a copy-pasted " control "
+        // used to be accepted over MCP and refused over the app's commands.
+        assert_eq!(Scope::parse_optional(Some(" browse ")).unwrap(), Some(Scope::Browse));
+        // A typo is a refusal, never a default, in either direction.
+        assert!(Scope::parse_optional(Some("")).is_err());
+        assert!(Scope::parse_optional(Some("Control")).is_err());
+        assert!(Scope::parse_optional(Some("admin")).is_err());
     }
 
     // ── Short ids ──────────────────────────────────────────────────────────
