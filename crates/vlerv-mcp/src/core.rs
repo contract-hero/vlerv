@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,13 @@ use crate::devices::{self, label};
 // clear the handshake budget (HANDSHAKE_TIMEOUT = 10s in vlerv-remote); the
 // cold-boot cost is paid once, before the probe loop, not inside this window.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How many pushed artifacts `server_status` lists. A server left running
+/// beside a chatty control peer would otherwise grow this vector for the life
+/// of the process. The newest entries are the ones a caller acts on, so the
+/// oldest are dropped; `ServerStatus::received_total` still reports the true
+/// count, because a silently shortened list reads as "that is all of them".
+const MAX_RECEIVED: usize = 100;
 
 /// Shortest content-hash prefix `stop_beam` accepts for ONE link. Revoking
 /// the wrong link is recoverable (mint another); revoking by a one-character
@@ -172,8 +180,12 @@ pub struct ServerStatus {
     pub uptime_secs: u64,
     pub paired_devices: usize,
     pub active_offers: Vec<OfferSummary>,
-    /// Files other devices pushed to this server during this process.
+    /// Files other devices pushed to this server during this process, newest
+    /// last, capped at `MAX_RECEIVED` entries.
     pub received_artifacts: Vec<ReceivedArtifact>,
+    /// How many arrived in total. Higher than `received_artifacts.len()` once
+    /// the cap has dropped the oldest entries.
+    pub received_total: u64,
     /// The directories a sent file is resolved against.
     pub roots: Vec<PathBuf>,
 }
@@ -194,6 +206,7 @@ pub struct ReceivedArtifact {
 struct McpSink {
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Vec<ReceivedArtifact>>>,
+    received_total: Arc<AtomicU64>,
 }
 
 impl EventSink for McpSink {
@@ -223,10 +236,17 @@ impl EventSink for McpSink {
             }
             HostSignal::ArtifactReceived { peer, path, name, size, hash } => {
                 eprintln!("vlerv-mcp: {} pushed {name} to {}", short_id(&peer), path.display());
-                self.received
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(ReceivedArtifact { from: peer, name, path, size, hash });
+                let mut received = self.received.lock().unwrap_or_else(|p| p.into_inner());
+                // Counted under the same lock as the push, so the count and
+                // the list never disagree about an arrival in flight.
+                self.received_total.fetch_add(1, Ordering::Relaxed);
+                // Drop from the front so the list stays the LAST MAX_RECEIVED
+                // arrivals rather than the first — an operator asking what
+                // just landed wants the newest.
+                if let Some(overflow) = (received.len() + 1).checked_sub(MAX_RECEIVED) {
+                    received.drain(..overflow);
+                }
+                received.push(ReceivedArtifact { from: peer, name, path, size, hash });
             }
         }
     }
@@ -242,8 +262,11 @@ pub struct McpCore {
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Vec<ReceivedArtifact>>>,
+    received_total: Arc<AtomicU64>,
     node: tokio::sync::Mutex<Option<Arc<endpoint::RemoteNode>>>,
-    sessions: tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>,
+    /// Live sessions, one per peer. `Arc` because a session that closes
+    /// evicts its own entry from here — see `session`.
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>>,
     started: Instant,
     /// Test seam: when set, peers are dialed at this socket and the push
     /// ticket names this server's own loopback address, so a two-endpoint
@@ -262,12 +285,13 @@ impl McpCore {
             peers: Arc::new(PeerStore::load(&dirs.remote())),
             pairing: Arc::new(Pairing::new()),
             received: Arc::new(Mutex::new(Vec::new())),
+            received_total: Arc::new(AtomicU64::new(0)),
             roots: RootSet::new(roots),
             cwd,
             home,
             dirs,
             node: tokio::sync::Mutex::new(None),
-            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             started: Instant::now(),
             loopback: Mutex::new(None),
         }
@@ -332,7 +356,11 @@ impl McpCore {
             // Headless: no bookmarks, no recents, no open tabs. A view-open
             // peer is therefore told about nothing and may fetch nothing.
             Arc::new(EmptyCatalog),
-            McpSink { pairing: self.pairing.clone(), received: self.received.clone() },
+            McpSink {
+                pairing: self.pairing.clone(),
+                received: self.received.clone(),
+                received_total: self.received_total.clone(),
+            },
         ));
         let node = Arc::new(endpoint::boot(&self.dirs, Some(state), |_| {}).await?);
         *guard = Some(node.clone());
@@ -535,6 +563,14 @@ impl McpCore {
         })
     }
 
+    /// Test seam: how many peer sessions this server is holding. A session
+    /// evicts its own entry when it closes, so this is what tells a test the
+    /// cache drains instead of growing one dead handle per probe.
+    #[doc(hidden)]
+    pub async fn cached_sessions(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     /// Drop a cached session so the next call re-handshakes.
     async fn forget_session(&self, node_id: &str) {
         self.sessions.lock().await.remove(node_id);
@@ -562,8 +598,24 @@ impl McpCore {
             Some(host) => endpoint::addr_at(&peer.node_id, host)?,
             None => endpoint::addr_for(&peer.node_id)?,
         };
+        // A probe dials every paired device, and a device that later sleeps
+        // leaves its session closed. Without this callback each one stays in
+        // the map for the life of the process, holding a dead connection.
+        let cache = self.sessions.clone();
+        let evict = peer.node_id.clone();
+        let on_closed = move || {
+            tokio::spawn(async move {
+                let mut sessions = cache.lock().await;
+                // Only ever drop a CLOSED entry: a re-dial may already have
+                // replaced this peer's session, and the old session's
+                // callback must not evict the new one.
+                if sessions.get(&evict).is_some_and(|s| s.is_closed()) {
+                    sessions.remove(&evict);
+                }
+            });
+        };
         let session =
-            ClientSession::connect(&node, addr, self.device.clone(), |_| {}, || {})
+            ClientSession::connect(&node, addr, self.device.clone(), |_| {}, on_closed)
                 .await
                 .map_err(|e| {
                     format!(
@@ -619,6 +671,12 @@ impl McpCore {
 
     /// Complete or discard a pending pairing. Rejecting writes nothing to
     /// disk, so a fingerprint mismatch leaves no trace to clean up.
+    ///
+    /// A named `scope` is the operator's explicit grant and REPLACES whatever
+    /// an already-trusted device holds, in either direction — re-pairing a
+    /// control peer at "view-open" narrows it. Omitting `scope` names no
+    /// grant: a new device gets the narrowest one, an existing device keeps
+    /// the grant it already has.
     pub fn confirm_pairing(
         &self,
         accept: bool,
@@ -627,7 +685,7 @@ impl McpCore {
     ) -> Result<PairingOutcome, String> {
         // The scope is checked FIRST, so a typo is refused before a parked
         // pairing is consumed.
-        let granted = args::validate_scope(scope)?;
+        let granted = args::validate_optional_scope(scope)?;
         let parked = self.pairing.parked();
         let target = devices::resolve_pending(&parked, node_id)?.node_id.clone();
         drop(parked);
@@ -643,7 +701,9 @@ impl McpCore {
                 scope: None,
             });
         }
-        let peer = self.peers.upsert(&pending.node_id, &pending.device, granted)?;
+        // `confirm`, not `upsert`: this is the human's grant, so it must land
+        // on disk even when it narrows an entry that is already there.
+        let peer = self.peers.confirm(&pending.node_id, &pending.device, granted)?;
         Ok(PairingOutcome {
             paired: true,
             device: peer.device,
@@ -679,6 +739,7 @@ impl McpCore {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
+            received_total: self.received_total.load(Ordering::Relaxed),
             roots: self.roots.roots(),
         })
     }
@@ -824,6 +885,92 @@ mod tests {
             role: "host".to_string(),
             created_at: peers::now_unix(),
         });
+    }
+
+    fn core_in(dir: &tempfile::TempDir) -> McpCore {
+        McpCore::new(
+            dir.path().to_path_buf(),
+            vec![dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+            None,
+        )
+    }
+
+    #[test]
+    fn re_pairing_at_a_narrower_scope_actually_narrows_the_stored_grant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let core = core_in(&dir);
+        let node = "cd".repeat(32);
+
+        park(&core, &node, "Val's iPhone");
+        let wide = core.confirm_pairing(true, None, Some("control")).unwrap();
+        assert_eq!(wide.scope.as_deref(), Some("control"));
+
+        // The whole point: the operator re-pairs the SAME device and names a
+        // narrower scope. Reporting "view-open" while "control" stays on disk
+        // would be a grant the human believes they took away.
+        park(&core, &node, "Val's iPhone");
+        let narrow = core.confirm_pairing(true, None, Some("view-open")).unwrap();
+        assert_eq!(narrow.scope.as_deref(), Some("view-open"));
+        assert_eq!(core.peer_store().get(&node).unwrap().scope, Scope::ViewOpen);
+
+        // Naming NO scope says nothing about the grant, so it is left alone
+        // rather than reset to the default.
+        core.peer_store().set_scope(&node, Scope::Browse).unwrap();
+        park(&core, &node, "Val's iPhone");
+        let kept = core.confirm_pairing(true, None, None).unwrap();
+        assert_eq!(kept.scope.as_deref(), Some("browse"));
+
+        // A NEW device with no scope named still lands on the narrowest one.
+        let other = "ef".repeat(32);
+        park(&core, &other, "iPad");
+        assert_eq!(core.confirm_pairing(true, None, None).unwrap().scope.as_deref(), Some("view-open"));
+    }
+
+    #[test]
+    fn rejecting_a_pairing_leaves_an_existing_grant_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let core = core_in(&dir);
+        let node = "cd".repeat(32);
+        park(&core, &node, "Val's iPhone");
+        core.confirm_pairing(true, None, Some("control")).unwrap();
+
+        park(&core, &node, "Val's iPhone");
+        let outcome = core.confirm_pairing(false, None, Some("view-open")).unwrap();
+        assert!(!outcome.paired);
+        assert_eq!(outcome.scope, None);
+        assert_eq!(
+            core.peer_store().get(&node).unwrap().scope,
+            Scope::Control,
+            "a rejected pairing writes nothing — it must not narrow the peer either"
+        );
+    }
+
+    #[test]
+    fn the_received_list_is_bounded_and_still_reports_the_true_count() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let total = Arc::new(AtomicU64::new(0));
+        let sink = McpSink {
+            pairing: Arc::new(Pairing::new()),
+            received: received.clone(),
+            received_total: total.clone(),
+        };
+        let pushes = MAX_RECEIVED + 5;
+        for i in 0..pushes {
+            sink.emit(HostSignal::ArtifactReceived {
+                peer: "ab".repeat(32),
+                path: PathBuf::from(format!("/tmp/a{i}.html")),
+                name: format!("a{i}.html"),
+                size: 1,
+                hash: format!("{i:064x}"),
+            });
+        }
+        let kept = received.lock().unwrap();
+        assert_eq!(kept.len(), MAX_RECEIVED, "the vector never grows past the cap");
+        // The OLDEST entries go, so what is listed is what just landed.
+        assert_eq!(kept.first().unwrap().name, format!("a{}.html", pushes - MAX_RECEIVED));
+        assert_eq!(kept.last().unwrap().name, format!("a{}.html", pushes - 1));
+        assert_eq!(total.load(Ordering::Relaxed), pushes as u64, "the count is not capped");
     }
 
     #[test]

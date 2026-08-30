@@ -368,11 +368,12 @@ pub async fn remote_pair_confirm(
     if !accept {
         return Ok(None);
     }
-    let granted = match scope {
-        Some(raw) => Scope::parse(&raw)?,
-        None => peers::DEFAULT_SCOPE,
-    };
-    let peer = state.peers.upsert(&pending.node_id, &pending.device, granted)?;
+    // A named scope is the human's explicit grant, so it must land on disk
+    // even when it NARROWS a device already in the store; naming none leaves
+    // an existing grant where it is. `confirm` expresses that difference —
+    // `upsert`, the passive handshake path, never moves a grant at all.
+    let granted = scope.as_deref().map(Scope::parse).transpose()?;
+    let peer = state.peers.confirm(&pending.node_id, &pending.device, granted)?;
     let _ = app.emit("vlerv://remote-event", RemoteEvent::PeersUpdated);
     Ok(Some(peer))
 }
@@ -718,7 +719,7 @@ fn test_autopair(app: &tauri::AppHandle, pending: &PendingPair) {
     let Some(parked) = state.pairing.take(&pending.node_id) else {
         return;
     };
-    match state.peers.upsert(&parked.node_id, &parked.device, scope) {
+    match state.peers.confirm(&parked.node_id, &parked.device, Some(scope)) {
         Ok(_) => {
             eprintln!(
                 "vlerv: {AUTOPAIR_ENV}: AUTO-CONFIRMED {} ({}) as {} — TEST BUILD ONLY",

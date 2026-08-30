@@ -163,13 +163,17 @@ Finishes or rejects a pending pairing.
 - `accept` — `false` discards it and writes nothing to disk.
 - `node_id` — only needed when more than one pairing is waiting.
 - `scope` — what the **new device** may do on this server: `view-open`
-  (default), `browse` or `control`.
+  (default for a device that is new here), `browse` or `control`.
+  Re-pairing a device that is already trusted and naming a scope **replaces**
+  its grant, including narrowing it. Omitting `scope` names no grant, so an
+  already-trusted device keeps the one it has.
 
 ### `server_status {}`
 
 This server's node id, its identity directory, whether it has booted the
 network, its uptime, which beam links are still being served, and which files
-other devices pushed to it during this session.
+other devices pushed to it during this session. The pushed-file list holds the
+last 100 arrivals; `received_total` reports how many arrived in all.
 
 ## Pairing an iOS device, step by step
 

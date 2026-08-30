@@ -153,6 +153,12 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
         "only files can be beamed"
     );
 
+    // ── A session that dies evicts its own cache entry ────────────────────
+    // The MCP server is long-lived and probes every paired device, so a
+    // session that is never dropped is one dead connection per device for the
+    // life of the process. Four sends over one device is still ONE session.
+    assert_eq!(core.cached_sessions().await, 1, "sessions are reused, not stacked");
+
     // ── Revocation on the device takes effect on the next call ─────────────
     host.peers.remove(&mcp_id).unwrap();
     assert!(
@@ -160,7 +166,33 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
         "a revoked server is refused on its very next request"
     );
 
+    // ── A session that dies evicts its own cache entry ────────────────────
+    // The MCP server is long-lived and probes every paired device, so a
+    // session that is never dropped is one dead connection per device for the
+    // life of the process.
+    // The revocation closed the session from the host side. Nothing calls
+    // `forget_session` on this path, so the cache draining is the eviction
+    // callback doing its job.
+    let drained = wait_until(|| async { core.cached_sessions().await == 0 }).await;
+    assert!(drained, "a closed session must not stay in the cache");
+
     host.node.router.shutdown().await.ok();
+}
+
+/// Poll a condition for up to five seconds. The eviction runs on the session's
+/// own reader task, so a test cannot observe it synchronously.
+async fn wait_until<F, Fut>(mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..100 {
+        if cond().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -128,7 +128,10 @@ impl VlervMcp {
                 .collect();
             format!("{} paired device(s):\n{}", devices.len(), rows.join("\n"))
         };
-        ok(summary, &devices)
+        // Wrapped in an object on purpose: MCP says `structuredContent` is a
+        // record, and a bare JSON array is rejected by the client before the
+        // model ever sees it.
+        ok(summary, &serde_json::json!({ "devices": devices }))
     }
 
     #[tool(
@@ -210,7 +213,8 @@ impl VlervMcp {
                 rows.join("\n")
             )
         };
-        ok(summary, &pending)
+        // Same record rule as `list_devices`: never a bare array.
+        ok(summary, &serde_json::json!({ "pending": pending }))
     }
 
     #[tool(
@@ -260,7 +264,7 @@ impl VlervMcp {
         render(self.core.server_status().await, |status| {
             format!(
                 "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
-                 {}\nactive beam links: {}\nreceived this session: {}",
+                 {}\nactive beam links: {}\nreceived this session: {}{}",
                 status.device,
                 status.node_id_short,
                 status.identity_dir.display(),
@@ -268,7 +272,14 @@ impl VlervMcp {
                 status.uptime_secs,
                 status.paired_devices,
                 status.active_offers.len(),
-                status.received_artifacts.len()
+                status.received_total,
+                // Say so when the list is shorter than the count, rather than
+                // letting the reader take the listed entries for all of them.
+                if status.received_total as usize > status.received_artifacts.len() {
+                    format!(" (listing the last {})", status.received_artifacts.len())
+                } else {
+                    String::new()
+                }
             )
         })
     }
@@ -467,6 +478,31 @@ mod tests {
             ContentBlock::Text(text) => assert_eq!(text.text, "sent it"),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_results_are_objects_because_mcp_rejects_a_bare_array() {
+        // `structuredContent` must be a record. A handler that returns a
+        // `Vec` directly makes the client reject the whole call, so both
+        // list-shaped tools name their array under a key.
+        let core = Arc::new(McpCore::new(
+            "/tmp/vlerv-mcp-test".into(),
+            vec![],
+            "/tmp".into(),
+            None,
+        ));
+        let server = VlervMcp::new(core);
+
+        let listed = server
+            .list_devices(Parameters(ListDevicesArgs { probe: Some(false) }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(listed.get("devices").is_some_and(|v| v.is_array()), "{listed}");
+
+        let pending = server.pair_status().await.unwrap().structured_content.unwrap();
+        assert!(pending.get("pending").is_some_and(|v| v.is_array()), "{pending}");
     }
 
     #[test]
