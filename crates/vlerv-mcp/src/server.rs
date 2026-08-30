@@ -87,10 +87,13 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<StopBeamArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        render(self.core.stop_beam(args.hash.as_deref()).await, |stopped| {
-            if stopped.is_empty() {
-                return "No beam link was live, so nothing had to be revoked.".to_string();
-            }
+        let stopped = match self.core.stop_beam(args.hash.as_deref()).await {
+            Ok(stopped) => stopped,
+            Err(message) => return tool_failure(message),
+        };
+        let summary = if stopped.is_empty() {
+            "No beam link was live, so nothing had to be revoked.".to_string()
+        } else {
             let names: Vec<&str> = stopped.iter().map(|o| o.name.as_str()).collect();
             format!(
                 "Revoked {} beam link(s): {}. Any further fetch is refused, even from somebody \
@@ -98,7 +101,8 @@ impl VlervMcp {
                 stopped.len(),
                 names.join(", ")
             )
-        })
+        };
+        ok(summary, &serde_json::json!({ "stopped": stopped }))
     }
 
     #[tool(
@@ -128,9 +132,6 @@ impl VlervMcp {
                 .collect();
             format!("{} paired device(s):\n{}", devices.len(), rows.join("\n"))
         };
-        // Wrapped in an object on purpose: MCP says `structuredContent` is a
-        // record, and a bare JSON array is rejected by the client before the
-        // model ever sees it.
         ok(summary, &serde_json::json!({ "devices": devices }))
     }
 
@@ -213,7 +214,6 @@ impl VlervMcp {
                 rows.join("\n")
             )
         };
-        // Same record rule as `list_devices`: never a bare array.
         ok(summary, &serde_json::json!({ "pending": pending }))
     }
 
@@ -262,6 +262,13 @@ impl VlervMcp {
     )]
     async fn server_status(&self) -> Result<CallToolResult, ErrorData> {
         render(self.core.server_status().await, |status| {
+            // Say so when the list is shorter than the count, rather than
+            // letting the reader take the listed entries for all of them.
+            let listed = if status.received_total as usize > status.received_artifacts.len() {
+                format!(" (listing the last {})", status.received_artifacts.len())
+            } else {
+                String::new()
+            };
             format!(
                 "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
                  {}\nactive beam links: {}\nreceived this session: {}{}",
@@ -273,13 +280,7 @@ impl VlervMcp {
                 status.paired_devices,
                 status.active_offers.len(),
                 status.received_total,
-                // Say so when the list is shorter than the count, rather than
-                // letting the reader take the listed entries for all of them.
-                if status.received_total as usize > status.received_artifacts.len() {
-                    format!(" (listing the last {})", status.received_artifacts.len())
-                } else {
-                    String::new()
-                }
+                listed
             )
         })
     }
@@ -332,9 +333,16 @@ fn render<T: Serialize>(
 
 /// A successful result: a sentence the model reads, plus the same facts as
 /// structured JSON for a client that renders it.
+///
+/// MCP says `structuredContent` is a RECORD. A tool that hands this a bare
+/// array gets its whole call rejected by the client before the model sees a
+/// word of it, so a list-shaped result must name its array under a key. The
+/// assertion below is what stops the next such tool from shipping — three
+/// handlers reached this with a `Vec` before it existed.
 fn ok<T: Serialize>(summary: impl Into<String>, value: &T) -> Result<CallToolResult, ErrorData> {
     let json = serde_json::to_value(value)
         .map_err(|e| ErrorData::internal_error(format!("cannot serialize result: {e}"), None))?;
+    debug_assert!(json.is_object(), "structuredContent must be a record, got: {json}");
     let mut result = CallToolResult::structured(json);
     result.content = vec![ContentBlock::text(summary.into())];
     Ok(result)
@@ -503,6 +511,16 @@ mod tests {
 
         let pending = server.pair_status().await.unwrap().structured_content.unwrap();
         assert!(pending.get("pending").is_some_and(|v| v.is_array()), "{pending}");
+
+        // The third list-shaped tool. It reached `ok` with a bare `Vec` until
+        // the assertion inside `ok` made every tool test catch that.
+        let stopped = server
+            .stop_beam(Parameters(StopBeamArgs { hash: None }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(stopped.get("stopped").is_some_and(|v| v.is_array()), "{stopped}");
     }
 
     #[test]

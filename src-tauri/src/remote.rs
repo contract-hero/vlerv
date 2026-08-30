@@ -372,7 +372,7 @@ pub async fn remote_pair_confirm(
     // even when it NARROWS a device already in the store; naming none leaves
     // an existing grant where it is. `confirm` expresses that difference —
     // `upsert`, the passive handshake path, never moves a grant at all.
-    let granted = scope.as_deref().map(Scope::parse).transpose()?;
+    let granted = Scope::parse_optional(scope.as_deref())?;
     let peer = state.peers.confirm(&pending.node_id, &pending.device, granted)?;
     let _ = app.emit("vlerv://remote-event", RemoteEvent::PeersUpdated);
     Ok(Some(peer))
