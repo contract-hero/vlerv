@@ -366,8 +366,14 @@ impl McpCore {
         Ok(node)
     }
 
+    /// The node IF one is already booted — never a wait.
+    ///
+    /// `node()` holds this lock across the whole boot, so awaiting it here
+    /// would put every read-only caller (`server_status`, `stop_beam`) behind
+    /// an in-flight boot. `try_lock` answers "not booted yet" instead, which
+    /// is true while a boot runs and keeps status answerable when one is stuck.
     async fn booted(&self) -> Option<Arc<endpoint::RemoteNode>> {
-        self.node.lock().await.clone()
+        self.node.try_lock().ok()?.clone()
     }
 
     /// Resolve a caller-supplied path, confine it to this server's roots, and
