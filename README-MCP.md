@@ -285,6 +285,16 @@ gets slower.
 **A beam link stopped working** — the server process ended (the Claude Code
 session closed) or the TTL expired. Mint a new one.
 
+**"another Vlerv process is already using the blob store"** — one state
+directory serves one process at a time, and every Claude Code session starts
+its own `vlerv-mcp`. Close the other session, or give this one its own
+`VLERV_MCP_STATE_DIR`. A separate state directory means a separate node id, so
+that server starts with no paired devices.
+
+Watch for orphaned headless runs: `claude --print` sessions keep their server
+alive, and one that never exits holds the store indefinitely. Find them with
+`pgrep -fl vlerv-mcp`.
+
 **Nothing appears in `/mcp`** — check `claude mcp list`, and confirm the path
 you registered is absolute and the binary is executable. Run it by hand: it
 should print one identity line to stderr and then wait.
