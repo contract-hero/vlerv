@@ -117,7 +117,10 @@ impl VlervMcp {
         &self,
         Parameters(args): Parameters<ListDevicesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let devices = self.core.list_devices(args.probe.unwrap_or(false)).await;
+        let devices = match self.core.list_devices(args.probe.unwrap_or(false)).await {
+            Ok(devices) => devices,
+            Err(e) => return tool_failure(e),
+        };
         let summary = if devices.is_empty() {
             "No devices are paired with this server yet. Call pair_device to pair one.".to_string()
         } else {
@@ -279,13 +282,18 @@ fn status_summary(status: &ServerStatus) -> String {
     } else {
         String::new()
     };
+    // "booted: false" reads as "idle" unless the refusal is named beside it.
+    let booted = match &status.boot_error {
+        Some(e) => format!("false — the last boot failed: {e}"),
+        None => status.booted.to_string(),
+    };
     format!(
         "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
          {}\nactive beam links: {}\nreceived this session: {}{}",
         status.device,
         status.node_id_short,
         status.identity_dir.display(),
-        status.booted,
+        booted,
         status.uptime_secs,
         status.paired_devices,
         status.active_offers.len(),
@@ -401,6 +409,7 @@ mod tests {
             identity_dir: "/tmp/x/remote".into(),
             state_dir: "/tmp/x".into(),
             booted: true,
+            boot_error: None,
             uptime_secs: 1,
             paired_devices: 0,
             active_offers: Vec::new(),

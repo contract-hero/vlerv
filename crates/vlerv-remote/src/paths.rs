@@ -23,7 +23,7 @@ pub const DEFAULT_IGNORED: &[&str] = &[
     ".venv",
 ];
 
-/// The base-directory seam. One state directory in, four derived paths out.
+/// The base-directory seam. One state directory in, five derived paths out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dirs {
     base: PathBuf,
@@ -53,8 +53,9 @@ impl Dirs {
     }
 
     /// `<base>/remote/blobs.lock` — the file whose exclusive lock says who
-    /// owns `blobs()`. A sibling, not a child: the store directory is redb's,
-    /// and the claim has to be takeable before it is opened.
+    /// owns `blobs()`. A sibling, not a child: it stays outside the tree
+    /// `FsStore` creates and manages, so resetting or deleting `blobs/`
+    /// cannot take the claim with it.
     pub fn blobs_lock(&self) -> PathBuf {
         self.remote().join("blobs.lock")
     }

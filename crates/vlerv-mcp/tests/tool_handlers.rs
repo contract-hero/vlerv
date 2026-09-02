@@ -226,7 +226,7 @@ async fn list_devices_and_server_status_report_what_the_tools_did() {
     core.use_loopback(host_socket);
 
     // ── Nothing paired, nothing booted ─────────────────────────────────────
-    assert!(core.list_devices(false).await.is_empty());
+    assert!(core.list_devices(false).await.unwrap().is_empty());
     let before = core.server_status().await.unwrap();
     assert!(!before.booted, "listing must not boot the network stack");
     assert_eq!(before.node_id, core.node_id().unwrap());
@@ -276,7 +276,7 @@ async fn list_devices_and_server_status_report_what_the_tools_did() {
     // ── Presence: unknown until something dials ────────────────────────────
     core.peer_store().seed(&host.node_id(), "Mac Studio", Scope::ViewOpen).unwrap();
     host.peers.seed(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
-    let quiet = core.list_devices(false).await;
+    let quiet = core.list_devices(false).await.unwrap();
     assert_eq!(quiet.len(), 1);
     assert_eq!(quiet[0].device, "Mac Studio");
     assert_eq!(quiet[0].scope, "view-open", "the scope shown is the one granted HERE");
@@ -285,10 +285,10 @@ async fn list_devices_and_server_status_report_what_the_tools_did() {
     // line and one in this list are the same string.
     assert_eq!(quiet[0].node_id_short, host.node_id()[..10]);
 
-    let probed = core.list_devices(true).await;
+    let probed = core.list_devices(true).await.unwrap();
     assert_eq!(probed[0].presence, "online", "the probe reached the host");
     // The session is now cached, so presence is live without a second dial.
-    assert_eq!(core.list_devices(false).await[0].presence, "online");
+    assert_eq!(core.list_devices(false).await.unwrap()[0].presence, "online");
 
     let status = core.server_status().await.unwrap();
     assert_eq!(status.paired_devices, 1);
@@ -329,4 +329,67 @@ async fn a_send_to_a_device_that_is_not_there_never_opens_a_socket() {
 
     // None of the above needed the endpoint.
     assert!(!core.server_status().await.unwrap().booted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claimed_store_is_reported_as_the_reason_not_as_an_empty_answer() {
+    // The point of the claim is that a second server SAYS why it can do
+    // nothing. Answering fast and blandly — "no links to revoke", "every
+    // device offline" — is the original silent failure wearing a new face.
+    let mcp_dir = tempfile::TempDir::new().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let artifact = workspace.path().join("a.html");
+    std::fs::write(&artifact, "<p>a</p>").unwrap();
+
+    // Stand in for the other process without any `vlerv-remote` type: the
+    // claim is an ordinary exclusive file lock, and that IS the contract.
+    let lock_path = mcp_dir.path().join("remote").join("blobs.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    holder.try_lock().expect("the test must be the holder");
+
+    let core = McpCore::new(
+        mcp_dir.path().to_path_buf(),
+        vec![workspace.path().to_path_buf()],
+        workspace.path().to_path_buf(),
+        None,
+    );
+
+    let err = core.beam_artifact(artifact.to_str().unwrap(), None).await.unwrap_err();
+    assert!(err.contains("already using the blob store"), "{err}");
+    assert!(err.contains("its own state directory"), "{err}");
+
+    // Status names the refusal instead of reading like a healthy idle server.
+    let status = core.server_status().await.unwrap();
+    assert!(!status.booted);
+    assert!(
+        status.boot_error.as_deref().unwrap_or_default().contains("already using"),
+        "server_status must say WHY it has no node: {:?}",
+        status.boot_error
+    );
+
+    // A revocation tool that could not look must not answer "nothing to
+    // revoke": the caller's link may be live in the process holding the store.
+    let err = core.stop_beam(None).await.unwrap_err();
+    assert!(err.contains("cannot check beam links"), "{err}");
+
+    // A probe reaches nothing either, and has to say so rather than blame
+    // every paired device for being offline.
+    core.peer_store().seed(&"ab".repeat(32), "Mac Studio", Scope::Control).unwrap();
+    let err = core.list_devices(true).await.unwrap_err();
+    assert!(err.contains("already using the blob store"), "{err}");
+    // Without a probe nothing needs the network, so the list still answers.
+    assert_eq!(core.list_devices(false).await.unwrap()[0].device, "Mac Studio");
+
+    // Releasing hands the store over — the refusal was never cached.
+    drop(holder);
+    core.beam_artifact(artifact.to_str().unwrap(), None)
+        .await
+        .expect("a released store must let the next process boot");
+    assert!(core.server_status().await.unwrap().booted);
 }
