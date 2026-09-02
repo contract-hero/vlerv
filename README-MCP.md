@@ -139,8 +139,28 @@ there and opens on that screen.
   characters or more). An ambiguous or unknown name is an error that lists the
   valid ones.
 
-Returns the name the **receiving** device landed the file under (it renames on
-collision), the size it measured, and the shared content hash.
+Returns a `status`. **`delivered`** carries the name the **receiving** device
+landed the file under (it renames on collision), the size it measured, and the
+shared content hash.
+
+**`queued`** means the device did not answer and the send was accepted anyway.
+The file is copied into this server's state directory as it stands at that
+moment, so later edits to it do not change what arrives, and it goes out on its
+own as soon as the device is reachable — usually the moment it dials in.
+
+**A queued send outlives the tool call, but not the process.** The bytes move
+only while a `vlerv-mcp` is running against that state directory, so a send
+accepted by a session that then closes goes out at the first network-touching
+tool call of a later one. A record nobody could deliver is kept for 7 days and
+then dropped, and its private copy goes with it. The queue holds at most 64
+records or 1 GiB; a full queue refuses the send rather than dropping an older
+one, and `server_status` lists what is waiting.
+
+A device whose last completed handshake reported a scope narrower than
+`control` is refused outright rather than queued: it would refuse the bytes on
+arrival, and the copy would sit here for the week. For a device this server has
+never completed a handshake with, the send is still queued, and the answer says
+in as many words that the grant is unverified.
 
 This needs the receiving device to have granted this server the **`control`**
 scope. See [Security model](#security-model).
@@ -171,9 +191,12 @@ Finishes or rejects a pending pairing.
 ### `server_status {}`
 
 This server's node id, its identity directory, whether it has booted the
-network, its uptime, which beam links are still being served, and which files
-other devices pushed to it during this session. The pushed-file list holds the
-last 100 arrivals; `received_total` reports how many arrived in all.
+network, its uptime, which beam links are still being served, which files other
+devices pushed to it during this session, and which sends are still queued for
+a device that has not answered. The pushed-file list holds the last 100
+arrivals; `received_total` reports how many arrived in all. Every queued record
+is listed, with the device it is for and the last error it hit;
+`queue_blocked_reason` says when this server can move none of them.
 
 ## Pairing an iOS device, step by step
 
@@ -220,7 +243,8 @@ Settings peer list instead.
 |---|---|
 | `remote/identity.key` | The ed25519 secret key that IS this server's identity. Written `0600`. Deleting it changes the node id and orphans every pairing. |
 | `remote/peers.json` | The devices this server trusts, and the scope each was granted here. Deleting an entry revokes it on the next request. |
-| `remote/blobs/` | The content-addressed store staged files are served from. |
+| `remote/blobs/` | The content-addressed store staged files are served from. A staged copy is kept alive by a tag; when the last tag on it goes, the store's collector frees the bytes within a minute. |
+| `remote/outbox/` | One `0600` record per send that was accepted for a device that did not answer, plus — in the store above — a private copy of the file itself, until it is delivered or expires. |
 | `received/<date>/` | Files other devices pushed to this server. |
 
 Nothing is ever written into your own source tree.
@@ -260,6 +284,13 @@ bytes, staged as `.partial` and only then moved into place.
 a receiver refuses one that names a third machine, so a control peer can never
 make it fetch from somewhere else.
 
+**A queued send is a private copy of your file.** Accepting a send to a device
+that is not there means copying the file into `remote/blobs/` and keeping it
+there until it is delivered or the record expires — up to seven days. Nothing
+leaves the machine in the meantime, and the copy is released the moment the
+delivery lands. This is why a device that is known not to grant `control` is
+refused outright instead of having files kept here for it.
+
 **No stdout.** Stdout is the JSON-RPC channel. Every log line goes to stderr.
 
 ## Troubleshooting
@@ -285,9 +316,17 @@ gets slower.
 **A beam link stopped working** — the server process ended (the Claude Code
 session closed) or the TTL expired. Mint a new one.
 
+**A send came back "queued"** — the device did not answer, and the file is
+waiting here instead of failing. Open Vlervtifacts on that device: the dial it
+makes on the way up is what sends the file. `server_status` shows every waiting
+record with the last error it hit.
+
 **"another Vlerv process is already using the blob store"** — one state
 directory serves one process at a time, and every Claude Code session starts
-its own `vlerv-mcp`. Close the other session, or give this one its own
+its own `vlerv-mcp`. That claim is also what makes one process the only one
+that may move the queue: a session without it can list queued sends in
+`server_status` but delivers none of them, and says so in
+`queue_blocked_reason`. Close the other session, or give this one its own
 `VLERV_MCP_STATE_DIR`. A separate state directory means a separate node id, so
 that server starts with no paired devices. (The message itself says "its own
 state directory" rather than naming a variable: the same check guards

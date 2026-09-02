@@ -72,6 +72,17 @@ impl Dirs {
     pub fn received(&self) -> PathBuf {
         self.base.join("received")
     }
+
+    /// `<base>/remote/outbox/` — one file per accepted-but-undelivered send.
+    /// A record names a peer, a local path and a pinned hash, so it is a
+    /// capability document and lives in the 0600 class with identity.key.
+    ///
+    /// Under `remote/`, beside the blob store it pins bytes in: the process
+    /// holding `blobs_lock()` is the only one that may open that store, so it
+    /// is also the only one that may write here.
+    pub fn outbox(&self) -> PathBuf {
+        self.remote().join("outbox")
+    }
 }
 
 /// The last component of a path, as owned display text. `None` for a root or
@@ -158,6 +169,7 @@ mod tests {
         assert_eq!(dirs.blobs(), Path::new("/tmp/state/remote/blobs"));
         assert_eq!(dirs.blobs_lock(), Path::new("/tmp/state/remote/blobs.lock"));
         assert_eq!(dirs.cache(), Path::new("/tmp/state/remote/cache"));
+        assert_eq!(dirs.outbox(), Path::new("/tmp/state/remote/outbox"));
         assert_eq!(dirs.received(), Path::new("/tmp/state/received"));
         assert_eq!(dirs.base(), Path::new("/tmp/state"));
     }

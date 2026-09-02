@@ -29,7 +29,7 @@ use vlerv_remote::beam::human_bytes;
 use crate::args::{
     BeamArtifactArgs, ConfirmPairingArgs, ListDevicesArgs, SendToDeviceArgs, StopBeamArgs,
 };
-use crate::core::{McpCore, ServerStatus};
+use crate::core::{Delivery, McpCore, ServerStatus};
 
 /// The rmcp handler. Holds the core behind an `Arc` because rmcp clones the
 /// service per connection.
@@ -145,7 +145,12 @@ impl VlervMcp {
                        and opens there. Use this when the user names a destination (\"send it to \
                        my phone\", \"push this to the Mac Studio\"). The device argument matches a \
                        device name or a node-id prefix; call list_devices first if you are not \
-                       sure of the name. This only works when the target device granted this \
+                       sure of the name. A device that is asleep or off the network does not \
+                       fail the call: the file is COPIED as it is now and queued, the result \
+                       says status \"queued\" instead of \"delivered\", and it goes out when \
+                       that device comes back while this server is running. Read the status \
+                       field and tell the user which of the two happened — a queued file is not \
+                       on their device yet. This only works when the target device granted this \
                        server the \"control\" scope; the error text says so when it has not."
     )]
     async fn send_to_device(
@@ -153,13 +158,7 @@ impl VlervMcp {
         Parameters(args): Parameters<SendToDeviceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         render(self.core.send_to_device(&args.path, &args.device).await, |delivery| {
-            format!(
-                "Delivered {} ({}) to {}. It landed there as \"{}\" and opened on that device.",
-                args.path,
-                human_bytes(delivery.size),
-                delivery.device,
-                delivery.name
-            )
+            delivery_summary(&args.path, delivery)
         })
     }
 
@@ -263,11 +262,37 @@ impl VlervMcp {
         description = "Report this MCP server's own identity and state: its node id, where its \
                        identity and peer list live on disk, whether it has opened a network \
                        connection yet, how long it has been running, which beam links are still \
-                       being served, and which files other devices pushed to it. Use it to \
-                       diagnose a failed send or to tell the user which links are still live."
+                       being served, which files other devices pushed to it, and which sends are \
+                       queued for a device that was not reachable. Use it to diagnose a failed \
+                       send, to tell the user which links are still live, or to answer \"did my \
+                       file get there yet\" — a queued entry has not."
     )]
     async fn server_status(&self) -> Result<CallToolResult, ErrorData> {
         render(self.core.server_status().await, status_summary)
+    }
+}
+
+/// The sentence `send_to_device` returns, one per outcome. A free function
+/// beside `status_summary` and for the same reason: both sentences have to be
+/// assertable without a device on the far end of a socket.
+///
+/// The VARIANT picks the verb. Nothing here may read "delivered" for a file
+/// that is still on this machine — that is the original silent failure told
+/// in a friendlier voice, and the type is what makes it impossible.
+fn delivery_summary(path: &str, delivery: &Delivery) -> String {
+    match delivery {
+        Delivery::Delivered { device, name, size, .. } => format!(
+            "Delivered {path} ({}) to {device}. It landed there as \"{name}\" and opened on \
+             that device.",
+            human_bytes(*size)
+        ),
+        Delivery::Queued { device, name, size, reason, notes, .. } => format!(
+            "NOT delivered yet — {device} did not answer ({reason}). {path} ({}) is queued as \
+             \"{name}\" and goes out the moment that device is reachable again. Tell the user \
+             it has not arrived on their device.\n{}",
+            human_bytes(*size),
+            notes.join("\n")
+        ),
     }
 }
 
@@ -289,7 +314,7 @@ fn status_summary(status: &ServerStatus) -> String {
     };
     format!(
         "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
-         {}\nactive beam links: {}\nreceived this session: {}{}",
+         {}\nactive beam links: {}\nreceived this session: {}{}\n{}",
         status.device,
         status.node_id_short,
         status.identity_dir.display(),
@@ -298,7 +323,56 @@ fn status_summary(status: &ServerStatus) -> String {
         status.paired_devices,
         status.active_offers.len(),
         status.received_total,
-        listed
+        listed,
+        queue_line(status)
+    )
+}
+
+/// The queue's line in the status report.
+///
+/// A count on its own is the failure this whole surface exists to remove: a
+/// reader who is told "3 queued" and nothing else cannot tell a queue that is
+/// about to move from one that is stuck behind a store another process owns,
+/// and would report the first while looking at the second. So the reason
+/// comes first whenever there is one, and the devices are named — the person
+/// asking already knows which one they were waiting for.
+fn queue_line(status: &ServerStatus) -> String {
+    // A record this build cannot read is a promise nobody is keeping, so it
+    // is named wherever the queue is named — including next to a count of 0,
+    // which is exactly when it would otherwise be invisible.
+    let unreadable = if status.queue_unreadable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{} queued record(s) this build cannot read, so they are never sent and never \
+             deleted: {}",
+            status.queue_unreadable.len(),
+            status.queue_unreadable.join(", ")
+        )
+    };
+    if let Some(reason) = &status.queue_blocked_reason {
+        return format!(
+            "queued deliveries: {} — NONE of them can move: {reason}{unreadable}",
+            status.queued_total
+        );
+    }
+    if status.queued_total == 0 {
+        return format!("queued deliveries: 0{unreadable}");
+    }
+    let waiting: Vec<String> = status
+        .queued
+        .iter()
+        .map(|q| match &q.last_error {
+            Some(e) => format!("- {} to {} (attempt {}: {e})", q.name, q.device, q.attempts),
+            None => format!("- {} to {} (not tried yet)", q.name, q.device),
+        })
+        .collect();
+    format!(
+        "queued deliveries: {} holding {}, NOT delivered yet{}:\n{}{unreadable}",
+        status.queued_total,
+        human_bytes(status.queued_bytes),
+        if status.draining { ", a drain pass is running" } else { "" },
+        waiting.join("\n")
     )
 }
 
@@ -323,7 +397,12 @@ impl ServerHandler for VlervMcp {
                  both screens — always show them and wait;\n\
                  2. send_to_device works only after the receiving device grants this server the \
                  \"control\" scope on its own side.\n\n\
-                 Links from beam_artifact stay fetchable only while this server process runs.",
+                 send_to_device answers with a status of either \"delivered\" or \"queued\". \
+                 \"queued\" means the device was asleep, the file was copied as it stood and is \
+                 waiting here — it is NOT on that device, and saying it is would be wrong. Say \
+                 which one happened, and use server_status to report what is still waiting.\n\n\
+                 Links from beam_artifact stay fetchable only while this server process runs, \
+                 and so does the queue: nothing is delivered after this server exits.",
             )
     }
 }
@@ -423,8 +502,39 @@ mod tests {
                 })
                 .collect(),
             received_total: total,
+            queued: Vec::new(),
+            queued_total: 0,
+            queued_bytes: 0,
+            retained_bytes: 0,
+            queue_unreadable: Vec::new(),
+            draining: false,
+            queue_blocked_reason: None,
             roots: Vec::new(),
         }
+    }
+
+    /// A status with one send waiting for a device that did not answer.
+    fn status_with_queue(last_error: Option<&str>) -> ServerStatus {
+        let mut status = status_with(0, 0);
+        status.queued = vec![crate::core::QueuedDelivery {
+            id: "0000000000001-0000".to_string(),
+            device: "Val's iPhone".to_string(),
+            node_id: "cd".repeat(32),
+            node_id_short: "cdcdcdcdcd".to_string(),
+            name: "report.html".to_string(),
+            size: 4096,
+            hash: "ab".repeat(32),
+            source: "/w/report.html".into(),
+            enqueued_at: 100,
+            expires_at: 200,
+            attempts: 2,
+            last_attempt_at: 150,
+            last_error: last_error.map(str::to_string),
+        }];
+        status.queued_total = 1;
+        status.queued_bytes = 4096;
+        status.retained_bytes = 4096;
+        status
     }
 
     #[test]
@@ -444,6 +554,97 @@ mod tests {
         // The boundary: exactly at the cap, nothing was dropped.
         let at_cap = status_summary(&status_with(100, 100));
         assert!(!at_cap.contains("listing"), "{at_cap}");
+    }
+
+    #[test]
+    fn a_queued_send_never_reads_as_a_delivered_one() {
+        // The failure this whole feature exists to remove is a send that
+        // reads as done and is not. The tagged answer is what makes the two
+        // sentences impossible to confuse, so both are pinned here.
+        let delivered = delivery_summary(
+            "/w/report.html",
+            &Delivery::Delivered {
+                device: "Val's iPhone".to_string(),
+                node_id: "cd".repeat(32),
+                name: "report.html".to_string(),
+                size: 4096,
+                hash: "ab".repeat(32),
+            },
+        );
+        assert!(
+            delivered.starts_with("Delivered /w/report.html (4 KiB) to Val's iPhone."),
+            "{delivered}"
+        );
+        assert!(delivered.contains("landed there"), "{delivered}");
+
+        let outcome = Delivery::Queued {
+            device: "Val's iPhone".to_string(),
+            node_id: "cd".repeat(32),
+            name: "report.html".to_string(),
+            size: 4096,
+            hash: "ab".repeat(32),
+            id: "0000000000001-0000".to_string(),
+            expires_at: 200,
+            reason: "peer offline — could not reach it (timed out)".to_string(),
+            notes: vec!["The file was copied as it stands right now.".to_string()],
+        };
+        // The tag is what a client reads, and `structuredContent` is typed as
+        // an OBJECT: an enum serialized any other way is rejected before the
+        // model sees a word of it, which is what `ok` refuses at runtime.
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("queued"), "{json}");
+        assert!(json.is_object(), "{json}");
+
+        let queued = delivery_summary("/w/report.html", &outcome);
+        assert!(queued.starts_with("NOT delivered yet"), "{queued}");
+        assert!(!queued.contains("Delivered"), "no reading of this may say it arrived: {queued}");
+        assert!(queued.contains("peer offline"), "the cause is quoted, not paraphrased: {queued}");
+        assert!(queued.contains("has not arrived"), "{queued}");
+        // The notes are the honest part — snapshot semantics, the running
+        // server, the deadline — and dropping them makes the sentence a lie
+        // of omission.
+        assert!(queued.contains("copied as it stands right now"), "{queued}");
+    }
+
+    #[test]
+    fn a_queue_that_cannot_move_names_its_reason_instead_of_reporting_a_count() {
+        // A second Claude Code session over one state directory can see the
+        // queue and cannot touch it. Reporting "1 queued" there reads as "it
+        // is on its way", which is the same silent failure in a new place.
+        let mut blocked = status_with_queue(None);
+        blocked.queue_blocked_reason =
+            Some("another Vlerv process is already using the blob store".to_string());
+        let text = status_summary(&blocked);
+        assert!(text.contains("NONE of them can move"), "{text}");
+        assert!(text.contains("already using the blob store"), "{text}");
+
+        // With nothing blocking it, the queue names what is waiting and why
+        // the last attempt did not land.
+        let waiting = status_summary(&status_with_queue(Some("peer offline — could not reach it")));
+        assert!(waiting.contains("queued deliveries: 1 holding 4 KiB"), "{waiting}");
+        assert!(waiting.contains("NOT delivered yet"), "{waiting}");
+        assert!(waiting.contains("report.html to Val's iPhone"), "{waiting}");
+        assert!(waiting.contains("attempt 2: peer offline"), "{waiting}");
+        assert!(
+            !waiting.contains("a drain pass is running"),
+            "a queue nothing is touching must not claim otherwise: {waiting}"
+        );
+
+        // And a queue something IS touching says so. The count alone reads
+        // the same either way, and those are different situations for the
+        // person deciding whether to wait.
+        let mut moving = status_with_queue(Some("peer offline — could not reach it"));
+        moving.draining = true;
+        assert!(status_summary(&moving).contains("a drain pass is running"), "{moving:?}");
+
+        // An empty queue says so in one line, and an unreadable record is
+        // named even then — it is a delivery that is quietly not happening.
+        let mut empty = status_with(0, 0);
+        assert!(status_summary(&empty).contains("queued deliveries: 0"));
+        empty.queue_unreadable = vec!["0000000000001-0000".to_string()];
+        let broken = status_summary(&empty);
+        assert!(broken.contains("cannot read"), "{broken}");
+        assert!(broken.contains("0000000000001-0000"), "{broken}");
     }
 
     #[test]

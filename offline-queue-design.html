@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vlerv — serverless outbox for sends to a sleeping device</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1f1f1f;
+  --fg-muted: #6e6e6e;
+  --heading-fg: #1a1a1a;
+  --accent: #1976d2;
+  --border: #e0e0e0;
+  --code-bg: #f0f0f0;
+  --code-fg: #6e3700;
+  --pre-bg: #fafafa;
+  --aside-bg: #f5f5f5;
+  --success: #2e7d32;
+  --warning: #9a5b00;
+  --error: #d32f2f;
+  --success-bg: #f3f8f4;
+  --warning-bg: #fbf7f0;
+  --error-bg: #fdf5f5;
+  --diagram-node-bg: #fafafa;
+  --diagram-edge: #8a8a8a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --fg: #cccccc;
+    --fg-muted: #9e9e9e;
+    --heading-fg: #e8e8e8;
+    --accent: #4dabf7;
+    --border: #2a2a2a;
+    --code-bg: #2a2a2a;
+    --code-fg: #f0e8d8;
+    --pre-bg: #161616;
+    --aside-bg: #242424;
+    --success: #66bb6a;
+    --warning: #f0c674;
+    --error: #ff7676;
+    --success-bg: #1e251f;
+    --warning-bg: #29241a;
+    --error-bg: #2a1f1f;
+    --diagram-node-bg: #242424;
+    --diagram-edge: #7a7a7a;
+  }
+}
+@media print {
+  :root {
+    color-scheme: light;
+    --bg: #ffffff; --fg: #1f1f1f; --fg-muted: #6e6e6e; --heading-fg: #1a1a1a;
+    --accent: #1976d2; --border: #e0e0e0; --code-bg: #f0f0f0; --code-fg: #6e3700;
+    --pre-bg: #fafafa; --aside-bg: #f5f5f5; --success: #2e7d32; --warning: #9a5b00;
+    --error: #d32f2f; --success-bg: #f3f8f4; --warning-bg: #fbf7f0; --error-bg: #fdf5f5;
+    --diagram-node-bg: #fafafa; --diagram-edge: #8a8a8a;
+  }
+  details { display: block; }
+  details > summary { list-style: none; }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+  max-width: 960px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+h1, h2, h3, h4 { color: var(--heading-fg); line-height: 1.25; }
+h1 { font-size: 2rem; margin: 0 0 .4rem; letter-spacing: -.01em; }
+h2 { font-size: 1.3rem; margin: 2.6rem 0 .8rem; padding-top: 1.2rem; border-top: 1px solid var(--border); }
+h3 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; margin: 1.6rem 0 .5rem; }
+h4 { font-size: 1rem; font-weight: 600; margin: 1.2rem 0 .4rem; }
+p, li { max-width: 76ch; }
+a { color: var(--accent); }
+small, figcaption, th { color: var(--fg-muted); }
+small, figcaption, th, code, .de { font-size: .9em; }
+code { background: var(--code-bg); color: var(--code-fg); padding: .1rem .3rem; border-radius: 3px; }
+pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 5px; padding: .9rem 1rem; overflow-x: auto; }
+pre code { background: none; color: inherit; padding: 0; font-size: .875rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border-bottom: 1px solid var(--border); padding: .5rem .6rem; text-align: left; vertical-align: top; }
+th { font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+aside { background: var(--aside-bg); border: 1px solid var(--border); border-radius: 4px; padding: .7rem 1rem; margin: 1.1rem 0; }
+aside.success { background: var(--success-bg); }
+aside.warning { background: var(--warning-bg); }
+aside.error   { background: var(--error-bg); }
+aside p:first-child { margin-top: 0; }
+aside p:last-child  { margin-bottom: 0; }
+aside :is(strong, b):first-child         { color: var(--heading-fg); }
+aside.success :is(strong, b):first-child { color: var(--success); }
+aside.warning :is(strong, b):first-child { color: var(--warning); }
+aside.error   :is(strong, b):first-child { color: var(--error); }
+header p.lede { color: var(--fg-muted); margin: .2rem 0 0; }
+nav ol { padding-left: 1.2rem; margin: .6rem 0 0; }
+nav li { margin: .15rem 0; }
+figure { margin: 1.4rem 0; }
+figure svg { width: 100%; height: auto; display: block; }
+details { border: 1px solid var(--border); border-radius: 5px; padding: .55rem .9rem; margin: .55rem 0; background: var(--pre-bg); }
+details[open] { padding-bottom: .9rem; }
+summary { cursor: pointer; font-weight: 600; color: var(--heading-fg); }
+summary .step-files { display: block; font-weight: 400; color: var(--fg-muted); font-size: .9em; margin-top: .2rem; }
+.badge { display: inline-block; font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; border: 1px solid var(--border); border-radius: 3px; padding: .05rem .4rem; color: var(--fg-muted); }
+.badge.core { color: var(--success); }
+.badge.later { color: var(--warning); }
+footer { margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--border); color: var(--fg-muted); font-size: .9em; }
+@media (max-width: 720px) {
+  body { padding: 1.5rem 1rem 3rem; font-size: 15px; }
+  h1 { font-size: 1.6rem; }
+  table { font-size: .9em; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>A serverless outbox for sends to a sleeping device</h1>
+  <p class="lede">Design specification — vlerv · <code>crates/vlerv-mcp</code> + <code>crates/vlerv-remote</code></p>
+</header>
+
+<nav aria-label="Contents">
+  <h3>Contents</h3>
+  <ol>
+    <li><a href="#problem">The failure we are fixing</a></li>
+    <li><a href="#decision">The decision, and what does not change</a></li>
+    <li><a href="#flow">How a delayed delivery works</a></li>
+    <li><a href="#model">On-disk model and blob lifetime</a></li>
+    <li><a href="#triggers">Drain triggers and backoff</a></li>
+    <li><a href="#plan">Work plan, eight steps</a></li>
+    <li><a href="#tests">Tests that define done</a></li>
+    <li><a href="#limits">What still does not work</a></li>
+    <li><a href="#rejected">Rejected alternatives</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="problem">
+<h2>1 · The failure we are fixing</h2>
+
+<p>iOS suspends the Vlervtifacts app when it leaves the foreground and closes its sockets. A push from
+the MCP server then fails in one of two ways, both observed in a live session on 2026-09-02:</p>
+
+<pre><code>localhost (50baf24c5c) is not reachable: peer offline — could not reach it (timed out).
+the session is closed</code></pre>
+
+<p>The second message is the important one. <code>McpCore::session</code> returns a cached session without
+dialing while <code>is_closed()</code> reads false (<code>crates/vlerv-mcp/src/core.rs:650-657</code>), and
+<code>is_closed()</code> is a cached <code>AtomicBool</code>, not a probe
+(<code>crates/vlerv-remote/src/scope.rs:1123</code>). After an iOS suspension the flag is still false, so the
+failure arrives from <code>request</code>, not from the dial.</p>
+
+<aside class="warning">
+<p><strong>Consequence for the design.</strong> A queue that classifies only dial failures never fires in the
+exact case the user hit. The push failure must be typed too.</p>
+</aside>
+
+<p>There is no <code>UIBackgroundModes</code> key in <code>src-tauri/Info.ios.plist</code> and no APNs code in
+the repository. Nothing can wake the app. The chosen fix therefore does not try to: it accepts the send,
+holds it, and delivers it the next time the device is reachable.</p>
+</section>
+
+<section id="decision">
+<h2>2 · The decision, and what does not change</h2>
+
+<p>A sender-side durable outbox in <code>vlerv-mcp</code>, drained by the process that holds the blob-store
+lock. No central server, no relay with storage, and no change to the product promise that nothing is
+uploaded to a server.</p>
+
+<table>
+<thead><tr><th>Area</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><td>Wire protocol</td><td>Untouched. No new <code>Req</code>, <code>Res</code> or <code>Event</code> variant, no <code>HelloAck</code> field, no new ALPN, <code>PROTO_VERSION</code> stays 1. The queue replays the existing <code>Req::PushArtifact</code> (wire tag 9).</td></tr>
+<tr><td>Who owns the queue</td><td>The process holding <code>remote/blobs.lock</code>. The <code>StoreLock</code> already permits one process per state directory, so it is the outbox lock too. No second lock.</td></tr>
+<tr><td>What is stored</td><td>The bytes, staged into the blob store at enqueue and pinned by a named tag. Not a path re-read later.</td></tr>
+<tr><td>Delivery guarantee</td><td>At least once. A duplicate lands visibly as <code>report-2.html</code> through the existing Beam collision rule.</td></tr>
+<tr><td>Tool surface</td><td>No new MCP tool. <code>send_to_device</code> returns a tagged <code>Delivery</code> enum: <code>Delivered</code> or <code>Queued</code>.</td></tr>
+</tbody>
+</table>
+
+<h3>Why no new protocol verb</h3>
+<p>An appended <code>Req</code> variant sent to an older peer is not ignored. <code>decode_frame</code> returns
+<code>Err</code> (<code>proto.rs:195-197</code>), <code>ScopeServer::serve</code> propagates it
+(<code>scope.rs:933-938</code>), and the connection closes. The client then reports
+<code>the session is closed</code> — the exact string of the bug being fixed, and indistinguishable from a
+sleeping phone. Appending a field to <code>HelloAck</code> breaks the other direction: postcard ignores
+trailing bytes, so a new reader of an old payload fails with <code>DeserializeUnexpectedEnd</code>.</p>
+
+<aside>
+<p><strong>Standing rule.</strong> Capability discovery is the ALPN. If a wire verb is ever required, register
+it on its own ALPN beside <code>SCOPE_ALPN</code> and <code>PAIR_ALPN</code>, so an older peer refuses the dial
+locally instead of having an established session torn down.</p>
+</aside>
+</section>
+
+<section id="flow">
+<h2>3 · How a delayed delivery works</h2>
+
+<figure>
+<svg viewBox="0 0 920 460" role="img" aria-label="Flow from send_to_device through the outbox to the phone">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--diagram-edge)"/>
+    </marker>
+  </defs>
+  <g font-size="13" font-family="system-ui, sans-serif" fill="currentColor">
+
+    <text x="0" y="16" font-size="12" fill="var(--fg-muted)">ACCEPT PATH — one tool call</text>
+
+    <rect x="0" y="30" width="150" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="75" y="50" text-anchor="middle">send_to_device</text>
+    <text x="75" y="66" text-anchor="middle" font-size="11" fill="var(--fg-muted)">gate → resolve → boot</text>
+
+    <line x1="150" y1="53" x2="196" y2="53" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+
+    <rect x="200" y="30" width="150" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="275" y="50" text-anchor="middle">dial + push</text>
+    <text x="275" y="66" text-anchor="middle" font-size="11" fill="var(--fg-muted)">typed failure</text>
+
+    <line x1="350" y1="53" x2="396" y2="53" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <text x="373" y="44" text-anchor="middle" font-size="11" fill="var(--success)">ok</text>
+
+    <rect x="400" y="30" width="150" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="var(--success)" stroke-width="1.5"/>
+    <text x="475" y="58" text-anchor="middle">Delivery::Delivered</text>
+
+    <line x1="275" y1="76" x2="275" y2="126" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <text x="285" y="104" font-size="11" fill="var(--warning)">Unreachable / Transport</text>
+
+    <line x1="600" y1="53" x2="646" y2="53" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <text x="575" y="53" text-anchor="middle" font-size="11" fill="var(--error)">Refused / Local / Denied</text>
+    <rect x="650" y="30" width="150" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="var(--error)" stroke-width="1.5"/>
+    <text x="725" y="52" text-anchor="middle">hard error</text>
+    <text x="725" y="68" text-anchor="middle" font-size="11" fill="var(--fg-muted)">nothing staged</text>
+
+    <text x="0" y="150" font-size="12" fill="var(--fg-muted)">ENQUEUE — disk before memory</text>
+
+    <rect x="200" y="164" width="220" height="66" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="310" y="186" text-anchor="middle">stage bytes into blob store</text>
+    <text x="310" y="204" text-anchor="middle" font-size="11" fill="var(--fg-muted)">pinned by tag outbox/&lt;id&gt;</text>
+    <text x="310" y="221" text-anchor="middle" font-size="11" fill="var(--fg-muted)">write outbox/&lt;id&gt;.json, 0600</text>
+
+    <line x1="420" y1="197" x2="466" y2="197" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <rect x="470" y="174" width="180" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="var(--warning)" stroke-width="1.5"/>
+    <text x="560" y="202" text-anchor="middle">Delivery::Queued</text>
+
+    <text x="0" y="262" font-size="12" fill="var(--fg-muted)">DRAIN — same process, later</text>
+
+    <rect x="0" y="276" width="200" height="80" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="100" y="296" text-anchor="middle">supervisor</text>
+    <text x="100" y="314" text-anchor="middle" font-size="11" fill="var(--fg-muted)">T1 PeerConnected</text>
+    <text x="100" y="330" text-anchor="middle" font-size="11" fill="var(--fg-muted)">T2 boot pass</text>
+    <text x="100" y="346" text-anchor="middle" font-size="11" fill="var(--fg-muted)">T3 backoff timer</text>
+
+    <line x1="310" y1="230" x2="310" y2="272" stroke="var(--diagram-edge)" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+    <text x="320" y="256" font-size="11" fill="var(--fg-muted)">reload on boot</text>
+
+    <line x1="200" y1="316" x2="246" y2="316" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+
+    <rect x="250" y="276" width="220" height="80" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="360" y="296" text-anchor="middle">drain_peer</text>
+    <text x="360" y="314" text-anchor="middle" font-size="11" fill="var(--fg-muted)">one dial per peer</text>
+    <text x="360" y="330" text-anchor="middle" font-size="11" fill="var(--fg-muted)">control-scope check</text>
+    <text x="360" y="346" text-anchor="middle" font-size="11" fill="var(--fg-muted)">push_staged, fresh ticket</text>
+
+    <line x1="470" y1="316" x2="516" y2="316" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+
+    <rect x="520" y="276" width="180" height="80" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="610" y="304" text-anchor="middle">phone fetches</text>
+    <text x="610" y="322" text-anchor="middle" font-size="11" fill="var(--fg-muted)">blobs ALPN, dials back</text>
+    <text x="610" y="338" text-anchor="middle" font-size="11" fill="var(--fg-muted)">BLAKE3 verified</text>
+
+    <line x1="700" y1="316" x2="746" y2="316" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <rect x="750" y="293" width="170" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="var(--success)" stroke-width="1.5"/>
+    <text x="835" y="315" text-anchor="middle">received/&lt;date&gt;/</text>
+    <text x="835" y="331" text-anchor="middle" font-size="11" fill="var(--fg-muted)">on the phone</text>
+
+    <line x1="360" y1="356" x2="360" y2="396" stroke="var(--diagram-edge)" marker-end="url(#ar)"/>
+    <rect x="250" y="400" width="220" height="46" rx="5" fill="var(--diagram-node-bg)" stroke="currentColor" stroke-width="1"/>
+    <text x="360" y="422" text-anchor="middle">on Res::Pushed</text>
+    <text x="360" y="438" text-anchor="middle" font-size="11" fill="var(--fg-muted)">delete record, then unpin tag</text>
+  </g>
+</svg>
+<figcaption>The bytes never touch a third party. The receiver still dials back on the blobs ALPN and streams
+directly from the sender's store, exactly as an immediate push does today.</figcaption>
+</figure>
+
+<h3>What decides "queue" instead of "fail"</h3>
+
+<p>Two new error enums in <code>scope.rs</code>, each with a <code>Display</code> that yields the inner string
+verbatim so no user-visible sentence changes byte for byte:</p>
+
+<pre><code>pub enum ConnectError { Unreachable(String), Refused(String) }
+pub enum PushFailure  { Local(String), Transport(String), Denied(String) }</code></pre>
+
+<table>
+<thead><tr><th>Cause</th><th>Variant</th><th>Outcome</th></tr></thead>
+<tbody>
+<tr><td>dial failed, or the peer did not answer the handshake</td><td><code>Unreachable</code></td><td>enqueue</td></tr>
+<tr><td>stream refused, version mismatch, <code>Res::Denied</code>, unexpected frame</td><td><code>Refused</code></td><td>hard error</td></tr>
+<tr><td><code>request</code> returned <code>the session is closed</code></td><td><code>Transport</code></td><td>re-dial once, then classify the re-dial</td></tr>
+<tr><td>path gate refused, malformed peer id, staging failed</td><td><code>Local</code></td><td>hard error</td></tr>
+<tr><td>host answered <code>Res::Denied</code></td><td><code>Denied</code></td><td>hard error</td></tr>
+</tbody>
+</table>
+
+<aside class="error">
+<p><strong>Never queue a caller error.</strong> A bad path, an unknown device, a missing control grant and a
+claimed store all fail loudly with today's wording and stage nothing. A caller error that silently becomes a
+pending delivery is the bug class this repository hunts.</p>
+</aside>
+
+<h3>The grant pre-check</h3>
+<p><code>peers::Peer</code> gains <code>last_ack_scope: Option&lt;String&gt;</code>, written on every successful
+handshake. If it says the device granted less than <code>control</code>, the send is refused and nothing is
+staged. Without this, a device that never granted control accumulates private full copies of user files for
+the whole retention window. The field is a hint, never an authority: the receiver's own
+<code>Scope::allows</code> filter still decides whether bytes may land.</p>
+</section>
+
+<section id="model">
+<h2>4 · On-disk model and blob lifetime</h2>
+
+<p>One file per record at <code>&lt;base&gt;/remote/outbox/&lt;id&gt;.json</code>, mode 0600, beside
+<code>identity.key</code> in the same privacy class. A whole-list document is rejected because completing a
+delivery must be an atomic <code>remove_file</code> that cannot lose an unrelated record, and because a corrupt
+document must poison one delivery rather than the whole spool.</p>
+
+<pre><code>pub struct Record {
+    pub id: String,          // "{unix_millis:013}-{seq:04}-{hash[..8]}"
+    pub peer: String,        // 64-hex NodeId, the peers.json key
+    pub device: String,      // display only, as it stood at enqueue
+    pub source: PathBuf,     // the canonical path the gate resolved
+    pub name: String,
+    pub size: u64,
+    pub hash: String,        // BLAKE3 hex of the STAGED bytes
+    pub tag: String,         // "outbox/&lt;id&gt;" — the pin
+    pub enqueued_at: u64,
+    pub expires_at: u64,
+    pub attempts: u32,
+    pub last_attempt_at: u64,
+    pub last_error: Option&lt;String&gt;,
+}</code></pre>
+
+<p>The record holds no <code>BlobTicket</code> and no grant. Both are minted per attempt: a stored ticket names
+addresses this process no longer has, and grants are in-memory with a one-hour lifetime.</p>
+
+<h3>Caps</h3>
+<table>
+<thead><tr><th>Constant</th><th>Value</th><th>Behaviour at the limit</th></tr></thead>
+<tbody>
+<tr><td><code>MAX_RECORDS</code></td><td>64</td><td>refuse the send, naming the cap and the device</td></tr>
+<tr><td><code>MAX_SPOOL_BYTES</code></td><td>1 GiB</td><td>refuse the send</td></tr>
+<tr><td><code>RECORD_TTL_SECS</code></td><td>7 days</td><td>expire, unpin, report in <code>server_status</code></td></tr>
+<tr><td><code>DRAIN_TICK</code></td><td>60 s</td><td>timer branch, skipped while the spool is empty</td></tr>
+<tr><td><code>MAX_PER_PASS</code></td><td>8</td><td>records per peer per pass, in id order</td></tr>
+</tbody>
+</table>
+
+<p>A full spool refuses the send. It never drops the oldest record: the received log drops its oldest because
+that is a log line, while the oldest queue record is the user's file.</p>
+
+<h3>Why the bytes are captured at enqueue</h3>
+<p>Claude Code writes a file and keeps editing it. Re-reading the source at drain time would deliver bytes the
+user never accepted, or fail outright on a deleted file. <code>add_path</code> is <code>ImportMode::Copy</code>,
+so the store's copy is independent of the source. Staging is one await —
+<code>add_path(path).with_named_tag("outbox/&lt;id&gt;")</code> — rather than add, then set a tag, then delete the
+automatic one, whose crash window leaks an <code>auto-*</code> tag that an <code>outbox/</code> prefix sweep can
+never collect.</p>
+
+<h3>Corruption policy, split by cause</h3>
+<ul>
+<li>A record this build cannot parse is renamed to <code>&lt;id&gt;.json.broken.&lt;unix&gt;</code>, counted, never replayed. Its stem stays in the tag keep-set.</li>
+<li>A record with a newer schema version is left byte for byte alone, counted, and its stem stays in the keep-set.</li>
+<li>If the outbox directory itself cannot be read, <code>enqueue</code> refuses and the tag sweep does not run.</li>
+</ul>
+
+<aside class="error">
+<p><strong>The data-loss path this guards.</strong> Without both guards, one unreadable spool makes the live set
+empty, the sweep unpins every staged copy, and the pending files are gone with no error.</p>
+</aside>
+
+<h3>Grants must not unpin queued bytes</h3>
+<p><code>Grant.tag</code> becomes <code>Option&lt;Tag&gt;</code> and <code>Grants::grant_pinned</code> inserts with
+<code>None</code>, meaning "another owner pins these bytes". This is required, not defensive:
+<code>stage_for_peer</code> calls <code>take_expired</code> on every invocation
+(<code>scope.rs:807</code>) and deletes the returned tags, so without it the one-hour grant lifetime would
+unpin a queued file an hour after enqueue and the drain would push a hash with no bytes behind it. Expired
+grants are still removed from the map and still refused by <code>admit</code> — only the tag collection is
+conditional.</p>
+
+<aside class="warning">
+<p><strong>Deleting a tag frees no disk today.</strong> <code>Blobs::delete</code> is <code>pub(crate)</code> and
+<code>FsStore::load</code> sets <code>gc: None</code>. Until step 8 ships, every queued item is a permanent
+private copy inside the state directory. <code>server_status</code> must report the retained bytes and
+<code>README-MCP.md</code> must say so plainly.</p>
+</aside>
+</section>
+
+<section id="triggers">
+<h2>5 · Drain triggers and backoff</h2>
+
+<table>
+<thead><tr><th></th><th>Trigger</th><th>Precision</th></tr></thead>
+<tbody>
+<tr><td>T1</td><td><code>HostSignal::PeerConnected</code>, emitted in <code>ScopeServer::accept</code> right after the <code>HelloAck</code> is queued</td><td>Exact. The phone dialing in is the receiver-initiated leg, and it needs no wire verb.</td></tr>
+<tr><td>T2</td><td>Boot: one pass after reconciliation</td><td>Delivers work left by a dead process.</td></tr>
+<tr><td>T3</td><td>Timer with a per-peer floor: 60 s, 2 min, 5 min, 10 min, then 10 min</td><td>Fallback. Backoff lives in memory, so a restart retries at once.</td></tr>
+<tr><td>T4</td><td>A successful inline send to a peer notifies that peer's waker</td><td>Opportunistic.</td></tr>
+</tbody>
+</table>
+
+<p>The 60-second floor is a privacy decision as much as a cost one. Every retry is an n0 discovery lookup and a
+possible relay traversal, so each avoided dial is one less third-party observation of who talks to whom.</p>
+
+<p>Records are grouped by peer before dialing. A dial to a suspended peer costs the full 30-second timeout, so
+five records for one sleeping phone must cost one dial, not five.</p>
+</section>
+
+<section id="plan">
+<h2>6 · Work plan, eight steps</h2>
+
+<p>Each step is independently shippable and ordered. Steps 1 to 6 are the queue. Step 7 makes the phone
+reachable at all. Step 8 reclaims disk.</p>
+
+<details>
+<summary>Step 1 — Typed session and push failures, with no behaviour change <span class="badge core">core</span>
+<span class="step-files">scope.rs · core.rs · src-tauri/src/remote.rs</span></summary>
+<p>Add <code>ConnectError</code> and <code>PushFailure</code>. Change <code>ClientSession::connect</code> and
+<code>push_artifact_via</code> to return them. Every call site keeps its exact wording through
+<code>Display</code>. Nothing string-sniffs: matching a <code>PEER_OFFLINE</code> prefix is literally
+unreachable, because <code>McpCore::session</code> wraps the dial error as
+<code>"{label} is not reachable: {e}. …"</code> and puts the marker in the middle.</p>
+<p>This step also replaces the tempting <code>session.is_closed()</code> state test, which races:
+<code>writer_closed</code> is stored only after <code>send.finish()</code> and <code>reader_closed</code> only
+after the read loop breaks, so the error can be observed while both flags still read false.</p>
+</details>
+
+<details>
+<summary>Step 2 — Pinned grants and the staged-push trio <span class="badge core">core</span>
+<span class="step-files">scope.rs</span></summary>
+<p><code>Grant.tag</code> becomes <code>Option&lt;Tag&gt;</code>; <code>take_expired</code> and
+<code>revoke_peer</code> keep their predicates and only collect <code>Some</code> tags. Add
+<code>Grants::grant_pinned</code>. Add <code>push_staged</code>, <code>push_staged_at</code> and
+<code>push_staged_via</code> beside the existing push trio: they take a hash instead of a path, guard
+<code>hash_hex.len() == 64</code> before <code>Hash::from_str</code>, re-grant per attempt, and mint a fresh
+<code>BlobTicket</code> on the current endpoint address. The no-argument form carries the bounded 10-second
+<code>endpoint.online()</code> wait; omitting it would mint a ticket with no relay address, which delivers on
+the same LAN and fails everywhere else.</p>
+</details>
+
+<details>
+<summary>Step 3 — The outbox module and its blob helpers <span class="badge core">core</span>
+<span class="step-files">paths.rs · outbox.rs (new) · beam.rs · lib.rs</span></summary>
+<p><code>Dirs::outbox()</code> beside <code>received()</code>, plus the line in
+<code>every_path_derives_from_the_one_base</code>. The new module carries <code>Record</code>,
+<code>Outbox</code>, the five constants and the load / enqueue / complete / expire surface. Persistence copies
+the shape of <code>peers.rs:351-377</code>: disk before memory, tmp plus rename, 0600, the mutex never held
+across an await. The id is claimed with <code>create_new</code> so a backwards clock jump fails loudly instead
+of overwriting an accepted send. No iroh type appears in any signature, per the <code>lib.rs</code> invariant.</p>
+</details>
+
+<details>
+<summary>Step 4 — Accept and persist: enqueue, the tagged Delivery, the status surface <span class="badge core">core</span>
+<span class="step-files">core.rs · server.rs · peers.rs</span></summary>
+<p><code>Delivery</code> becomes a <code>#[serde(tag = "status")]</code> enum with <code>Delivered</code> and
+<code>Queued</code>. A tagged enum still serializes to a JSON object, which <code>structuredContent</code>
+requires, and the type stops the render code compiling until it decides which case it prints. Add
+<code>outbox: Arc&lt;Outbox&gt;</code> to <code>McpCore</code>, loaded in <code>new()</code> so
+<code>new()</code> still binds nothing. Add <code>last_ack_scope</code> to <code>Peer</code>;
+<code>PEERS_SCHEMA</code> stays 1 because <code>Peer</code> does not deny unknown fields.
+<code>server_status</code> grows the queue depth, the retained bytes, the per-record state and the reason a
+drain is blocked.</p>
+</details>
+
+<details>
+<summary>Step 5 — The drain: reconciliation, supervisor, per-peer pass <span class="badge core">core</span>
+<span class="step-files">core.rs · beam.rs · tests/tool_handlers.rs</span></summary>
+<p>One <code>tokio::spawn</code> inside the <code>boot()</code> <code>OnceCell</code> initializer, after
+<code>endpoint::boot</code> returns <code>Ok</code>. Spawning there and nowhere else preserves the lazy-boot
+contract the tests already assert: a registered but unused server still binds nothing. Boot order is reload,
+then drop records whose bytes are gone, then the guarded orphan-tag sweep, then the supervisor, which runs one
+pass immediately. The supervisor is a single <code>select!</code> over the wake channel and the tick, so two
+passes cannot overlap by construction.</p>
+<p>Per pass: expire, group by peer, one task per peer. Per peer: unpaired means drop and unpin; unreachable
+records the attempt and ends the pass; a scope below control writes today's actionable instruction as
+<code>last_error</code>. Per record: a lexical roots check (not a fresh <code>canonicalize</code>, so a snapshot
+stays deliverable after the source is deleted), a bytes-present check, then the push. On success, delete the
+record file first and unpin second, so a crash between the two leaks a tag the next boot sweep collects rather
+than leaving a record whose bytes are gone.</p>
+</details>
+
+<details>
+<summary>Step 6 — The wake signal <span class="badge core">core</span>
+<span class="step-files">host.rs · scope.rs · core.rs · src-tauri/src/remote.rs</span></summary>
+<p>Append <code>PeerConnected { peer, device, scope }</code> to <code>HostSignal</code> and emit it right after
+the <code>HelloAck</code> is queued, so the signal means "this peer holds a working session", not "this peer
+knocked". <code>PeerDisconnected</code> is deliberately not added: the drain learns the truth from its own dial,
+and every variant costs both consumers an arm. The app's sink logs and returns; the frozen
+<code>vlerv://*</code> webview event namespace gains no name.</p>
+</details>
+
+<details>
+<summary>Step 7 — The app side: make the phone reachable at all <span class="badge core">core</span>
+<span class="step-files">app.rs · remote.rs · state/remote.tsx · Settings.tsx</span></summary>
+<p><strong>Without this step the fix is inert on a default install.</strong>
+<code>preferences.remote_listen</code> defaults to false and <code>listen_at_launch</code> returns before it
+spawns anything when the flag is off, so the phone boots no endpoint and the sender's dial can never connect.
+On iOS, boot whenever the peer store is non-empty, independent of the preference — the lazy-boot promise still
+holds for a fresh install with zero peers — and hide the toggle on iOS, because the phone is the receiver.</p>
+</details>
+
+<details>
+<summary>Step 8 — Real byte reclamation <span class="badge later">later</span>
+<span class="step-files">endpoint.rs · beam.rs · core.rs · README-MCP.md · STATUS.md</span></summary>
+<p>Switch <code>endpoint::boot</code> to <code>FsStore::load_with_opts</code> with a garbage-collection config,
+and sweep orphan <code>auto-*</code> tags at boot through the existing <code>beam::delete_tags</code>. The sweep
+is safe by construction because <code>StoreLock</code> means one process owns the store. Until this lands, the
+documentation must state that a queued send keeps a private copy inside the state directory.</p>
+</details>
+</section>
+
+<section id="tests">
+<h2>7 · Tests that define done</h2>
+
+<h3>The headline proof</h3>
+<p><code>a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes</code> — queue while the host is down,
+then bring a second host up over the same state directory and assert exactly one verified landing.</p>
+
+<aside class="warning">
+<p><strong>Trap in this test.</strong> Shut the host router down <em>and</em> drop the <code>Host</code> plus
+every <code>Arc&lt;RemoteNode&gt;</code> clone before booting the second host. <code>router.shutdown()</code> does
+not release the store lock, so a leftover clone fails the test with "another Vlerv process is already using the
+blob store", which reads like a queue bug and is not one.</p>
+</aside>
+
+<h3>The rest</h3>
+<ul>
+<li><code>a_caller_error_is_refused_outright_and_never_becomes_a_pending_delivery</code> — every existing gate refusal, asserting today's exact wording and a spool depth of zero.</li>
+<li><code>a_spooled_delivery_survives_the_process_that_accepted_it</code> — the restart idiom: drop the core, rebuild over the same tempdir, assert the record reloaded intact.</li>
+<li><code>a_claimed_store_refuses_the_send_instead_of_promising_it</code> — hold the lock, assert the hard error and that nothing was staged.</li>
+<li><code>an_expired_pinned_grant_is_refused_and_unpins_nothing</code> — what stops <code>Option&lt;Tag&gt;</code> turning an expired grant into an immortal fetch capability.</li>
+<li><code>the_grant_sweep_never_deletes_a_tag_the_spool_still_needs</code>.</li>
+<li><code>every_connect_failure_reports_its_own_cause_not_one_string</code> — a table pinning cause to variant, and the <code>Display</code> text byte for byte.</li>
+<li><code>an_unreadable_spool_never_lets_the_sweep_unpin_a_live_record</code>.</li>
+<li><code>a_full_spool_refuses_the_send_instead_of_dropping_the_oldest_file</code>.</li>
+<li><code>a_staged_push_replays_from_the_store_without_reading_the_source_again</code> — stage, delete the source, assert the bytes still land. This is the whole reason bytes are captured at enqueue.</li>
+<li><code>two_sends_of_one_file_to_one_sleeping_device_make_one_record</code>, and the held-outside-roots case.</li>
+<li>The outbox mirror set of the peer-store tests: round trip, reload, quarantine, foreign schema left untouched, id collision refused, 0600.</li>
+</ul>
+
+<h3>Manual gates — there is no CI</h3>
+<pre><code>cargo test --workspace          # 215 today, all must stay green
+pnpm test                       # 148
+npx tsc -p tsconfig.json
+cargo clippy --workspace --all-targets</code></pre>
+
+<aside class="error">
+<p><strong>Do not run <code>cargo fmt</code>.</strong> There is no <code>rustfmt.toml</code>, and default rustfmt
+rewrites all 30 Rust files across 302 hunks.</p>
+</aside>
+</section>
+
+<section id="limits">
+<h2>8 · What still does not work</h2>
+
+<table>
+<thead><tr><th>Limit</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>Delivery needs a live MCP process</td><td>The receiver dials back for the bytes, and only the store-lock holder may open the store. A file accepted at 14:00 with the terminal closed at 14:05 is delivered at the first network-touching tool call of the next session over the same state directory.</td></tr>
+<tr><td>Nothing wakes a suspended iOS app</td><td>If the human never opens Vlervtifacts, no dial succeeds and the record expires at seven days. Only APNs or a background mode changes that, and both are out of scope by choice.</td></tr>
+<tr><td>Two sessions, one state directory</td><td>The second can neither send nor drain: <code>StoreLock</code> refuses rather than queues. It fails hard with the claimed-store message.</td></tr>
+<tr><td>At least once, not exactly once</td><td>If the host lands the bytes and the connection dies before <code>Res::Pushed</code> arrives, the next drain pushes again. It lands as <code>report-2.html</code>, so the duplicate is visible rather than silent.</td></tr>
+<tr><td>Snapshot semantics</td><td>A file edited after the send is delivered as it was at send time. Deliberate, but it changes what "send this file" means, and the queued sentence must say so.</td></tr>
+<tr><td>Roots differ between projects</td><td>A record whose source path is outside the current roots is held, not delivered and not dropped. Visible in <code>server_status</code>; nothing tells the user which session can serve it.</td></tr>
+<tr><td>No cancel surface</td><td>A queued send is withdrawn only by deleting the record file. A tool was left out because every tool is a permanent model-facing surface.</td></tr>
+<tr><td>Wall-clock dependence</td><td>Backoff and expiry both use wall-clock time. A backwards jump delays retries; a forwards jump can expire a record early.</td></tr>
+<tr><td>Old installs stay broken until step 7</td><td>An iOS install that already persisted <code>remote_listen: false</code> accepts sends forever and drains none of them.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="rejected">
+<h2>9 · Rejected alternatives</h2>
+
+<table>
+<thead><tr><th>Alternative</th><th>Why it was cut</th></tr></thead>
+<tbody>
+<tr><td>A new <code>vlerv/inbox/0</code> ALPN so the phone pulls on wake</td><td>Its whole value needs a shipped iOS build, a new foreground hook and a preference change to line up. The sender-side design already delivers whenever the phone becomes reachable for any reason, including that same dial-in.</td></tr>
+<tr><td>A receiver-side <code>delivered.json</code> ledger for exactly-once</td><td>It sits in the general accept path and would turn a deliberate repeat send into a silent no-op — no file, no tab, no signal.</td></tr>
+<tr><td>Re-reading the source path at drain time</td><td>Claude Code edits its own reports. The delivered bytes would not be the accepted bytes, and a deleted source would fail outright.</td></tr>
+<tr><td>Dropping the oldest record when the spool is full</td><td>The oldest record is the user's file, not a log line.</td></tr>
+<tr><td>String-matching the offline error</td><td>The marker sits in the middle of a wrapped sentence. Typed errors are the only reliable signal.</td></tr>
+<tr><td>APNs or <code>UIBackgroundModes</code></td><td>Both need a push service that learns who is sending to whom. The promise is that nothing is uploaded to a server.</td></tr>
+</tbody>
+</table>
+</section>
+
+</main>
+
+<footer>
+<p>Produced from a 12-agent design run: five readers mapped the sender, host, persistence, app and test layers
+with file-and-line evidence; three competing designs were judged on correctness, privacy and fit; the winner
+was synthesized with the losing proposals' best parts grafted in and every fatal flaw the judges named fixed.</p>
+<p>Repository: <code>/Users/valrov/workspace/vlerv</code> · line references are against the working tree at
+commit <code>5f98190</code>.</p>
+</footer>
+
+</body>
+</html>

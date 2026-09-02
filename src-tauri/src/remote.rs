@@ -17,16 +17,21 @@
 // `remote::peers::…` keep working for the deep-link layer and the tests.
 //
 // Lazy-boot contract (design §2): the app makes ZERO network connections
-// until the user invokes a remote action — or, at launch, only when the peer
-// store is non-empty AND `preferences.remote_listen` is on. `RemoteState.node`
-// starts empty and is populated on the first action that truly needs it;
-// listing peers, publishing tabs and revoking a peer never boot it.
+// until the user invokes a remote action — or, at launch, when the peer store
+// is non-empty AND `preferences.remote_listen` is on. Both platforms read
+// that one rule (see `listens_at_launch`). The phone is the receiving end,
+// and a phone that opens no socket cannot be handed a file another machine
+// already accepted for it, so its first paired launch turns the preference
+// ON once (see `adopts_listen_pref`) — the switch still exists, and a user
+// who turns it off is obeyed. `RemoteState.node` starts empty and is
+// populated on the first action that truly needs it; listing peers,
+// publishing tabs and revoking a peer never boot it.
 
 pub use vlerv_remote::{beam, endpoint, peers, proto, scope};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
@@ -77,6 +82,15 @@ pub struct RemoteState {
     roots: RootSet,
     device: String,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<scope::ClientSession>>>,
+    /// Which round of sessions this app is on. Bumped when it abandons every
+    /// session it holds — the iOS foreground hop — and read by each session's
+    /// `on_closed` before that callback reports presence. Dropping a session
+    /// does not wake its reader task: the task sits on a connection nobody
+    /// uses until the peer's idle timer kills it, up to half a minute later,
+    /// and by then a live replacement has been dialed for the same peer. The
+    /// generation is what tells the late callback that it speaks for a
+    /// session the app no longer has.
+    session_generation: AtomicU64,
 }
 
 impl RemoteState {
@@ -90,6 +104,7 @@ impl RemoteState {
             roots,
             device: vlerv_remote::device_name(),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
+            session_generation: AtomicU64::new(0),
         }
     }
 
@@ -274,6 +289,11 @@ pub enum RemoteEvent {
     },
     /// The peer list changed (paired, unpaired, scope edited).
     PeersUpdated,
+    /// iOS brought the app back to the foreground. Every cached session was
+    /// dropped immediately before this went out, so the webview must treat
+    /// its own subscriptions as gone and re-establish the ones it still
+    /// wants — it is the only side that knows which drawers are open.
+    Resumed,
 }
 
 impl RemoteEvent {
@@ -633,6 +653,21 @@ fn host_signal_sink(app: tauri::AppHandle) -> impl Fn(HostSignal) + Send + Sync 
                 BeamReceivedEvent { peer: Some(peer), path, name, size, hash },
             );
         }
+        HostSignal::PeerConnected { peer, device, scope } => {
+            // Logged and nothing else, deliberately. The signal exists for a
+            // host that holds a SEND QUEUE — the outbox lives in vlerv-mcp,
+            // beside the blob-store claim that makes one process its only
+            // drainer — and this app holds none, so a peer becoming reachable
+            // gives it nothing to act on. No `vlerv://*` name is added
+            // either: that namespace is the frontend's contract, presence in
+            // the UI is driven by the sessions this app DIALS, and a second
+            // source for it would be a second truth to keep in step. The line
+            // stays because "did the phone ever reach this Mac" is the first
+            // question a human debugging a missed delivery asks.
+            eprintln!(
+                "vlerv: scope: {peer} ({device}) connected; this machine grants it {scope:?}"
+            );
+        }
     }
 }
 
@@ -809,6 +844,10 @@ async fn session(
             return Ok(existing.clone());
         }
     }
+    // Read under the same lock the foreground hop clears the map with, so a
+    // dial already in flight when the app resumes cannot land a pre-resume
+    // session in the fresh generation and keep reporting presence for it.
+    let generation = state.session_generation.load(Ordering::Acquire);
 
     let node = boot_node(app, state).await?;
     let addr = endpoint::addr_for(peer)?;
@@ -829,10 +868,25 @@ async fn session(
             );
         },
         move || {
+            // The generation this callback speaks for is fixed at dial time;
+            // the one it is compared against is read now, because a resume
+            // may have happened at any point in between.
+            let current = closed_app
+                .state::<RemoteState>()
+                .session_generation
+                .load(Ordering::Acquire);
+            if !closed_session_reports_offline(generation, current) {
+                return;
+            }
             presence(&closed_app, &closed_peer, "offline", None, None, None);
         },
     )
     .await
+    // The app is a viewer, not a sender: it has nothing to retry later, so
+    // both dial failures collapse to the one sentence the drawer already
+    // shows. `Display` is the inner string, so the header wording is
+    // unchanged.
+    .map_err(|e| e.to_string())
     .inspect_err(|e| presence(app, peer, "offline", None, None, Some(e.clone())))?;
 
     presence(
@@ -845,6 +899,34 @@ async fn session(
     );
     sessions.insert(peer.to_string(), session.clone());
     Ok(session)
+}
+
+/// Does a closed session still speak for this app, or has a resume replaced
+/// it? The whole decision `ClientSession::on_closed` makes, pure so it can be
+/// tested without an endpoint: `session` is the generation the dial was made
+/// in, `current` the one the app is on now.
+///
+/// A session the foreground hop dropped keeps its reader task, because
+/// dropping the session never wakes it: the task sits on a connection nobody
+/// uses until the peer's idle timer kills it, up to half a minute after the
+/// resume. Its `on_closed` then fires for a session the app abandoned, and
+/// the replacement dial has already reported the same peer online — so the
+/// drawer would show a working device as offline, with an empty tab list.
+/// Equality, not "at least as new": every generation but the current one is
+/// a round this app has finished with.
+fn closed_session_reports_offline(session: u64, current: u64) -> bool {
+    session == current
+}
+
+/// Open the next round of sessions. The caller has already emptied the map
+/// under the sessions lock, and this is the half a late `on_closed` reads.
+///
+/// The counter only ever climbs, and that is the property this has to keep:
+/// a generation that repeated an earlier value would let a session dropped
+/// two resumes ago pass `closed_session_reports_offline` and report a peer
+/// this app is actively talking to as offline.
+fn supersede_sessions(generation: &AtomicU64) {
+    generation.fetch_add(1, Ordering::Release);
 }
 
 fn presence(
@@ -884,22 +966,250 @@ pub fn note_file_change(app: &tauri::AppHandle, change: crate::watcher::FileChan
     });
 }
 
+/// Does launch open a listening socket? Pure, because it decides whether an
+/// install binds a socket before the user has asked for anything, and both
+/// wrong answers cost something: an undeliverable send, or a socket nobody
+/// wanted.
+///
+/// Both inputs are read the same way on both platforms. `paired` gates it, so
+/// a fresh install with no peers binds nothing at all and the zero-sockets
+/// promise survives everywhere. `listen_pref` is the user's own switch, and
+/// it is OBEYED on the phone exactly as on the Mac — the phone is made to
+/// listen by `adopts_listen_pref` turning that switch on once, not by this
+/// predicate ignoring it. A platform test here would make an off switch a
+/// lie: `state.json` would say the app listens to nobody while it binds a
+/// socket at every launch, and the Settings row would decide nothing.
+fn listens_at_launch(paired: bool, listen_pref: bool) -> bool {
+    paired && listen_pref
+}
+
+/// Is this build the machine that exists to be reached? PRODUCT.md makes the
+/// phone a read-only companion: it browses another machine's files and it is
+/// where artifacts land, so it is the end that must be listening.
+const RECEIVER_BUILD: bool = cfg!(target_os = "ios");
+
+/// Does this launch have to turn `preferences.remote_listen` on for good?
+///
+/// The one-way migration behind `listens_at_launch` reading the preference on
+/// both platforms. `remote_listen` defaults to false (state_store.rs), and a
+/// phone that listens to nobody cannot be handed a file another machine
+/// already accepted and spooled for it — the send succeeds, waits, and
+/// expires undelivered. So the first launch of a receiver build that trusts
+/// anybody flips the switch ON and records that it did.
+///
+/// `adopted` is what makes it one-way, and it is the whole point: a user who
+/// then turns the switch back off stays off, because every later launch reads
+/// the marker and leaves the preference alone. `paired` keeps a fresh,
+/// unpaired install untouched — it binds nothing and it is asked nothing.
+fn adopts_listen_pref(receiver: bool, paired: bool, adopted: bool) -> bool {
+    receiver && paired && !adopted
+}
+
+/// Persist the adoption: the switch the launch decision reads, then the
+/// marker that stops it happening a second time. The switch goes first
+/// because a marker that lands without it would leave the phone not
+/// listening, with nothing left that would ever turn it on again.
+///
+/// `set_state_field` moves the in-memory document at once and debounces the
+/// disk write, like every other settings write, so the Settings row this
+/// launch renders already shows the switch on.
+fn adopt_listen_pref() {
+    for key in ["preferences.remote_listen", "preferences.remote_listen_adopted"] {
+        if let Err(e) = crate::state_store::set_state_field(key, serde_json::Value::Bool(true)) {
+            eprintln!("vlerv: remote: cannot record that this device listens for its peers: {e}");
+        }
+    }
+}
+
 /// The launch-time half of the lazy-boot rule (design §4): boot the endpoint
-/// at startup ONLY when this install has peers AND the user turned listening
-/// on. Every other path stays zero-sockets until an action needs one.
+/// at startup only when `listens_at_launch` says so. Every other path stays
+/// zero-sockets until an action needs one.
 pub fn listen_at_launch(app: &tauri::AppHandle) {
-    let listen = crate::state_store::current_state().preferences.remote_listen;
-    if !listen {
+    // Both inputs are read here, before anything is spawned, so an install
+    // that will not listen costs one map lookup instead of a tokio task.
+    let paired = !app.state::<RemoteState>().peers.is_empty();
+    let prefs = crate::state_store::current_state().preferences;
+    // Adopted BEFORE the preference is read for the decision below, so the
+    // phone's first paired launch already listens instead of waiting for the
+    // one after it.
+    let listen = if adopts_listen_pref(RECEIVER_BUILD, paired, prefs.remote_listen_adopted) {
+        adopt_listen_pref();
+        true
+    } else {
+        prefs.remote_listen
+    };
+    if !listens_at_launch(paired, listen) {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<RemoteState>();
-        if state.peers.is_empty() {
-            return;
-        }
         if let Err(e) = boot_node(&app, &state).await {
             eprintln!("vlerv: remote: cannot start listening: {e}");
         }
     });
+}
+
+/// iOS brought the app back to the foreground. Everything here is recovery
+/// from a suspension the process itself never saw: iOS freezes the app, the
+/// peer's idle timer tears the QUIC connections down, and NOTHING in this
+/// process learns of it — `ClientSession::is_closed` reads a cached
+/// `AtomicBool` that the reader task can only set once it is running again.
+/// So `session()` keeps handing out sessions whose next request answers "the
+/// session is closed", which is the failure a sender then has to guess at.
+///
+/// Called from the `RunEvent::WindowEvent { event: Resumed }` arm in app.rs,
+/// which is mobile-only. macOS never suspends the process, so there is no
+/// stale session to drop there and nothing calls this.
+pub fn on_foreground(app: &tauri::AppHandle) {
+    // No peers ⇒ nobody may dial this app and it has nobody to dial, so
+    // resuming is not a reason to bind a socket.
+    if app.state::<RemoteState>().peers.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<RemoteState>();
+        // Dropped FIRST, before the event and before any re-dial: `session()`
+        // returns a cached session whenever `is_closed()` reads false, so one
+        // left in the map is handed to the reconnect this very event
+        // triggers, and the reconnect then rides the dead connection.
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.clear();
+            // Under the same lock, so the bump and the clear are one act to
+            // every dial. What it silences is explained on the field.
+            supersede_sessions(&state.session_generation);
+        }
+        let _ = app.emit("vlerv://remote-event", RemoteEvent::Resumed);
+        // Re-dialing every paired peer is what makes the phone reachable
+        // again: the dial boots the endpoint if the launch did not, and
+        // `session()` emits the presence transitions itself, so the drawer
+        // header reports the truth for devices whose `on_closed` never fired
+        // because the reader task was frozen with the rest of the app.
+        for peer in state.peers.list() {
+            if let Err(e) = session(&app, &state, &peer.node_id).await {
+                eprintln!("vlerv: remote: {} is not reachable after resume: {e}", peer.device);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_listens_for_exactly_one_of_the_four_states_it_can_be_in() {
+        // All four, on either platform: the predicate reads no platform at
+        // all. A peer to listen for AND the switch the user left on is the
+        // only combination that binds a socket before the user asks for
+        // anything.
+        assert!(listens_at_launch(true, true));
+        // The switch is obeyed. On the phone this is a user who turned
+        // listening off AFTER the adoption below ran; overriding them here
+        // would make `state.json` disagree with what the app does.
+        assert!(!listens_at_launch(true, false));
+        // The zero-sockets promise a fresh install makes (design §2). Nothing
+        // may dial an app that trusts nobody, so listening buys nothing.
+        assert!(!listens_at_launch(false, true));
+        assert!(!listens_at_launch(false, false));
+    }
+
+    #[test]
+    fn the_phone_adopts_the_listen_switch_once_and_never_overrules_a_user_who_turns_it_off() {
+        // The migration that lets `listens_at_launch` read the preference on
+        // both platforms. Without it the phone keeps the default false, and
+        // every send to it is accepted, spooled, and expires undelivered.
+        assert!(adopts_listen_pref(true, true, false));
+        // Once adopted, never again — this is what makes the Settings row on
+        // the phone a control that actually decides something.
+        assert!(!adopts_listen_pref(true, true, true));
+        // A fresh, unpaired install is asked nothing and left at the default,
+        // so it still binds nothing.
+        assert!(!adopts_listen_pref(true, false, false));
+        // The Mac has always had the switch and has never needed the phone's
+        // reason for it: it is the end that reaches out, not the end that is
+        // reached.
+        assert!(!adopts_listen_pref(false, true, false));
+    }
+
+    #[test]
+    fn adopting_the_switch_also_records_that_it_happened() {
+        // Two writes, and the second is the one that matters: a marker that
+        // never lands turns a one-time migration into a launch-time override
+        // that re-enables listening every time the user turns it off.
+        crate::state_store::ensure_shared_test_state_dir();
+        crate::state_store::set_state_field(
+            "preferences.remote_listen",
+            serde_json::Value::Bool(false),
+        )
+        .expect("seed the default");
+        crate::state_store::set_state_field(
+            "preferences.remote_listen_adopted",
+            serde_json::Value::Bool(false),
+        )
+        .expect("seed the default");
+
+        adopt_listen_pref();
+
+        let prefs = crate::state_store::current_state().preferences;
+        assert!(prefs.remote_listen, "the phone now listens for its peers");
+        assert!(prefs.remote_listen_adopted, "and will not be asked again");
+        assert!(!adopts_listen_pref(RECEIVER_BUILD, true, prefs.remote_listen_adopted));
+    }
+
+    #[test]
+    fn only_a_session_from_the_round_the_app_is_on_reports_its_peer_offline() {
+        // The check inside `on_closed`. A session dialed in the round the app
+        // is still on is the live one, and its close is real news: the peer
+        // went away and the drawer header has to say so.
+        assert!(closed_session_reports_offline(4, 4));
+        // A session from a round the foreground hop ended says nothing. Its
+        // reader task was frozen with the app and wakes up half a minute
+        // after the resume, by which time the replacement dial has already
+        // reported the same peer online — so this emit would mark a device
+        // the user is browsing as offline and empty its tab list.
+        assert!(!closed_session_reports_offline(3, 4));
+        assert!(!closed_session_reports_offline(0, 4));
+        // Nothing is dialed into a round that has not started, so this pair
+        // cannot occur; it is here because a `>=` in place of the equality
+        // answers the same for every case above and differs only here.
+        assert!(!closed_session_reports_offline(5, 4));
+    }
+
+    #[test]
+    fn every_resume_opens_a_round_that_no_earlier_session_can_claim_again() {
+        // Two suspensions in a row is the ordinary iOS case — the phone
+        // sleeps, resumes, sleeps and resumes again — and each resume
+        // abandons the sessions the resume before it dialed.
+        let generation = AtomicU64::new(0);
+        let launch = generation.load(Ordering::Acquire);
+        supersede_sessions(&generation);
+        let first_resume = generation.load(Ordering::Acquire);
+        supersede_sessions(&generation);
+        let second_resume = generation.load(Ordering::Acquire);
+
+        assert!(first_resume > launch, "a resume ends the round it found");
+        assert!(second_resume > first_resume, "and so does the resume after it");
+        // The point of the counter climbing rather than toggling: a session
+        // from the launch round must stay silent through EVERY later resume,
+        // not just the first one. A generation that came back around would
+        // hand a two-resumes-dead session the right to report its peer
+        // offline while a live session for that same peer is serving tabs.
+        assert!(!closed_session_reports_offline(launch, second_resume));
+        assert!(!closed_session_reports_offline(first_resume, second_resume));
+        assert!(closed_session_reports_offline(second_resume, second_resume));
+    }
+
+    #[test]
+    fn the_resumed_kind_is_the_name_the_webview_switches_on() {
+        // `RemoteEvent` is serialized straight onto `vlerv://remote-event`,
+        // and the frontend dispatches on `kind`. A rename here is a silent
+        // no-op there, not a compile error.
+        assert_eq!(
+            serde_json::to_value(RemoteEvent::Resumed).expect("serialize"),
+            serde_json::json!({ "kind": "resumed" })
+        );
+    }
 }

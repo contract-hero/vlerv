@@ -18,7 +18,7 @@
 // knows that MCP exists, which is what lets the integration test drive the
 // same code path a tool call drives.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,9 +26,13 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use serde::Serialize;
+use tokio::sync::mpsc;
 use vlerv_remote::host::{EmptyCatalog, EventSink, HostSignal};
+use vlerv_remote::outbox::{self, Outbox, Record, Staged};
 use vlerv_remote::peers::{self, short_id, Pairing, Peer, PeerStore, PendingPair, Scope};
-use vlerv_remote::scope::{ClientSession, ScopeState, TabsCache};
+use vlerv_remote::scope::{
+    ClientSession, ConnectError, PushFailure, PushedArtifact, ScopeState, TabsCache,
+};
 use vlerv_remote::security::{self, RootSet};
 use vlerv_remote::{beam, endpoint, Dirs};
 
@@ -55,6 +59,30 @@ const MAX_RECEIVED: usize = 100;
 /// prefix by accident is just noise. Omitting the argument revokes them all,
 /// which is the deliberate, unambiguous form.
 const MIN_HASH_CHARS: usize = 8;
+
+/// How long a peer that would not take its queued sends is left alone, by how
+/// many passes in a row have failed for it: one minute, two, five, then ten
+/// forever.
+///
+/// The FLOOR is the deliberate part. Naming a peer costs an n0 discovery
+/// lookup and a possible relay traversal, so a tighter ladder would spend the
+/// week a record lives telling third parties who this machine talks to, to
+/// learn what it already knows — the phone is asleep. The precise trigger is
+/// a peer connecting; this is only the fallback for one that comes back
+/// without ever dialing in.
+const RETRY_LADDER: [u64; 4] = [60, 120, 300, 600];
+
+/// How many wake requests may be pending before one is dropped. Lossy on
+/// purpose: a wake is a HINT that a pass is worth running, and a pass that is
+/// already queued covers every peer anyway. Blocking the caller — the host's
+/// own event sink, on its accept path — to deliver a hint would be the wrong
+/// trade in the other direction.
+const WAKE_DEPTH: usize = 32;
+
+/// Live sessions, one per peer, shared by the send path and the drain. One
+/// map, deliberately: a session the drain dialed serves the next send, and a
+/// send's session drains the queue without a second handshake.
+type SessionCache = Arc<tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>>;
 
 /// What the caller is told about a paired device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,16 +112,98 @@ pub struct BeamLink {
     pub hash: String,
 }
 
+/// What a `send_to_device` call actually did.
+///
+/// A TAGGED enum, and the tag is the whole point: "it is on your phone" and
+/// "a copy of it is waiting here for your phone" are different events, and
+/// the type is what stops the render code compiling until it has decided
+/// which one it is printing. A wording convention could not — that is how the
+/// original failure read as a success in the first place. Serde's internal
+/// tagging keeps the JSON an OBJECT, which `structuredContent` requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Delivery {
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Delivery {
+    /// The bytes are on the other machine, which verified them itself.
+    Delivered {
+        device: String,
+        node_id: String,
+        /// The name the RECEIVING device landed the file under — collision
+        /// handling there may have renamed it.
+        name: String,
+        /// The size the receiver measured, never the one this side announced.
+        size: u64,
+        hash: String,
+    },
+    /// The device did not answer, so the file was COPIED and the send was
+    /// accepted for later. Nothing has arrived anywhere yet.
+    Queued {
+        device: String,
+        node_id: String,
+        /// What the receiver will be TOLD the file is called. It has agreed
+        /// to nothing: a collision on its side may still rename it on
+        /// arrival, the way a delivered one is renamed today.
+        name: String,
+        size: u64,
+        /// BLAKE3 of the copy that was taken. The delivery replays THOSE
+        /// bytes, whatever the source path holds by the time it goes out.
+        hash: String,
+        /// The spool record this send became — the id `server_status` reports
+        /// it under.
+        id: String,
+        /// Unix seconds. After this the copy is given up on and deleted.
+        expires_at: u64,
+        /// The dial's own answer, verbatim: why the file is not there yet.
+        reason: String,
+        /// The facts the model has to pass on, because "queued" hides every
+        /// one of them and none is obvious to the person who asked for a send.
+        notes: Vec<String>,
+    },
+}
+
+/// One accepted-but-undelivered send, as `server_status` reports it.
+///
+/// `last_error` is carried rather than summarized: a record that is not
+/// moving has a reason, and a status surface that shows a count without it
+/// is the silent failure this queue exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueuedDelivery {
+    pub id: String,
     pub device: String,
     pub node_id: String,
-    /// The name the RECEIVING device landed the file under — collision
-    /// handling there may have renamed it.
+    pub node_id_short: String,
     pub name: String,
-    /// The size the receiver measured, never the one this side announced.
     pub size: u64,
     pub hash: String,
+    /// The file the copy was taken from. Reported because `VLERV_MCP_ROOTS`
+    /// differs between projects: a record whose source has left this server's
+    /// roots can only ever be served by a session whose roots still hold it.
+    pub source: PathBuf,
+    pub enqueued_at: u64,
+    pub expires_at: u64,
+    pub attempts: u32,
+    pub last_attempt_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<Record> for QueuedDelivery {
+    fn from(r: Record) -> Self {
+        Self {
+            node_id_short: short_id(&r.peer),
+            id: r.id,
+            device: r.device,
+            node_id: r.peer,
+            name: r.name,
+            size: r.size,
+            hash: r.hash,
+            source: r.source,
+            enqueued_at: r.enqueued_at,
+            expires_at: r.expires_at,
+            attempts: r.attempts,
+            last_attempt_at: r.last_attempt_at,
+            last_error: r.last_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -190,6 +300,53 @@ pub struct ServerStatus {
     /// How many arrived in total. Higher than `received_artifacts.len()` once
     /// the cap has dropped the oldest entries.
     pub received_total: u64,
+    /// Sends accepted for a device that did not answer, oldest first. Not
+    /// capped the way `received_artifacts` is: the spool itself is capped at
+    /// `outbox::MAX_RECORDS`, and every entry is a file somebody was told
+    /// would arrive, so none of them may be hidden from the list.
+    pub queued: Vec<QueuedDelivery>,
+    /// How many are waiting. It matches `queued.len()`, and that is the
+    /// claim: unlike `received_total`, this count can never be higher than
+    /// the list beside it, because a hidden pending delivery is the thing
+    /// this surface exists to make impossible.
+    pub queued_total: usize,
+    /// What those records weigh — the number the spool's own cap counts.
+    pub queued_bytes: u64,
+    /// Private copies of the user's files this server is holding inside its
+    /// state directory for the queue — one per distinct content address, not
+    /// one per record, because two devices owed the same file are owed one
+    /// copy of it. This is what the queue costs this disk, and `queued_bytes`
+    /// beside it is what is still owed to devices; they differ exactly when a
+    /// file is queued for more than one device.
+    ///
+    /// Still a floor for the state directory as a whole, and now only by a
+    /// minute: a delivery that just landed has released its copy, and the
+    /// store's collector takes it at its next pass (`endpoint::GC_INTERVAL`).
+    pub retained_bytes: u64,
+    /// Record files this build could not put on the list above: unparseable
+    /// ones, moved aside as `<id>.json.broken.<unix>`; ones written by a
+    /// newer schema and left byte-for-byte alone; and ones that would not
+    /// read at all this boot, also left alone so a later boot can retry them.
+    /// Named rather than counted, because each one is a delivery that is
+    /// quietly not happening.
+    ///
+    /// A quarantined stem stays on this list for every later boot, not just
+    /// the one that moved the file aside: the alternative is a delivery that
+    /// is reported once and then silently forgotten.
+    pub queue_unreadable: Vec<String>,
+    /// Whether a drain pass owns this queue right now — true while any peer
+    /// is being drained. A reader must be able to tell a queue that is moving
+    /// from one that is merely stored: a count that is still 3 a minute later
+    /// means something different when a pass has been trying the whole time.
+    /// False on a server that never booted, which is the honest answer — the
+    /// drain lives in the process holding the blob-store claim.
+    pub draining: bool,
+    /// Why this server can neither queue nor drain, when it cannot. Same
+    /// register as `boot_error`, and for the same reason: a second Claude
+    /// Code session over one state directory reports the store claim it lost
+    /// rather than a queue it will never move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_blocked_reason: Option<String>,
     /// The directories a sent file is resolved against.
     pub roots: Vec<PathBuf>,
 }
@@ -212,13 +369,73 @@ pub struct ReceivedArtifact {
     pub hash: String,
 }
 
+/// What one delivery attempt settled on. Not a `Result`: two of the three
+/// answers are neither a success nor a caller error, and only the type keeps
+/// them from collapsing into the one string that made a sleeping phone and a
+/// broken send read the same.
+enum Attempt {
+    /// The host answered `Res::Pushed` and reported what it landed.
+    Landed(PushedArtifact),
+    /// Nothing on the other side answered the dial. THE queue-eligible cause.
+    Asleep(String),
+    /// The session died under the request. Queue-eligible only after a fresh
+    /// dial has confirmed it, because a cached session's `is_closed()` flag
+    /// cannot tell a sleeping peer from an awake one.
+    SessionDied(String),
+}
+
+/// What one dial produced. A refusal never reaches here: it leaves through
+/// the caller's own `Err`, which is what keeps it out of the spool.
+enum Dialed {
+    Session(Arc<ClientSession>),
+    Asleep(String),
+}
+
+/// Why the drain was asked to wake up. The two reasons buy different things,
+/// and collapsing them into "run a pass" would undo the retry ladder: a peer
+/// that just proved it is reachable is worth dialing NOW, while a spool that
+/// merely grew is not — the send that grew it has just finished failing to
+/// reach that same device.
+enum Wake {
+    /// This peer holds a working session, or has just taken a file over one.
+    /// It is dialed on this pass whatever its backoff says.
+    Peer(String),
+    /// A record was accepted. Nothing is forced; the point is only to arm the
+    /// tick, which stands down while the spool is empty and would otherwise
+    /// never learn that it stopped being empty.
+    Spool,
+}
+
+/// When one peer may be dialed again, and how many passes in a row have
+/// failed for it.
+///
+/// In memory only, and keyed by PEER rather than by record: a record's
+/// persisted `attempts` is what the status surface reports to a human,
+/// while this is the cadence, and a restart is a new decision — the phone may
+/// well be awake now, so the boot pass tries every peer at once. `Instant`,
+/// not `now_unix`, so a clock the user corrects backwards cannot park a
+/// pending delivery for however long the correction was.
+struct Backoff {
+    failures: u32,
+    next: Instant,
+}
+
 /// This server's `EventSink`. A headless host has no window to raise, so the
-/// three signals become: park the pairing for `pair_status`, record the
-/// artifact for `server_status`, and a stderr line for a human tailing the
-/// log. Stdout is the JSON-RPC channel and is never written to here.
+/// signals become: park the pairing for `pair_status`, record the artifact for
+/// `server_status`, wake the drain for a device that just proved it is
+/// reachable, and a stderr line for a human tailing the log. Stdout is the
+/// JSON-RPC channel and is never written to here.
 struct McpSink {
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Received>>,
+    /// The wake channel, held WEAKLY, and that is not a nicety. This sink is
+    /// owned by the `ScopeState` inside the `RemoteNode` that the supervisor
+    /// task holds, so a strong sender here would make the channel
+    /// un-closable: `supervise` would never read `None`, never return, and
+    /// never drop the node — and the blob-store claim would outlive the
+    /// `McpCore` that took it, refusing every later process over the same
+    /// state directory.
+    wake: mpsc::WeakSender<Wake>,
 }
 
 impl EventSink for McpSink {
@@ -258,6 +475,37 @@ impl EventSink for McpSink {
                     received.items.remove(0);
                 }
             }
+            HostSignal::PeerConnected { peer, device, scope } => {
+                // THE PRECISE WAKE TRIGGER. This device holds a session right
+                // now, so anything queued for it goes out on this pass
+                // whatever its backoff says — the ladder exists to stop this
+                // server naming a sleeping phone to n0 discovery every few
+                // seconds, and a device that dialed in has already answered
+                // the question the ladder was waiting on.
+                //
+                // `scope` is deliberately NOT cached as `last_ack_scope`. It
+                // says what THIS server grants that device; the queue's
+                // pre-check reads the opposite direction, what the device
+                // grants this server, and only an ack this side RECEIVES
+                // carries that — `Drainer::dial_session` writes those. Mixing
+                // the two would stage private copies of the user's files for
+                // a device that denies them on arrival, and refuse sends to
+                // one that would take them.
+                // The direction is spelled out because the log is the one
+                // place a human reads this value, and both grants are called
+                // "scope".
+                eprintln!(
+                    "vlerv-mcp: {device} ({}) connected; this server grants it {scope:?}",
+                    short_id(&peer)
+                );
+                // This runs on the host's accept path, so it may not block or
+                // fail it: a full channel already holds a pass that covers
+                // this peer, and a gone channel means the drain this hint was
+                // for has already ended with its process.
+                if let Some(wake) = self.wake.upgrade() {
+                    let _ = wake.try_send(Wake::Peer(peer));
+                }
+            }
         }
     }
 }
@@ -272,6 +520,12 @@ pub struct McpCore {
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Received>>,
+    /// Sends accepted for a device that was asleep. Read off disk in `new`,
+    /// beside the peer store and for the same reason: both are files this
+    /// server must be able to REPORT before it is allowed to open a socket,
+    /// and reading a directory is not a network connection. `Arc` because the
+    /// drain will hold it from a task of its own.
+    outbox: Arc<Outbox>,
     /// The booted node, or nothing yet — the lazy-boot contract.
     ///
     /// A `OnceCell` rather than a `Mutex<Option<_>>` so that reading whether
@@ -290,13 +544,33 @@ pub struct McpCore {
     /// most recent attempt is worth reporting.
     last_boot_error: Mutex<Option<String>>,
     /// Live sessions, one per peer. `Arc` because a session that closes
-    /// evicts its own entry from here — see `session`.
-    sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>>,
+    /// evicts its own entry from here — see `dial_session`.
+    sessions: SessionCache,
     started: Instant,
     /// Test seam: when set, peers are dialed at this socket and the push
     /// ticket names this server's own loopback address, so a two-endpoint
     /// test never depends on relays or discovery. `None` in production.
-    loopback: Mutex<Option<SocketAddr>>,
+    ///
+    /// Shared with the drain and read on every dial rather than copied when
+    /// the drain starts: the two-endpoint proof re-points it at a second host
+    /// while the drain task is already running, which is exactly the shape of
+    /// a phone that went away and came back somewhere else.
+    loopback: Arc<Mutex<Option<SocketAddr>>>,
+    /// Tells the drain that a pass is worth running. Built in `new` because
+    /// an mpsc pair binds nothing and every sender needs somewhere to send
+    /// from the first tool call; the receiver is handed to the supervisor by
+    /// the boot that spawns it.
+    wake: mpsc::Sender<Wake>,
+    wake_rx: Mutex<Option<mpsc::Receiver<Wake>>>,
+    /// Peers with a drain pass in flight, and whether one more is owed. The
+    /// single supervisor cannot overlap two passes by construction, but a
+    /// wake arriving mid-pass must not be dropped either — it may be the one
+    /// carrying the address the last attempt lacked.
+    inflight: Arc<Mutex<HashMap<String, bool>>>,
+    /// The retry ladder's state, one entry per peer that has refused to take
+    /// its queued sends. Empty at startup, which is what makes a restart
+    /// retry at once.
+    retry: Arc<Mutex<HashMap<String, Backoff>>>,
 }
 
 impl McpCore {
@@ -305,11 +579,13 @@ impl McpCore {
     /// nothing.
     pub fn new(state_dir: PathBuf, roots: Vec<PathBuf>, cwd: PathBuf, home: Option<PathBuf>) -> Self {
         let dirs = Dirs::new(state_dir);
+        let (wake, wake_rx) = mpsc::channel(WAKE_DEPTH);
         Self {
             device: device_name(),
             peers: Arc::new(PeerStore::load(&dirs.remote())),
             pairing: Arc::new(Pairing::new()),
             received: Arc::new(Mutex::new(Received::default())),
+            outbox: Arc::new(Outbox::load(&dirs.outbox())),
             roots: RootSet::new(roots),
             cwd,
             home,
@@ -318,7 +594,11 @@ impl McpCore {
             last_boot_error: Mutex::new(None),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             started: Instant::now(),
-            loopback: Mutex::new(None),
+            loopback: Arc::new(Mutex::new(None)),
+            wake,
+            wake_rx: Mutex::new(Some(wake_rx)),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            retry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -334,13 +614,13 @@ impl McpCore {
     /// mint push tickets on this server's own loopback address. The
     /// integration test's seam, so a two-endpoint proof never depends on
     /// relays — production never calls it.
+    ///
+    /// Settable after the drain is running, and read by it on every dial: a
+    /// device that went away and came back at another address is the case the
+    /// queue exists for, so the proof of it has to be able to move.
     #[doc(hidden)]
     pub fn use_loopback(&self, host: SocketAddr) {
         *self.loopback.lock().unwrap_or_else(|p| p.into_inner()) = Some(host);
-    }
-
-    fn loopback(&self) -> Option<SocketAddr> {
-        *self.loopback.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn device(&self) -> &str {
@@ -389,9 +669,43 @@ impl McpCore {
                     // view-open peer is therefore told about nothing and may
                     // fetch nothing.
                     Arc::new(EmptyCatalog),
-                    McpSink { pairing: self.pairing.clone(), received: self.received.clone() },
+                    McpSink {
+                        pairing: self.pairing.clone(),
+                        received: self.received.clone(),
+                        // Weak, so the supervisor spawned just below can
+                        // still see the channel close when this core is
+                        // dropped — see the field.
+                        wake: self.wake.downgrade(),
+                    },
                 ));
-                endpoint::boot(&self.dirs, Some(state), |_| {}).await.map(Arc::new)
+                let node = Arc::new(endpoint::boot(&self.dirs, Some(state), |_| {}).await?);
+
+                // THE DRAIN IS SPAWNED HERE AND NOWHERE ELSE, for two
+                // reasons. The lazy-boot contract: a registered but unused
+                // server must still bind nothing, and this initializer is the
+                // one place that has already given that up. And the blob
+                // store: the process holding `remote/blobs.lock` is the only
+                // one that may open the store, so it is the only one that may
+                // stage, re-grant or replay — the claim IS the outbox lock,
+                // and no second lock is added. `get_or_try_init` does not
+                // cache a failure and this sits after the `?`, so exactly one
+                // supervisor is ever spawned.
+                let drainer = self.drainer(&node);
+                drainer.reconcile().await;
+                match self.wake_rx.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(wake) => {
+                        tokio::spawn(supervise(drainer, wake));
+                    }
+                    // Unreachable while the `OnceCell` holds: the receiver is
+                    // taken exactly once, by the boot that succeeds. Reported
+                    // rather than ignored, because a queue nothing drains is
+                    // the failure this whole feature exists to remove.
+                    None => eprintln!(
+                        "vlerv-mcp: the queue supervisor was already started — this boot \
+                         drains nothing"
+                    ),
+                }
+                Ok(node)
             })
             .await
             .cloned()
@@ -568,7 +882,13 @@ impl McpCore {
 
     // ── send_to_device ─────────────────────────────────────────────────────
 
-    /// Resolve `device` to one paired peer and push `raw_path` to it.
+    /// Resolve `device` to one paired peer and push `raw_path` to it — or, if
+    /// that device is merely asleep, copy the file now and promise it.
+    ///
+    /// Every CALLER error is still a hard error: an unsendable path, an
+    /// unknown device, a device that has not granted control. Only "the other
+    /// machine did not answer" becomes a queued send, because that is the only
+    /// cause a later attempt can change.
     pub async fn send_to_device(&self, raw_path: &str, device: &str) -> Result<Delivery, String> {
         let query = args::validate_device_query(device)?;
         // Same order as `beam_artifact`: one gate pass, and an unsendable file
@@ -576,42 +896,261 @@ impl McpCore {
         let cand = self.gate_arg_path(raw_path)?;
         let peer = devices::resolve_device(&self.peers.list(), query).map_err(|e| e.to_string())?;
 
+        // The store is opened BEFORE anything else is decided, and its refusal
+        // is this call's refusal. Queuing copies the file INTO that store, so
+        // a server that may not open it has to say so rather than promise a
+        // delivery it can neither stage nor replay.
+        let node = self.node().await?;
+
+        match self.attempt_send(&node, &peer, &cand).await? {
+            Attempt::Landed(pushed) => {
+                // The most precise reachability fact this server can have:
+                // that device just took a file over a live session. Anything
+                // waiting for it goes out now instead of at the next tick.
+                self.wake(Wake::Peer(peer.node_id.clone()));
+                Ok(Delivery::Delivered {
+                    device: peer.device,
+                    node_id: peer.node_id,
+                    name: pushed.name,
+                    size: pushed.size,
+                    hash: pushed.hash,
+                })
+            }
+            Attempt::Asleep(why) | Attempt::SessionDied(why) => {
+                // This call has just spent a full dial learning that the
+                // device does not answer, so the drain starts one ladder step
+                // in rather than repeating that dial a second later. The
+                // RECORD still says nothing has been attempted, because
+                // nothing has: this is the cadence, not the report.
+                self.drainer(&node).back_off(&peer.node_id);
+                let queued = self.queue_send(&node, &peer, &cand, why).await?;
+                // The tick stands down while the spool is empty, so the pass
+                // that would notice this record has to be told the spool
+                // stopped being empty. Without this a send accepted on an
+                // idle server waits for the phone to dial in, and nothing on
+                // this side ever tries again.
+                self.wake(Wake::Spool);
+                Ok(queued)
+            }
+        }
+    }
+
+    /// One delivery attempt, and at most one retry.
+    ///
+    /// The retry is not politeness, it IS the reported bug. `dial_session`
+    /// hands back a cached session whenever `is_closed()` reads false, and
+    /// that flag is an `AtomicBool` the reader and writer tasks set — not a
+    /// probe. After an iOS suspension it still reads false, so the failure
+    /// arrives from `request` as `PushFailure::Transport` and never from a
+    /// dial at all. A design that only classified dial failures would never
+    /// queue the exact case the user reported. Only a fresh dial can tell a
+    /// stale cache entry from a phone that has gone away.
+    async fn attempt_send(
+        &self,
+        node: &Arc<endpoint::RemoteNode>,
+        peer: &Peer,
+        cand: &beam::OfferCandidate,
+    ) -> Result<Attempt, String> {
+        match self.try_send(node, peer, cand).await? {
+            Attempt::SessionDied(_) => {
+                forget_session(&self.sessions, &peer.node_id).await;
+                self.try_send(node, peer, cand).await
+            }
+            settled => Ok(settled),
+        }
+    }
+
+    /// Dial, check the grant, push. Every hard refusal on the send path is
+    /// produced here, so a caller error and a sleeping device cannot end up
+    /// wearing each other's answer.
+    async fn try_send(
+        &self,
+        node: &Arc<endpoint::RemoteNode>,
+        peer: &Peer,
+        cand: &beam::OfferCandidate,
+    ) -> Result<Attempt, String> {
+        let mut session = match self.dialed(node, peer).await? {
+            Dialed::Session(session) => session,
+            Dialed::Asleep(why) => return Ok(Attempt::Asleep(why)),
+        };
         // The scope in the handshake is what the DEVICE granted this server.
         // Checking it here turns the host's one deliberately vague refusal
         // ("not permitted for this peer") into an instruction the human can
         // act on.
-        let mut session = self.session(&peer).await?;
         if session.scope != Scope::Control.as_str() {
             // A session reports the grant as it stood when it connected, so a
             // cached one can be stale: the human may have widened the scope
             // between two tool calls. Re-handshake once before refusing.
-            self.forget_session(&peer.node_id).await;
-            session = self.session(&peer).await?;
+            forget_session(&self.sessions, &peer.node_id).await;
+            session = match self.dialed(node, peer).await? {
+                Dialed::Session(session) => session,
+                Dialed::Asleep(why) => return Ok(Attempt::Asleep(why)),
+            };
         }
         if session.scope != Scope::Control.as_str() {
-            return Err(format!(
-                "{} has not granted this server control. It paired this server at scope {:?}; \
-                 pushing a file needs \"control\". On that device, open its Vlervtifacts peer \
-                 settings, find \"{}\", and set its scope to \"control\".",
-                label(&peer),
-                session.scope,
-                self.device
-            ));
+            return Err(needs_control(peer, &session.scope, &self.device));
         }
 
         // The canonical path the gate resolved, not the caller's string: the
         // push re-applies the same policy, and it must see the same file.
-        let pushed = match self.own_loopback().await {
-            Some(own) => session.push_artifact_at(&cand.canonical, &self.roots, own).await?,
-            None => session.push_artifact(&cand.canonical, &self.roots).await?,
+        let pushed = match self.drainer(node).own_loopback().await {
+            Some(own) => session.push_artifact_at(&cand.canonical, &self.roots, own).await,
+            None => session.push_artifact(&cand.canonical, &self.roots).await,
         };
-        Ok(Delivery {
-            device: peer.device,
-            node_id: peer.node_id,
-            name: pushed.name,
-            size: pushed.size,
-            hash: pushed.hash,
-        })
+        match pushed {
+            Ok(pushed) => Ok(Attempt::Landed(pushed)),
+            Err(PushFailure::Transport(why)) => Ok(Attempt::SessionDied(why)),
+            // This side refused, or the host did. Both are answers about
+            // these bytes and this peer, and a week of retries would collect
+            // the same answer every time.
+            Err(local_or_denied) => Err(local_or_denied.to_string()),
+        }
+    }
+
+    /// Accept a send for a device that did not answer: copy the bytes, write
+    /// the record, and report exactly what was promised.
+    ///
+    /// Everything that can refuse runs BEFORE the copy is taken. A refusal
+    /// that arrives after it has already cost the user a private duplicate of
+    /// their file inside this server's state directory.
+    async fn queue_send(
+        &self,
+        node: &Arc<endpoint::RemoteNode>,
+        peer: &Peer,
+        cand: &beam::OfferCandidate,
+        why: String,
+    ) -> Result<Delivery, String> {
+        // Re-read the peer instead of trusting the list this call started
+        // from: the handshake it just tried may have refreshed the cached
+        // grant, and the human may have unpaired the device in between.
+        let Some(peer) = self.peers.get(&peer.node_id) else {
+            return Err(format!(
+                "{} is no longer paired with this server, so nothing was queued.",
+                label(peer)
+            ));
+        };
+        // THE GRANT PRE-CHECK. A device that has not granted control refuses
+        // these bytes the moment it wakes, so queuing them would keep a
+        // private copy of the user's file for a week to deliver a refusal.
+        // The same predicate the RECEIVER enforces answers it, so the two
+        // cannot drift. Never handshaken (`None`) is not a no: that send is
+        // queued, and its answer says the grant is unverified.
+        if let Some(granted) = peer.last_ack_scope.as_deref() {
+            if Scope::parse(granted).is_ok_and(|scope| !scope.may_land_artifacts()) {
+                return Err(format!(
+                    "{} Nothing was queued: a device that has not granted control refuses \
+                     these bytes on arrival, and the file would sit here as a private copy \
+                     until it expired. The scope above is what the last completed handshake \
+                     reported; if the grant has been widened since, the send goes through as \
+                     soon as that device is reachable again.",
+                    needs_control(&peer, granted, &self.device)
+                ));
+            }
+        }
+        if let Some(reason) = self.queue_blocked_reason() {
+            return Err(format!("the send to {} was not queued: {reason}", label(&peer)));
+        }
+        // The caps are checked before the copy, and again inside `enqueue`
+        // over the same predicate — so a refusal never costs a duplicate of
+        // the file, and the two answers cannot disagree.
+        self.outbox.room_for(&label(&peer), cand.size)?;
+
+        // ONE await copies the bytes and pins them under `outbox/<id>`. The
+        // pin is the only thing keeping them: `stage_for_peer` sweeps expired
+        // grants on every push, so an unpinned queued file would lose its
+        // bytes an hour after it was accepted.
+        let id = self.outbox.next_id();
+        let hash = beam::stage_outbox(node, &cand.canonical, &id).await?;
+
+        // DEDUPE on (peer, content). The store is content-addressed, so
+        // re-staging the same file costs a read and a hash pass, never a
+        // second copy on disk. A model retries a call that looked like it
+        // failed, and without this one user intent becomes several records.
+        if let Some(pending) = self.outbox.find_pending(&peer.node_id, &hash) {
+            beam::unpin_outbox(node, &outbox::tag_name(&id)).await;
+            return Ok(self.queued(&peer, pending, why));
+        }
+
+        let staged = Staged {
+            id: id.clone(),
+            peer: peer.node_id.clone(),
+            device: peer.device.clone(),
+            source: cand.canonical.clone(),
+            name: cand.name.clone(),
+            size: cand.size,
+            hash,
+        };
+        match self.outbox.enqueue(staged) {
+            Ok(record) => Ok(self.queued(&peer, record, why)),
+            Err(e) => {
+                // The record never reached disk, so nothing will ever name
+                // this pin again. Releasing it here is what keeps a send that
+                // was NOT accepted from leaving a copy of the user's file in
+                // the store for the life of the install.
+                //
+                // THE PIN IS THIS CALL'S OWN, and only because `stage_outbox`
+                // refuses a tag the store already holds. The commonest way to
+                // reach this arm is `enqueue` refusing a REPEATED id, and an
+                // unpin without that guard would release the incumbent
+                // record's bytes — losing the very delivery the `create_new`
+                // claim above is there to protect.
+                beam::unpin_outbox(node, &outbox::tag_name(&id)).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The queued answer, written for the model that has to relay it. Every
+    /// note is a way this promise differs from the delivery the user asked
+    /// for, and the word "queued" hides all of them.
+    fn queued(&self, peer: &Peer, record: Record, why: String) -> Delivery {
+        let mut notes = vec![
+            format!(
+                "The file was copied as it stands right now, so later edits to it do not \
+                 change what {} receives.",
+                peer.device
+            ),
+            "Delivery needs this server running. If this session ends first, the file goes \
+             out at the first network-touching tool call of a later session over the same \
+             state directory — not before."
+                .to_string(),
+            format!(
+                "The copy is kept for {} days from when it was accepted, then deleted \
+                 undelivered.",
+                outbox::RECORD_TTL_SECS / (24 * 3600)
+            ),
+        ];
+        if peer.last_ack_scope.is_none() {
+            notes.push(format!(
+                "This server has never completed a handshake with {}, so its \"control\" \
+                 grant is unverified. Without that grant the device refuses the file when it \
+                 wakes, and the send waits here until it expires.",
+                peer.device
+            ));
+        }
+        Delivery::Queued {
+            device: peer.device.clone(),
+            node_id: peer.node_id.clone(),
+            name: record.name,
+            size: record.size,
+            hash: record.hash,
+            id: record.id,
+            expires_at: record.expires_at,
+            reason: why,
+            notes,
+        }
+    }
+
+    /// Why this server can neither accept nor move a queued send, or `None`.
+    ///
+    /// Two causes, and each one stops the WHOLE queue rather than one send:
+    /// another process holds the blob-store claim, so nothing may be copied
+    /// in or replayed out; or the spool directory did not read, so a record
+    /// would be a promise this process could never find again. One producer,
+    /// read by the send path and by `server_status`, so a refusal and the
+    /// status that explains it cannot tell two different stories.
+    fn queue_blocked_reason(&self) -> Option<String> {
+        self.last_boot_error().or_else(|| self.outbox.load_error())
     }
 
     /// Test seam: how many peer sessions this server is holding. A session
@@ -631,61 +1170,86 @@ impl McpCore {
         self.sessions.lock().await.get(node_id).map(|s| Arc::as_ptr(s) as usize)
     }
 
-    /// Drop a cached session so the next call re-handshakes.
-    async fn forget_session(&self, node_id: &str) {
-        self.sessions.lock().await.remove(node_id);
-    }
-
-    /// This server's own `127.0.0.1:<port>`, and only in loopback mode — the
-    /// address a pushed ticket names so the peer dials back over loopback.
-    async fn own_loopback(&self) -> Option<SocketAddr> {
-        self.loopback()?;
+    /// Test seam: the loopback address a device dials THIS server at. Every
+    /// other two-endpoint proof drives the outbound leg, where this server
+    /// dials; the inbound one — the phone coming back and connecting, which
+    /// is what `HostSignal::PeerConnected` reports — needs an address to dial
+    /// to. Booting is what creates it, so this boots. No tool reads it.
+    #[doc(hidden)]
+    pub async fn loopback_socket(&self) -> Option<SocketAddr> {
         let node = self.node().await.ok()?;
         endpoint::loopback_socket(&node).await
     }
 
-    /// A live session with a paired peer, dialed on first use and reused
-    /// after. Dial failures are reported as the device being offline, which
-    /// is what they almost always are.
-    async fn session(&self, peer: &Peer) -> Result<Arc<ClientSession>, String> {
-        if let Some(existing) = self.sessions.lock().await.get(&peer.node_id) {
-            if !existing.is_closed() {
-                return Ok(existing.clone());
-            }
+    /// The drain's view of this server, over the booted node the caller
+    /// already holds.
+    ///
+    /// Every field is an `Arc` clone or a cheap handle: the drain owns
+    /// nothing of its own, so a `use_loopback` re-point, a session, a cached
+    /// grant and the spool are the same ones the tools see. Built per call
+    /// rather than stored because it can only exist once the store is open,
+    /// and a type that cannot be built without a node is the cheapest way to
+    /// say that a drain without the store claim is not a thing.
+    fn drainer(&self, node: &Arc<endpoint::RemoteNode>) -> Drainer {
+        Drainer {
+            node: node.clone(),
+            peers: self.peers.clone(),
+            outbox: self.outbox.clone(),
+            sessions: self.sessions.clone(),
+            roots: self.roots.clone(),
+            device: self.device.clone(),
+            loopback: self.loopback.clone(),
+            inflight: self.inflight.clone(),
+            retry: self.retry.clone(),
         }
+    }
+
+    /// Tell the drain a pass is worth running. Never blocks and never fails
+    /// the caller: a full channel already holds a pass this one would only
+    /// repeat, and the tick covers whatever a dropped hint would have.
+    fn wake(&self, reason: Wake) {
+        let _ = self.wake.try_send(reason);
+    }
+
+    /// Test seam, and the shape the host's `PeerConnected` signal will use:
+    /// this peer is reachable now, so its queued sends go out on the next
+    /// pass whatever its backoff says.
+    #[doc(hidden)]
+    pub fn wake_drain(&self, node_id: &str) {
+        self.wake(Wake::Peer(node_id.to_string()));
+    }
+
+    /// Whether a drain pass owns this queue right now — one entry per peer
+    /// being drained. A pass that found nothing due is not "draining": it
+    /// held the queue for no time at all, and a reader must be able to tell a
+    /// queue that is moving from one that is merely stored.
+    fn draining(&self) -> bool {
+        !self.inflight.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// A live session with a paired peer, with the dial's answer flattened
+    /// into the one sentence every read-only caller wants. Dial failures are
+    /// reported as the device being offline, which is what they almost always
+    /// are.
+    async fn session(&self, peer: &Peer) -> Result<Arc<ClientSession>, String> {
         let node = self.node().await?;
-        let addr = match self.loopback() {
-            Some(host) => endpoint::addr_at(&peer.node_id, host)?,
-            None => endpoint::addr_for(&peer.node_id)?,
-        };
-        // A probe dials every paired device, and a device that later sleeps
-        // leaves its session closed. Without this callback each one stays in
-        // the map for the life of the process, holding a dead connection.
-        let cache = self.sessions.clone();
-        let evict = peer.node_id.clone();
-        let on_closed = move || {
-            tokio::spawn(async move {
-                let mut sessions = cache.lock().await;
-                // Only ever drop a CLOSED entry: a re-dial may already have
-                // replaced this peer's session, and the old session's
-                // callback must not evict the new one.
-                if sessions.get(&evict).is_some_and(|s| s.is_closed()) {
-                    sessions.remove(&evict);
-                }
-            });
-        };
-        let session =
-            ClientSession::connect(&node, addr, self.device.clone(), |_| {}, on_closed)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "{} is not reachable: {e}. Check that the device is awake, on a network, \
-                         and that Vlervtifacts is running on it.",
-                        label(peer)
-                    )
-                })?;
-        self.sessions.lock().await.insert(peer.node_id.clone(), session.clone());
-        Ok(session)
+        self.drainer(&node).dial_session(peer).await.map_err(|e| not_reachable(peer, &e))
+    }
+
+    /// `Drainer::dial_session`, with the two answers the SEND path can act on
+    /// kept apart and everything else already refused. `Dialed::Asleep` is
+    /// the only door to the queue, and it is this narrow on purpose: a
+    /// refusal queued as if it were a nap would repeat itself for a week.
+    async fn dialed(
+        &self,
+        node: &Arc<endpoint::RemoteNode>,
+        peer: &Peer,
+    ) -> Result<Dialed, String> {
+        match self.drainer(node).dial_session(peer).await {
+            Ok(session) => Ok(Dialed::Session(session)),
+            Err(ConnectError::Unreachable(why)) => Ok(Dialed::Asleep(why)),
+            Err(refused) => Err(not_reachable(peer, &refused)),
+        }
     }
 
     // ── pair_device / pair_status / confirm_pairing ────────────────────────
@@ -788,6 +1352,26 @@ impl McpCore {
             let log = self.received.lock().unwrap_or_else(|p| p.into_inner());
             Received { items: log.items.clone(), total: log.total }
         };
+        let queued: Vec<QueuedDelivery> =
+            self.outbox.list().into_iter().map(QueuedDelivery::from).collect();
+        // Summed from the listed records, not read off the spool again: a
+        // total that disagreed with the list beside it would send a reader
+        // hunting for a record that is not there.
+        let queued_bytes: u64 = queued.iter().map(|q| q.size).sum();
+        // ONE COPY BACKS EVERY RECORD THAT NAMES THE SAME CONTENT. The store
+        // is content-addressed, so a file queued for the phone and the iPad
+        // is two records, two pins and ONE blob — counting it twice would
+        // report a disk cost that is not there.
+        let mut counted: BTreeSet<&str> = BTreeSet::new();
+        let retained_bytes: u64 =
+            queued.iter().filter(|q| counted.insert(&q.hash)).map(|q| q.size).sum();
+        let mut queue_unreadable = self.outbox.quarantined();
+        queue_unreadable.extend(self.outbox.foreign());
+        // The third cause, and the only one that may fix itself: the file
+        // would not read this boot. It is on this list for the same reason as
+        // the other two — it is off the pending list, so a status that stayed
+        // silent would report the delivery as simply gone.
+        queue_unreadable.extend(self.outbox.io_faults());
         Ok(ServerStatus {
             node_id_short: short_id(&node_id),
             node_id,
@@ -801,9 +1385,484 @@ impl McpCore {
             active_offers,
             received_artifacts: received.items,
             received_total: received.total,
+            queued_total: queued.len(),
+            queued,
+            queued_bytes,
+            retained_bytes,
+            queue_unreadable,
+            draining: self.draining(),
+            queue_blocked_reason: self.queue_blocked_reason(),
             roots: self.roots.roots(),
         })
     }
+}
+
+// ── The drain ──────────────────────────────────────────────────────────────
+
+/// What moves the queue: the booted node and the handles `McpCore` already
+/// shares with its tools. It owns nothing, which is the point — the spool it
+/// empties, the sessions it dials, the grants it caches and the loopback seam
+/// it reads are the same ones a tool call sees, so a drain pass and a send
+/// can never act on two different pictures of the same device.
+///
+/// It can only be built from an `Arc<endpoint::RemoteNode>`, and that is a
+/// statement rather than a convenience: only the process holding
+/// `remote/blobs.lock` may open the store, so only it may stage, re-grant or
+/// replay. The store claim IS the outbox lock.
+struct Drainer {
+    node: Arc<endpoint::RemoteNode>,
+    peers: Arc<PeerStore>,
+    outbox: Arc<Outbox>,
+    sessions: SessionCache,
+    roots: RootSet,
+    device: String,
+    loopback: Arc<Mutex<Option<SocketAddr>>>,
+    inflight: Arc<Mutex<HashMap<String, bool>>>,
+    retry: Arc<Mutex<HashMap<String, Backoff>>>,
+}
+
+impl Drainer {
+    /// The ONE dial path, with the classification `ClientSession::connect`
+    /// produced still intact.
+    ///
+    /// `McpCore::session` flattens it into a sentence, and that sentence is
+    /// where the cause stops being usable: it reads "{device} is not
+    /// reachable: peer offline — …", so nothing downstream can tell a
+    /// sleeping phone from a refusal without matching on prose. The send path
+    /// and the drain take the variant instead, because "asleep" is the only
+    /// cause a queued send may be built on, and the only one worth retrying.
+    async fn dial_session(&self, peer: &Peer) -> Result<Arc<ClientSession>, ConnectError> {
+        if let Some(existing) = self.sessions.lock().await.get(&peer.node_id) {
+            if !existing.is_closed() {
+                return Ok(existing.clone());
+            }
+        }
+        // A peer record that cannot be turned into an address is a corrupt
+        // entry in this server's own store, not a device that is asleep, so
+        // it takes the refusal door and can never reach the spool.
+        let addr = match self.loopback() {
+            Some(host) => endpoint::addr_at(&peer.node_id, host),
+            None => endpoint::addr_for(&peer.node_id),
+        }
+        .map_err(ConnectError::Refused)?;
+        // A probe dials every paired device, and a device that later sleeps
+        // leaves its session closed. Without this callback each one stays in
+        // the map for the life of the process, holding a dead connection.
+        let cache = self.sessions.clone();
+        let evict = peer.node_id.clone();
+        let on_closed = move || {
+            tokio::spawn(async move {
+                let mut sessions = cache.lock().await;
+                // Only ever drop a CLOSED entry: a re-dial may already have
+                // replaced this peer's session, and the old session's
+                // callback must not evict the new one.
+                if sessions.get(&evict).is_some_and(|s| s.is_closed()) {
+                    sessions.remove(&evict);
+                }
+            });
+        };
+        let session =
+            ClientSession::connect(&self.node, addr, self.device.clone(), |_| {}, on_closed)
+                .await?;
+        // What the DEVICE says it grants this server, cached the moment it
+        // says it. It is read for exactly one decision — whether a send to
+        // that device may be queued while it is ASLEEP, when no handshake can
+        // be had — and it is a hint there too: the receiver's own filter
+        // still decides what may land. A failed write costs the hint, never
+        // the send, so it is reported and stepped over.
+        if let Err(e) = self.peers.note_ack_scope(&peer.node_id, &session.scope) {
+            eprintln!("vlerv-mcp: cannot cache the grant {} reported: {e}", label(peer));
+        }
+        self.sessions.lock().await.insert(peer.node_id.clone(), session.clone());
+        Ok(session)
+    }
+
+    fn loopback(&self) -> Option<SocketAddr> {
+        *self.loopback.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// This server's own `127.0.0.1:<port>`, and only in loopback mode — the
+    /// address a pushed ticket names so the peer dials back over loopback.
+    async fn own_loopback(&self) -> Option<SocketAddr> {
+        self.loopback()?;
+        endpoint::loopback_socket(&self.node).await
+    }
+
+    /// What a boot owes the spool before anything else touches it.
+    ///
+    /// The order is load-bearing. The directory is re-read first because a
+    /// previous process may have completed records after `McpCore::new` read
+    /// it, and replaying those would push files that already landed. Records
+    /// whose bytes are gone go next, each releasing its own pin, so the sweep
+    /// that follows already has the final list of what is still owed. The
+    /// sweep runs LAST and only behind `live_tags`, which answers `None` when
+    /// the spool did not load: an unreadable spool has an EMPTY record map,
+    /// so a sweep that ran anyway would unpin every pending send and take the
+    /// files with it, with no error anywhere.
+    async fn reconcile(&self) {
+        self.outbox.reload();
+        for record in self.outbox.list() {
+            if !beam::outbox_bytes_present(&self.node, &record.hash).await {
+                // Retrying this to the TTL would announce a fetch the
+                // receiver can never complete, once per pass for a week.
+                self.give_up(&record, "its staged copy is no longer in the blob store").await;
+            }
+        }
+        let Some(keep) = self.outbox.live_tags() else {
+            return;
+        };
+        let swept = beam::sweep_outbox_tags(&self.node, &keep).await;
+        if swept > 0 {
+            // What a process that died between claiming an id and writing its
+            // record left pinned. Reported because the alternative reading —
+            // that a delivery went missing — is one a reader must be able to
+            // rule out.
+            eprintln!("vlerv-mcp: released {swept} staged file(s) no queued send claims");
+        }
+    }
+
+    /// One pass over the whole spool.
+    ///
+    /// `forced` is the peer a wake named, and it is dialed whatever its
+    /// backoff says — a peer that just connected has answered the only
+    /// question the ladder was guessing at.
+    async fn pass(&self, forced: Option<&str>) {
+        // Expiry first, so a record past its week is not dialed for one more
+        // time on its way out. The copy of the user's file goes with it.
+        for expired in self.outbox.take_expired(peers::now_unix()) {
+            beam::unpin_outbox(&self.node, &expired.tag).await;
+        }
+        // GROUPED BY PEER, and that is the whole shape of this pass: a dial
+        // to a suspended phone costs DIAL_TIMEOUT, so five records for one
+        // device must cost ONE dial, not five. The peers then run together,
+        // the way `list_devices { probe: true }` probes, so one sleeping
+        // device does not hold up a delivery to an awake one.
+        let due: Vec<String> = self
+            .outbox
+            .list()
+            .into_iter()
+            .map(|record| record.peer)
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .filter(|peer| forced == Some(peer.as_str()) || self.due(peer))
+            .collect();
+        join_all(due.iter().map(|peer| self.drain_peer(peer))).await;
+    }
+
+    /// One peer's pass, behind an in-flight + redrive guard.
+    ///
+    /// A second trigger for a peer already draining sets the redrive flag and
+    /// returns, and the running pass loops once more. Two passes to one
+    /// device would otherwise push the same record twice — the receiver lands
+    /// both, under the Beam collision rule, and the user gets `report-2.html`
+    /// they never asked for. The single supervisor cannot overlap passes
+    /// today; this holds the moment anything else calls the drain.
+    async fn drain_peer(&self, peer_id: &str) {
+        {
+            let mut flight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(redrive) = flight.get_mut(peer_id) {
+                *redrive = true;
+                return;
+            }
+            flight.insert(peer_id.to_string(), false);
+        }
+        loop {
+            self.peer_pass(peer_id).await;
+            let mut flight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+            match flight.get_mut(peer_id) {
+                // Somebody asked again while this pass was running, and the
+                // answer they wanted may only be true now.
+                Some(redrive) if *redrive => *redrive = false,
+                _ => {
+                    flight.remove(peer_id);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The steps one peer's records take, in the order the mechanism sets:
+    /// still paired, reachable, granted control, then at most
+    /// `MAX_PER_PASS` PUSHES — a bound, not a batch size, because a pass
+    /// that tried to empty a full spool down one session would hold that
+    /// device for minutes.
+    ///
+    /// Every one of those checks is made HERE rather than trusted from
+    /// enqueue time: a record can be days old, and the pairing, the grant and
+    /// the root set have all had that long to change.
+    async fn peer_pass(&self, peer_id: &str) {
+        let records = self.outbox.for_peer(peer_id);
+        if records.is_empty() {
+            return;
+        }
+        // The device was unpaired since the send was accepted. Revocation
+        // stays immediate: the bytes go now, not at the TTL.
+        let Some(peer) = self.peers.get(peer_id) else {
+            for record in &records {
+                self.give_up(record, "the device is no longer paired with this server").await;
+            }
+            self.retry.lock().unwrap_or_else(|p| p.into_inner()).remove(peer_id);
+            return;
+        };
+        let session = match self.dial_session(&peer).await {
+            Ok(session) => session,
+            // Asleep or refusing — for the queue these are the same move:
+            // say why on every record and try the whole peer again later.
+            // Only the wording differs, and it is the dial's own.
+            Err(cause) => {
+                self.hold_peer(peer_id, &records, not_reachable(&peer, &cause));
+                return;
+            }
+        };
+        // The grant as the DEVICE reports it, re-read on every pass. A record
+        // queued for a device that has since narrowed its grant must say so
+        // rather than collect "not permitted for this peer" forever.
+        if !Scope::parse(&session.scope).is_ok_and(|scope| scope.may_land_artifacts()) {
+            self.hold_peer(peer_id, &records, needs_control(&peer, &session.scope, &self.device));
+            return;
+        }
+
+        let mut landed = false;
+        // Pushes made, and it is COUNTED rather than taken off the front of
+        // the list. `MAX_PER_PASS` exists to stop one peer holding a session
+        // for minutes, and only a record that reaches `push_staged` costs
+        // that session anything — a held or dropped record costs a string
+        // compare. Spending the budget on skipped records starved every
+        // deliverable record behind them: the state directory is shared by
+        // every Claude Code session while VLERV_MCP_ROOTS is per project, so
+        // eight records another project queued for the same phone sit at the
+        // head of this peer's queue as a matter of course, and the ninth
+        // waited out the whole seven-day TTL behind them.
+        let mut pushes = 0usize;
+        for record in &records {
+            if pushes >= outbox::MAX_PER_PASS {
+                break;
+            }
+            // A purely LEXICAL prefix test against the roots, never a fresh
+            // canonicalize: the bytes were captured at enqueue, so a snapshot
+            // stays deliverable after the source file is deleted. The record
+            // is HELD — not sent, not dropped — because VLERV_MCP_ROOTS
+            // differs between projects and a session started elsewhere can
+            // still serve it.
+            if !self.roots.contains(&record.source) {
+                self.note(record, held_outside_roots(record, &self.roots));
+                continue;
+            }
+            // `push_staged` mints a ticket for whatever hash it is handed, so
+            // a record whose bytes went would announce a fetch the receiver
+            // can never finish.
+            if !beam::outbox_bytes_present(&self.node, &record.hash).await {
+                self.give_up(record, "its staged copy is no longer in the blob store").await;
+                continue;
+            }
+            // Past both skips, so this record is about to spend a session
+            // round trip. That — not the loop iteration — is what the bound
+            // counts.
+            pushes += 1;
+            // The STAGED bytes, named by content address: nothing re-reads
+            // the source, which by now may have been rewritten or deleted.
+            let pushed = match self.own_loopback().await {
+                Some(own) => {
+                    session.push_staged_at(&record.hash, &record.name, record.size, own).await
+                }
+                None => session.push_staged(&record.hash, &record.name, record.size).await,
+            };
+            match pushed {
+                Ok(_) => {
+                    // The RECORD FILE goes first, then the pin. A crash
+                    // between the two leaks a tag, which the next boot sweep
+                    // collects; the other order leaves a record whose bytes
+                    // are gone and a delivery that can never succeed.
+                    match self.outbox.complete(&record.id) {
+                        Ok(_) => {
+                            beam::unpin_outbox(&self.node, &record.tag).await;
+                            landed = true;
+                        }
+                        // The bytes ARE on the other machine. Reporting the
+                        // record as still pending is the honest answer, and
+                        // the duplicate the next pass sends lands visibly as
+                        // "report-2.html" rather than silently.
+                        Err(e) => eprintln!(
+                            "vlerv-mcp: {:?} reached {} but its record could not be \
+                             removed ({e}) — it will be sent again",
+                            record.name, record.device
+                        ),
+                    }
+                }
+                // The session died under the request, so nothing more is
+                // going out over it. Dropping it from the cache is what makes
+                // the next pass dial instead of reusing a handle whose
+                // `is_closed()` flag has not caught up.
+                Err(PushFailure::Transport(why)) => {
+                    forget_session(&self.sessions, peer_id).await;
+                    self.hold_peer(peer_id, &records, why);
+                    return;
+                }
+                // This side refused these bytes, or the host did. Both are
+                // answers about ONE record, so the next record still gets its
+                // turn on this session.
+                Err(refused) => self.note(record, refused.to_string()),
+            }
+        }
+        if landed {
+            // The device took a file, so whatever the ladder had learned
+            // about it is stale. Anything left over goes at the next tick.
+            self.retry.lock().unwrap_or_else(|p| p.into_inner()).remove(peer_id);
+        } else {
+            // NOTHING MOVED, so this peer is stalled like any other and the
+            // ladder is what says so. Stepping it only on a failed dial or a
+            // dead session left the reachable-but-held peer — every record
+            // outside this session's roots, or refused one at a time — with
+            // no ladder entry at all, so `due` answered true forever and the
+            // pass ran again at every `DRAIN_TICK`: 1440 dials a day at a
+            // device that had already given its answer.
+            self.back_off(peer_id);
+        }
+    }
+
+    /// End this peer's pass with one stated reason on every record it owns,
+    /// and step the ladder. `record_attempt` on an id that is already gone is
+    /// a no-op, so a record this pass delivered a moment ago is not
+    /// resurrected by the failure that ended the pass.
+    fn hold_peer(&self, peer_id: &str, records: &[Record], why: String) {
+        for record in records {
+            self.note(record, why.clone());
+        }
+        self.back_off(peer_id);
+    }
+
+    /// Write what happened to one record. The count and the sentence are what
+    /// `server_status` shows a human: a record that is not moving has a
+    /// reason, and a surface that shows the count without it is the silent
+    /// failure this queue exists to remove.
+    fn note(&self, record: &Record, why: String) {
+        if let Err(e) = self.outbox.record_attempt(&record.id, Some(why)) {
+            eprintln!("vlerv-mcp: cannot record an attempt on {}: {e}", record.id);
+        }
+    }
+
+    /// Give up on one record: the file goes, then its pin. The reason is
+    /// printed by the spool, because a delivery somebody was promised is
+    /// ending here.
+    async fn give_up(&self, record: &Record, reason: &str) {
+        match self.outbox.drop_record(&record.id, reason) {
+            Ok(Some(dropped)) => beam::unpin_outbox(&self.node, &dropped.tag).await,
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "vlerv-mcp: cannot drop the queued send of {:?} to {}: {e}",
+                record.name, record.device
+            ),
+        }
+    }
+
+    /// Step this peer one rung down the retry ladder.
+    fn back_off(&self, peer_id: &str) {
+        let mut ladder = self.retry.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = ladder
+            .entry(peer_id.to_string())
+            .or_insert(Backoff { failures: 0, next: Instant::now() });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.next = Instant::now() + retry_delay(entry.failures);
+    }
+
+    /// May this peer be dialed on this pass? A peer nothing has failed for is
+    /// always due, which is what makes the boot pass try everything at once.
+    fn due(&self, peer_id: &str) -> bool {
+        self.retry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(peer_id)
+            .is_none_or(|backoff| backoff.next <= Instant::now())
+    }
+}
+
+/// The one drain task, spawned by the boot that claimed the blob store.
+///
+/// One serialized task means two passes cannot overlap by construction. The
+/// tick is GUARDED by a non-empty spool, so an idle server costs zero
+/// wakeups — the `Wake::Spool` hint is what tells it the spool stopped being
+/// empty, and the sender lives on `McpCore`, so this task ends with the
+/// server it serves rather than holding the store claim after it.
+async fn supervise(drainer: Drainer, mut wake: mpsc::Receiver<Wake>) {
+    // The boot pass, before anything asks: it delivers the work a dead
+    // process left behind, which is the whole promise made to the user whose
+    // send outlived the session that accepted it.
+    drainer.pass(None).await;
+    loop {
+        let forced = tokio::select! {
+            woken = wake.recv() => match woken {
+                Some(Wake::Peer(peer)) => Some(peer),
+                Some(Wake::Spool) => None,
+                // Every sender is gone, so nothing will ever queue again and
+                // this process is finished with the spool. This task holds
+                // the last reference to the node, so handing the store over
+                // is its last act — and it has to SAY so: dropping a node
+                // whose store runs a collector releases the lock file but
+                // leaves redb open, and the next opener inside this process
+                // would hang on a store the lock says is free.
+                None => return drainer.node.shutdown().await,
+            },
+            _ = tokio::time::sleep(outbox::DRAIN_TICK), if !drainer.outbox.is_empty() => None,
+        };
+        drainer.pass(forced.as_deref()).await;
+    }
+}
+
+/// How long a peer that would not take its queued sends is left alone.
+fn retry_delay(failures: u32) -> Duration {
+    let rung = (failures.max(1) as usize - 1).min(RETRY_LADDER.len() - 1);
+    Duration::from_secs(RETRY_LADDER[rung])
+}
+
+/// Drop a cached session so the next call re-handshakes. A free function over
+/// the shared map: the send path and the drain both do this for the same
+/// reason, and `is_closed()` is a cached flag rather than a probe, so neither
+/// may leave a stale handle for the other to find.
+async fn forget_session(sessions: &SessionCache, node_id: &str) {
+    sessions.lock().await.remove(node_id);
+}
+
+/// What a record whose source has left this server's roots is told.
+///
+/// It is HELD, not dropped: `VLERV_MCP_ROOTS` differs between projects, so a
+/// delivery accepted in one may only ever be served by a session started in
+/// another. Saying which roots refused it is the difference between a user
+/// who can start that session and one who watches a count that never moves.
+fn held_outside_roots(record: &Record, roots: &RootSet) -> String {
+    let listed: Vec<String> = roots.roots().iter().map(|root| format!("{root:?}")).collect();
+    format!(
+        "held, not sent: {:?} is outside this server's send roots ({}), so it is neither \
+         delivered nor dropped. A Claude Code session whose VLERV_MCP_ROOTS covers that file \
+         delivers this record; otherwise it waits here until it expires.",
+        record.source,
+        listed.join(", ")
+    )
+}
+
+/// The refusal a device that has not granted this server "control" gets.
+///
+/// One producer, two callers: the live check against the scope in a
+/// handshake, and the queue-time pre-check against the scope the last
+/// handshake reported. The same human has to act on both, and two spellings
+/// of one instruction are how one of them stops naming the peer to widen.
+fn needs_control(peer: &Peer, scope: &str, this_device: &str) -> String {
+    format!(
+        "{} has not granted this server control. It paired this server at scope {scope:?}; \
+         pushing a file needs \"control\". On that device, open its Vlervtifacts peer \
+         settings, find \"{this_device}\", and set its scope to \"control\".",
+        label(peer)
+    )
+}
+
+/// The sentence a peer that would not talk produces, wherever the send path
+/// gives up on reaching it. `ConnectError` prints its own cause verbatim, so
+/// this wraps it without touching a word of it.
+fn not_reachable(peer: &Peer, cause: &ConnectError) -> String {
+    format!(
+        "{} is not reachable: {cause}. Check that the device is awake, on a network, \
+         and that Vlervtifacts is running on it.",
+        label(peer)
+    )
 }
 
 /// The name this server announces in every handshake and pairing ticket.
@@ -1012,7 +2071,12 @@ mod tests {
     #[test]
     fn the_received_list_is_bounded_and_still_reports_the_true_count() {
         let received = Arc::new(Mutex::new(Received::default()));
-        let sink = McpSink { pairing: Arc::new(Pairing::new()), received: received.clone() };
+        let (wake, _drain) = mpsc::channel(WAKE_DEPTH);
+        let sink = McpSink {
+            pairing: Arc::new(Pairing::new()),
+            received: received.clone(),
+            wake: wake.downgrade(),
+        };
         let pushes = MAX_RECEIVED + 5;
         for i in 0..pushes {
             sink.emit(HostSignal::ArtifactReceived {
@@ -1029,6 +2093,74 @@ mod tests {
         assert_eq!(kept.items.first().unwrap().name, format!("a{}.html", pushes - MAX_RECEIVED));
         assert_eq!(kept.items.last().unwrap().name, format!("a{}.html", pushes - 1));
         assert_eq!(kept.total, pushes as u64, "the count is not capped");
+    }
+
+    #[test]
+    fn a_peer_that_dials_in_wakes_the_drain_and_no_other_signal_does() {
+        // The precise trigger, and the reason the retry ladder is allowed to
+        // start at a whole minute: a device that dialed IN has answered the
+        // question the ladder was waiting on, so its queued sends go out on
+        // this pass instead of a later one. The other three signals say
+        // nothing about whether anything is reachable, and a pass they
+        // provoked would be one more n0 discovery lookup for the same answer.
+        let (wake, mut passes) = mpsc::channel(WAKE_DEPTH);
+        let sink = McpSink {
+            pairing: Arc::new(Pairing::new()),
+            received: Arc::new(Mutex::new(Received::default())),
+            wake: wake.downgrade(),
+        };
+        let phone = "ab".repeat(32);
+
+        sink.emit(HostSignal::PeerConnected {
+            peer: phone.clone(),
+            device: "Val's iPhone".into(),
+            scope: "control".into(),
+        });
+        let Ok(Wake::Peer(woken)) = passes.try_recv() else {
+            panic!("a peer holding a session must force a pass");
+        };
+        assert_eq!(woken, phone, "and force it for THAT peer, not for the whole spool");
+
+        sink.emit(HostSignal::OpenOnHost {
+            peer: phone.clone(),
+            path: PathBuf::from("/tmp/a.html"),
+            reader_mode: false,
+        });
+        sink.emit(HostSignal::ArtifactReceived {
+            peer: phone.clone(),
+            path: PathBuf::from("/tmp/b.html"),
+            name: "b.html".into(),
+            size: 1,
+            hash: "cd".repeat(32),
+        });
+        assert!(passes.try_recv().is_err(), "nothing else claims a device is reachable");
+    }
+
+    #[tokio::test]
+    async fn the_hosts_own_sink_never_holds_the_wake_channel_open() {
+        // This sink is owned by the `ScopeState` inside the `RemoteNode` the
+        // supervisor task holds. A STRONG sender in it would close the loop:
+        // `supervise` would never read `None`, so it would never return,
+        // never drop the node, and never release the blob-store claim — and
+        // the next process over the same state directory would be refused for
+        // as long as this one lived. The two restart tests in
+        // tests/tool_handlers.rs fail on exactly that.
+        let (wake, mut passes) = mpsc::channel::<Wake>(WAKE_DEPTH);
+        let sink = McpSink {
+            pairing: Arc::new(Pairing::new()),
+            received: Arc::new(Mutex::new(Received::default())),
+            wake: wake.downgrade(),
+        };
+        drop(wake);
+        assert!(passes.recv().await.is_none(), "the last STRONG sender ends the supervisor");
+
+        // And the host survives its drain: a peer connecting after the queue
+        // is gone drops a hint, rather than panicking on the accept path.
+        sink.emit(HostSignal::PeerConnected {
+            peer: "ab".repeat(32),
+            device: "Val's iPhone".into(),
+            scope: "control".into(),
+        });
     }
 
     #[test]
@@ -1095,6 +2227,642 @@ mod tests {
             );
         }
         assert!(!core.server_status().await.unwrap().booted, "a refusal binds nothing");
+    }
+
+    /// An endpoint that answers the transport and speaks no scope protocol.
+    ///
+    /// A device that is really asleep costs `DIAL_TIMEOUT` — thirty seconds —
+    /// to give up on, which is a minute of test time for the two sends the
+    /// dedupe proof needs. This one fails the SAME `endpoint::dial` in
+    /// milliseconds and produces the SAME `ConnectError::Unreachable`, which
+    /// is the one input the decision to queue reads.
+    async fn deaf_device(dir: &tempfile::TempDir) -> Arc<endpoint::RemoteNode> {
+        Arc::new(endpoint::boot(&Dirs::new(dir.path()), None, |_| {}).await.unwrap())
+    }
+
+    /// A core whose every dial goes to `device`, with that device already
+    /// paired the way `confirm_pairing` writes it.
+    async fn core_paired_with(
+        state: &tempfile::TempDir,
+        workspace: &tempfile::TempDir,
+        device: &Arc<endpoint::RemoteNode>,
+    ) -> McpCore {
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        core.use_loopback(endpoint::loopback_socket(device).await.unwrap());
+        core.peer_store()
+            .seed(&device.endpoint.id().to_string(), "Val's iPhone", Scope::Control)
+            .unwrap();
+        core
+    }
+
+    /// The same device AWAKE: a headless `vlerv-remote` host that already
+    /// grants `grants_to` control, which is the shape a Vlervcode instance
+    /// presents to the wire. `deaf_device` is its sleeping twin, and the two
+    /// exist for opposite proofs — that one is what the drain does when it
+    /// cannot reach a peer, this one what it does when it CAN.
+    async fn awake_device(
+        dir: &tempfile::TempDir,
+        grants_to: &str,
+    ) -> (Arc<endpoint::RemoteNode>, Arc<Mutex<Vec<HostSignal>>>) {
+        let peers = Arc::new(PeerStore::load(dir.path()));
+        peers.seed(grants_to, "Claude Code", Scope::Control).unwrap();
+        let signals: Arc<Mutex<Vec<HostSignal>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = signals.clone();
+        let state = Arc::new(ScopeState::new(
+            peers,
+            Arc::new(Pairing::new()),
+            Arc::new(TabsCache::new()),
+            // A push reads nothing on the receiving side, so the receiver
+            // needs no workspace at all.
+            RootSet::empty(),
+            "Val's iPhone".to_string(),
+            Arc::new(EmptyCatalog),
+            move |signal| sink.lock().unwrap_or_else(|p| p.into_inner()).push(signal),
+        ));
+        let node = endpoint::boot(&Dirs::new(dir.path()), Some(state), |_| {})
+            .await
+            .expect("the device is up");
+        (Arc::new(node), signals)
+    }
+
+    /// The names a device landed, in arrival order.
+    fn received(signals: &Arc<Mutex<Vec<HostSignal>>>) -> Vec<String> {
+        signals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|s| match s {
+                HostSignal::ArtifactReceived { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stage one file into this server's own store and write the record that
+    /// claims it: `send_to_device` without the dial, so a test can lay out an
+    /// exact queue for one peer in an exact order. The id carries the
+    /// millisecond it was minted at, so records enqueued here in sequence are
+    /// the order the drain reads them in.
+    async fn queue_staged(
+        core: &McpCore,
+        node: &Arc<endpoint::RemoteNode>,
+        peer: &str,
+        file: &Path,
+    ) -> String {
+        let id = core.outbox.next_id();
+        // The record keeps the path the GATE resolved, and the roots are
+        // canonical too, so an uncanonicalized source would be held here for
+        // a reason the drain never meant.
+        let source = file.canonicalize().unwrap();
+        let hash = beam::stage_outbox(node, &source, &id).await.expect("staged bytes");
+        core.outbox
+            .enqueue(Staged {
+                id: id.clone(),
+                peer: peer.to_string(),
+                device: "Val's iPhone".to_string(),
+                name: source.file_name().unwrap().to_string_lossy().into_owned(),
+                size: std::fs::metadata(&source).unwrap().len(),
+                source,
+                hash,
+            })
+            .expect("the record is written");
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_head_of_queue_never_starves_the_record_behind_it() {
+        // One state directory serves every Claude Code session on this
+        // machine, while VLERV_MCP_ROOTS is per project — so records another
+        // project queued for the same phone sit at the head of this session's
+        // view of that peer as a matter of course. They are HELD here, and a
+        // per-pass budget spent on records that are only SKIPPED left the one
+        // record this session can actually serve unreachable behind them for
+        // the whole seven-day TTL, with nothing on any surface saying so.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let other_project = tempfile::TempDir::new().unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
+        let phone_id = phone.endpoint.id().to_string();
+        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        let node = core.node().await.unwrap();
+
+        // One MORE than the bound, so a budget spent per record looked at
+        // runs out before the queue does.
+        for n in 0..=outbox::MAX_PER_PASS {
+            let file = other_project.path().join(format!("held-{n}.html"));
+            std::fs::write(&file, format!("<h1>queued in another project: {n}</h1>")).unwrap();
+            queue_staged(&core, &node, &phone_id, &file).await;
+        }
+        // And the record this session queued, behind every one of them.
+        let mine = workspace.path().join("report.html");
+        let body = "<h1>queued right here</h1>";
+        std::fs::write(&mine, body).unwrap();
+        let deliverable = queue_staged(&core, &node, &phone_id, &mine).await;
+
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        assert_eq!(
+            received(&signals),
+            vec!["report.html".to_string()],
+            "the one deliverable record has to go out in a SINGLE pass, whatever is ahead of it"
+        );
+        let status = core.server_status().await.unwrap();
+        assert!(
+            !status.queued.iter().any(|q| q.id == deliverable),
+            "a delivered record leaves the spool, or the next pass sends it twice"
+        );
+        assert_eq!(
+            status.queued_total,
+            outbox::MAX_PER_PASS + 1,
+            "and the held records stay held: not sent, and not dropped either"
+        );
+        assert!(
+            status.queued.iter().all(|q| q
+                .last_error
+                .as_deref()
+                .is_some_and(|why| why.contains("outside this server's send roots"))),
+            "every one of them says why it is not moving: {:?}",
+            status.queued
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_pass_pushes_at_most_the_per_pass_bound_and_the_next_pass_takes_the_rest() {
+        // What `MAX_PER_PASS` buys: one device with a full spool must not own
+        // the drain until its last record is gone. The drain is one
+        // serialized task, so every push a peer makes on one pass is time
+        // every other paired device waits, and a spool holds up to
+        // `MAX_RECORDS` of them.
+        //
+        // The starvation test above cannot show this and still passes with
+        // the bound deleted: it queues exactly ONE deliverable record, so an
+        // unbounded loop simply runs off the end of a queue whose other
+        // records are all skipped. Here every record is deliverable, so a
+        // pass that does not stop at the bound pushes the whole spool.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
+        let phone_id = phone.endpoint.id().to_string();
+        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        let node = core.node().await.unwrap();
+
+        // Two past the bound. All inside this session's roots, all with their
+        // bytes in the store and all for one awake device that grants
+        // control, so no record here can be held, dropped or refused: the
+        // budget is the only thing left that can stop one.
+        let mut names = Vec::new();
+        let mut ids = Vec::new();
+        for n in 0..outbox::MAX_PER_PASS + 2 {
+            let name = format!("report-{n}.html");
+            let file = workspace.path().join(&name);
+            std::fs::write(&file, format!("<h1>deliverable {n}</h1>")).unwrap();
+            ids.push(queue_staged(&core, &node, &phone_id, &file).await);
+            names.push(name);
+        }
+
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        assert_eq!(
+            received(&signals),
+            names[..outbox::MAX_PER_PASS],
+            "one pass hands over the bound and stops, oldest record first"
+        );
+        let after_one = core.server_status().await.unwrap();
+        assert_eq!(
+            after_one.queued.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
+            ids[outbox::MAX_PER_PASS..],
+            "the records past the bound are still pending, in the order they were queued"
+        );
+        assert!(
+            after_one.queued.iter().all(|q| q.attempts == 0 && q.last_error.is_none()),
+            "and the pass never reached them — this is the budget stopping, not a push \
+             that was tried and failed: {:?}",
+            after_one.queued
+        );
+
+        // A bound defers work, it never drops it: the next pass takes the
+        // batch behind it, which is what makes a full spool drain at all.
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        assert_eq!(received(&signals), names, "the next pass takes the records behind the bound");
+        assert_eq!(
+            core.server_status().await.unwrap().queued_total,
+            0,
+            "and nothing is owed to this device any more"
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reachable_peer_whose_records_are_all_held_still_steps_the_retry_ladder() {
+        // The ladder used to be stepped only by a failed dial, a scope that
+        // is too narrow or a dead session. A peer that ANSWERS, grants
+        // control and then has nothing this session may send fell through all
+        // three, so `due` said yes forever and the pass ran again at every
+        // DRAIN_TICK — 1440 dials a day at a device that had already given
+        // its answer, each one an n0 discovery lookup that tells a third
+        // party who this machine talks to.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let other_project = tempfile::TempDir::new().unwrap();
+        let held = other_project.path().join("report.html");
+        std::fs::write(&held, "<h1>queued in another project</h1>").unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
+        let phone_id = phone.endpoint.id().to_string();
+        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        let node = core.node().await.unwrap();
+        queue_staged(&core, &node, &phone_id, &held).await;
+        assert!(core.drainer(&node).due(&phone_id), "nothing has failed for it yet");
+
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        assert!(received(&signals).is_empty(), "the ROOTS held it, so nothing was pushed");
+        let why = core.server_status().await.unwrap().queued[0].last_error.clone().unwrap();
+        assert!(
+            why.contains("outside this server's send roots"),
+            "the pass reached the roots test, so the dial and the grant both passed: {why}"
+        );
+        assert!(
+            !core.drainer(&node).due(&phone_id),
+            "a pass that moved nothing is a stalled peer, whatever stalled it"
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_sends_of_one_file_to_one_sleeping_device_make_one_record() {
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        let body = "<!doctype html><h1>report</h1>";
+        std::fs::write(&artifact, body).unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+
+        let first = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+        let Delivery::Queued { id, device, name, size, hash, expires_at, reason, notes, .. } = first
+        else {
+            panic!("a device that did not answer must be queued, never delivered: {first:?}");
+        };
+        assert_eq!(device, "Val's iPhone");
+        assert_eq!(name, "report.html");
+        assert_eq!(size, body.len() as u64);
+        assert!(reason.contains("peer offline"), "the dial's own answer, verbatim: {reason}");
+        assert!(expires_at > peers::now_unix());
+        // No handshake has ever completed with this device, so the answer has
+        // to say the control grant is unverified rather than imply a promise
+        // the device may refuse when it wakes.
+        assert!(notes.iter().any(|n| n.contains("unverified")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("copied as it stands")), "{notes:?}");
+
+        let record = Dirs::new(state.path()).outbox().join(format!("{id}.json"));
+        assert!(record.is_file(), "the send is on disk before it is reported: {record:?}");
+
+        // The retry a model makes when a call looked like it failed. The
+        // store is content-addressed, so this stages the same bytes — and
+        // without the dedupe one user intent becomes two records, each
+        // pinning its own copy.
+        let again = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+        let Delivery::Queued { id: repeated, .. } = again else {
+            panic!("the second send must be queued too");
+        };
+        assert_eq!(repeated, id, "one intent, one record, however often it is asked for");
+
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 1);
+        assert_eq!(status.queued_bytes, body.len() as u64);
+        assert_eq!(status.retained_bytes, body.len() as u64, "the copy is real and is counted");
+        assert!(!status.draining, "nothing drains in this build, and the status says so");
+        assert_eq!(status.queue_blocked_reason, None);
+        assert!(status.queue_unreadable.is_empty());
+        let queued = &status.queued[0];
+        assert_eq!(queued.id, id);
+        assert_eq!(queued.hash, hash);
+        assert_eq!(queued.node_id, asleep.endpoint.id().to_string());
+        assert_eq!(
+            queued.source,
+            artifact.canonicalize().unwrap(),
+            "the record keeps the path the gate resolved, never the caller's argument"
+        );
+        assert_eq!(queued.attempts, 0, "nothing has tried to deliver it yet");
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_record_id_leaves_the_incumbents_file_and_its_pin_alone() {
+        // `queue_send` mints `{millis}-{seq}` one line before it stages the
+        // bytes under `outbox/<id>`, so two runs that mint the same id put
+        // the second run's staging on the first run's pin. That happens when
+        // the clock goes backwards, and on any machine reporting a time
+        // before 1970 it happens to every first send, because `now_millis`
+        // answers 0 and the counter used to restart at 0 as well.
+        // `Outbox::enqueue` refuses the repeated id — `create_new` is what
+        // makes it fail loudly rather than overwrite — but the cleanup under
+        // that refusal then unpins the tag, and the tag was the incumbent's.
+        // The incumbent kept its FILE and lost its BYTES.
+        //
+        // The replay is handed to the staging call rather than provoked
+        // through `next_id`: nothing in this process can move the machine's
+        // clock, and this is the exact call `queue_send` makes with the id it
+        // has just minted.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        let body = "<!doctype html><h1>accepted first, and still owed</h1>";
+        std::fs::write(&artifact, body).unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+        let node = core.node().await.unwrap();
+
+        let accepted = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+        let Delivery::Queued { id, hash, .. } = accepted else {
+            panic!("a device that did not answer must be queued: {accepted:?}");
+        };
+        let record = Dirs::new(state.path()).outbox().join(format!("{id}.json"));
+        assert!(record.is_file(), "the incumbent is on disk before anything replays its id");
+
+        // The second run, minting the id the first one already used.
+        let intruder = workspace.path().join("other.html");
+        std::fs::write(&intruder, "<h1>a second run minting the very same id</h1>").unwrap();
+        let err = beam::stage_outbox(&node, &intruder.canonicalize().unwrap(), &id)
+            .await
+            .expect_err("a taken id has to fail before it can take a pin");
+        assert!(err.contains(&outbox::tag_name(&id)), "the refusal names the pin, got: {err}");
+
+        // BOTH halves of the incumbent survive, which is the whole claim.
+        assert!(record.is_file(), "the record file the id claim protects");
+        let pinned = node
+            .store
+            .tags()
+            .get(outbox::tag_name(&id))
+            .await
+            .unwrap()
+            .expect("the pin that keeps the bytes");
+        assert_eq!(pinned.hash.to_string(), hash, "and it still names the bytes it was made for");
+        assert!(beam::outbox_bytes_present(&node, &hash).await, "which are still in the store");
+
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 1, "one send was accepted, and it is still pending");
+        assert_eq!(status.queued[0].hash, hash);
+        assert_eq!(
+            status.retained_bytes,
+            body.len() as u64,
+            "and the refused replay cost the user no second copy"
+        );
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sleeping_device_that_never_granted_control_is_refused_instead_of_hoarded_for() {
+        // The privacy half of the queue. Every queued send is a full private
+        // copy of the user's file kept for a week; making them for a device
+        // that will refuse the bytes on arrival is the one way this feature
+        // could quietly cost more than it is worth.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        std::fs::write(&artifact, "<h1>report</h1>").unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+        let phone_id = asleep.endpoint.id().to_string();
+
+        core.peer_store().note_ack_scope(&phone_id, "browse").unwrap();
+        let err = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap_err();
+        assert!(err.contains("has not granted this server control"), "{err}");
+        assert!(err.contains("\"browse\""), "the message names the scope it knows about: {err}");
+        assert!(err.contains("Nothing was queued"), "{err}");
+        assert_eq!(core.server_status().await.unwrap().queued_total, 0);
+        assert!(
+            !Dirs::new(state.path()).outbox().exists(),
+            "a refusal must not even create the spool, let alone stage a copy"
+        );
+
+        // The same device, once it has granted control: now the send waits,
+        // and its answer no longer calls the grant unverified.
+        core.peer_store().note_ack_scope(&phone_id, "control").unwrap();
+        let queued = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+        let Delivery::Queued { notes, .. } = queued else {
+            panic!("the device is still not answering");
+        };
+        assert!(!notes.iter().any(|n| n.contains("unverified")), "{notes:?}");
+        assert_eq!(core.server_status().await.unwrap().queued_total, 1);
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test]
+    async fn two_devices_owed_one_file_are_owed_one_copy_of_it() {
+        // What the status must not do is add a disk cost that is not there.
+        // The store is content-addressed and a record pins a hash, so one
+        // file queued for two devices is two records, two pins and ONE blob.
+        // The spool is written straight to disk here: `McpCore::new` reads it
+        // back, and neither number needs a socket, a device or a store.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let spool = Outbox::load(&Dirs::new(state.path()).outbox());
+        let hash = "b".repeat(64);
+        for device in ["Val's iPhone", "Val's iPad"] {
+            spool
+                .enqueue(Staged {
+                    id: spool.next_id(),
+                    peer: "a".repeat(64),
+                    device: device.to_string(),
+                    source: workspace.path().join("report.html"),
+                    name: "report.html".to_string(),
+                    size: 4096,
+                    hash: hash.clone(),
+                })
+                .unwrap();
+        }
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 2, "both devices are still owed the file");
+        assert_eq!(status.queued_bytes, 8192, "and that is what is owed, added up");
+        assert_eq!(status.retained_bytes, 4096, "but one copy is what it costs this disk");
+    }
+
+    #[test]
+    fn the_retry_ladder_never_dials_a_sleeping_device_more_than_once_a_minute() {
+        // The floor is the privacy half of the cadence, not a performance
+        // choice: `addr_for` names a peer by NodeId alone, so every retry is
+        // an n0 discovery lookup and a possible relay traversal, and each one
+        // is a third-party observation of who this machine talks to. A week
+        // of a phone in a drawer is what this ladder is sized against.
+        assert_eq!(retry_delay(1), Duration::from_secs(60));
+        assert_eq!(retry_delay(2), Duration::from_secs(120));
+        assert_eq!(retry_delay(3), Duration::from_secs(300));
+        assert_eq!(retry_delay(4), Duration::from_secs(600));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(600), "it never grows past ten");
+        // Nothing calls this with zero — `back_off` increments first — but a
+        // ladder that answered "retry immediately" to an off-by-one would
+        // spin a dial as fast as the timeout allows.
+        assert_eq!(retry_delay(0), Duration::from_secs(60));
+        assert!(RETRY_LADDER.iter().all(|step| *step >= 60), "the floor holds at every rung");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_send_does_not_re_dial_the_device_it_just_failed_to_reach() {
+        // `send_to_device` has already spent a whole dial on this device
+        // before it queued anything. A drain that then dialed again, because
+        // a new record woke it, would learn the same thing twice and start
+        // the week's retries at zero.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        std::fs::write(&artifact, "<h1>report</h1>").unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+        let phone_id = asleep.endpoint.id().to_string();
+        let node = core.node().await.unwrap();
+        assert!(core.drainer(&node).due(&phone_id), "nothing has failed for it yet");
+
+        core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+        assert!(
+            !core.drainer(&node).due(&phone_id),
+            "the send's own failed dial is the first rung of the ladder"
+        );
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_whose_bytes_are_gone_is_dropped_at_boot_instead_of_retried_forever() {
+        // The record and the staged copy it names can come apart: a state
+        // directory restored from a backup, a store rebuilt, a build that did
+        // not write this pin. Replaying such a record announces a fetch the
+        // receiver can never complete, and would do it once per pass for the
+        // whole week the record lives.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let phone_id = "ab".repeat(32);
+
+        // Written before the core reads the directory, the way a previous
+        // process would have left it.
+        let spool = Outbox::load(&Dirs::new(state.path()).outbox());
+        let id = spool.next_id();
+        spool
+            .enqueue(Staged {
+                id: id.clone(),
+                peer: phone_id.clone(),
+                device: "Val's iPhone".to_string(),
+                source: workspace.path().join("report.html"),
+                name: "report.html".to_string(),
+                size: 15,
+                // No blob in this store has this address.
+                hash: "b".repeat(64),
+            })
+            .unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        // Still paired, so a missing copy is the only thing that can explain
+        // the record going away.
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        assert_eq!(core.server_status().await.unwrap().queued_total, 1, "it is on disk");
+
+        // Reconciliation runs INSIDE the boot initializer, so a node in hand
+        // means it has already finished.
+        core.node().await.expect("this server's own store");
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 0, "a delivery that cannot happen is not kept");
+        assert_eq!(status.queued_bytes, 0);
+        assert!(
+            !Dirs::new(state.path()).outbox().join(format!("{id}.json")).exists(),
+            "the record file goes with it, or the next boot brings it back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quarantined_record_is_still_named_after_the_boot_reconciles() {
+        // The boot RELOADS the spool before it builds the sweep keep-set, so
+        // a quarantine counted only on the read that moved the file aside was
+        // erased by the very next read. Two things went with it: this list,
+        // which is the only place a human hears that a delivery is not
+        // happening, and the stem's place in the keep-set, which is the only
+        // thing holding the staged copy of the user's file back from the boot
+        // sweep.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outbox_dir = Dirs::new(state.path()).outbox();
+        std::fs::create_dir_all(&outbox_dir).unwrap();
+        std::fs::write(outbox_dir.join("0000000000001-0099.json"), "{not json").unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        assert_eq!(
+            core.server_status().await.unwrap().queue_unreadable,
+            vec!["0000000000001-0099".to_string()],
+            "the read that moved it aside names it"
+        );
+
+        // Reconciliation runs INSIDE the boot initializer, so a node in hand
+        // means the reload and the sweep have both already happened.
+        core.node().await.expect("this server's own store");
+        assert_eq!(
+            core.server_status().await.unwrap().queue_unreadable,
+            vec!["0000000000001-0099".to_string()],
+            "and so does every read after it"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::api::Tag;
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::{Hash, HashAndFormat};
+use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::beam::delete_tags;
@@ -85,20 +85,56 @@ const PEER_OFFLINE: &str = "peer offline — could not reach it";
 // ── Grants: peer-locked blob capabilities ──────────────────────────────────
 
 struct Grant {
-    /// Peers allowed to fetch this hash. A grant is NOT a beam ticket:
-    /// possession of the hash is not enough, the fetching NodeId must be one
-    /// that asked for the artifact through a scoped session.
-    peers: HashSet<EndpointId>,
-    expires_at: u64,
-    tag: Tag,
+    /// Peers allowed to fetch this hash, each with the moment ITS OWN
+    /// capability lapses. A grant is NOT a beam ticket: possession of the
+    /// hash is not enough, the fetching NodeId must be one that asked for the
+    /// artifact through a scoped session.
+    ///
+    /// The clock is per peer because unrelated callers share one hash. A
+    /// queued send re-grants the same bytes to the receiving device on every
+    /// delivery attempt, once a minute for as long as that device sleeps,
+    /// while another peer may hold a browse grant on the same file. One
+    /// grant-wide clock lets that retry loop renew the browse capability for
+    /// a week, so bytes a peer asked for once stay fetchable long after the
+    /// hour it was given.
+    peers: HashMap<EndpointId, u64>,
+    /// The staging tag this grant OWNS, or `None` when the bytes are pinned
+    /// by somebody with a longer memory than a grant has. `None` means
+    /// "expiring me must unpin nothing", and the case that needs it is a send
+    /// accepted for a peer that is asleep: those bytes are pinned by a durable
+    /// tag the sender keeps for up to a week, while a grant lives one hour and
+    /// is re-minted per delivery attempt. Let such a grant own that tag and
+    /// the next `stage_for_peer` sweep unpins a file the user was promised,
+    /// leaving a delivery that pushes a hash with no bytes behind it.
+    ///
+    /// `None` is not permanent: a grant that owns nothing ADOPTS the next
+    /// staging tag minted for the same content — see `insert`. That tag is a
+    /// fresh one this registry made, never the spool's `outbox/<id>`, so
+    /// releasing it can never unpin a pending send.
+    tag: Option<Tag>,
 }
 
 impl Grant {
-    /// Let one more peer fetch these bytes, and restart the clock — a peer
-    /// that just asked is about to fetch.
+    /// Let one more peer fetch these bytes, and restart THAT PEER's clock — a
+    /// peer that just asked is about to fetch. Every other peer on this hash
+    /// keeps the expiry it earned, so one peer's traffic cannot extend
+    /// another's capability.
     fn admit(&mut self, peer: EndpointId) {
-        self.peers.insert(peer);
-        self.expires_at = now_unix() + GRANT_TTL_SECS;
+        self.peers.insert(peer, now_unix() + GRANT_TTL_SECS);
+    }
+
+    /// May this peer still fetch? Unknown and lapsed answer the same.
+    fn admits(&self, peer: &EndpointId, now: u64) -> bool {
+        self.peers.get(peer).is_some_and(|expires_at| *expires_at > now)
+    }
+
+    /// Drop the peers whose hour ran out, and report whether anybody is left.
+    /// A grant survives while ONE peer still holds it: dropping the whole
+    /// entry on the first lapse would take the pin with it and free bytes a
+    /// live peer is still allowed to fetch.
+    fn retain_live(&mut self, now: u64) -> bool {
+        self.peers.retain(|_, expires_at| *expires_at > now);
+        !self.peers.is_empty()
     }
 }
 
@@ -123,22 +159,38 @@ impl Grants {
     }
 
     /// Record (or refresh) a grant. Returns a tag the caller must delete: the
-    /// redundant staging tag when this content was already staged — leaving
-    /// it would pin a second copy of the bytes that nothing can reach.
+    /// redundant staging tag when this content was already staged AND the
+    /// grant already owns a pin of its own — leaving it would pin a second
+    /// copy of the bytes that nothing can reach.
+    ///
+    /// A grant that owns NO tag ADOPTS the fresh one instead, and that is the
+    /// whole reason this is not one arm. A tag-less grant defers to another
+    /// owner, and that owner is the spool record, which is unpinned the
+    /// moment the delivery lands. Hand the fresh tag back after that and the
+    /// content has no root left at all: the collector is free to take the
+    /// bytes while the peer this grant was just minted for is fetching them.
+    /// Adoption takes nothing the spool needs — the adopted tag is the fresh
+    /// staging one, never `outbox/<id>` — so `take_expired` and `revoke_peer`
+    /// release it on the grant's own clock and a pending send keeps its pin.
     fn insert(&self, hash: Hash, peer: EndpointId, tag: Tag) -> Option<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match map.get_mut(&hash) {
             Some(existing) => {
                 existing.admit(peer);
-                Some(tag)
+                match existing.tag {
+                    Some(_) => Some(tag),
+                    None => {
+                        existing.tag = Some(tag);
+                        None
+                    }
+                }
             }
             None => {
                 map.insert(
                     hash,
                     Grant {
-                        peers: HashSet::from([peer]),
-                        expires_at: now_unix() + GRANT_TTL_SECS,
-                        tag,
+                        peers: HashMap::from([(peer, now_unix() + GRANT_TTL_SECS)]),
+                        tag: Some(tag),
                     },
                 );
                 None
@@ -146,9 +198,40 @@ impl Grants {
         }
     }
 
-    /// Widen an EXISTING grant to one more peer, refreshing its TTL. `false`
-    /// when nothing is staged under `hash`: a grant with no bytes behind it is
-    /// a dangling capability, so the caller must stage first.
+    /// `insert` for bytes THIS GRANT DOES NOT OWN: admit an existing grant, or
+    /// mint one that pins nothing. `push_staged_via` calls it once per
+    /// delivery attempt — a grant is in-memory and lives `GRANT_TTL_SECS`,
+    /// so nothing durable may ever store one and replay it later.
+    ///
+    /// The concrete failure the absent tag prevents: `stage_for_peer` runs
+    /// `take_expired` on EVERY invocation and deletes every tag it returns.
+    /// Let this grant own the durable tag that holds a pending send, and the
+    /// first unrelated staging an hour later unpins the user's file, after
+    /// the send was reported as accepted.
+    ///
+    /// `admit` touches ONE peer's clock, which is what makes this safe to
+    /// call on a retry loop: the record for a sleeping device re-grants the
+    /// same hash every minute for up to a week, and it must not carry a
+    /// browse capability another peer earned along with it.
+    fn grant_pinned(&self, hash: Hash, peer: EndpointId) {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get_mut(&hash) {
+            Some(existing) => existing.admit(peer),
+            None => {
+                map.insert(
+                    hash,
+                    Grant {
+                        peers: HashMap::from([(peer, now_unix() + GRANT_TTL_SECS)]),
+                        tag: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Widen an EXISTING grant to one more peer, refreshing that peer's hour.
+    /// `false` when nothing is staged under `hash`: a grant with no bytes
+    /// behind it is a dangling capability, so the caller must stage first.
     ///
     /// This is the cheap half of `stage_for_peer`. Re-staging a file the
     /// watcher touched costs a read plus a BLAKE3 pass and produces the same
@@ -173,20 +256,32 @@ impl Grants {
         let Some(peer) = peer else { return false };
         let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match map.get(hash) {
-            Some(grant) => grant.expires_at > now_unix() && grant.peers.contains(&peer),
+            Some(grant) => grant.admits(&peer, now_unix()),
             None => false,
         }
     }
 
-    /// Drop expired grants, returning their staging tags for cleanup.
+    /// Drop expired grants, returning the staging tags they OWNED for cleanup.
+    ///
+    /// Every lapsed peer leaves its grant, so `admit` answers false the moment
+    /// that peer's TTL passes. Only the tag collection is conditional. A
+    /// pinned grant that outlived its expiry would be an immortal fetch
+    /// capability, which is the opposite of what the option is for — it holds
+    /// back a DELETE, never a revocation.
+    ///
+    /// An entry goes only when its LAST peer lapses, because the tag it owns
+    /// is what keeps the bytes on disk for the peers that are still inside
+    /// their hour.
     fn take_expired(&self, now: u64) -> Vec<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut expired = Vec::new();
         map.retain(|_, grant| {
-            if grant.expires_at > now {
+            if grant.retain_live(now) {
                 return true;
             }
-            expired.push(grant.tag.clone());
+            if let Some(tag) = &grant.tag {
+                expired.push(tag.clone());
+            }
             false
         });
         expired
@@ -194,13 +289,19 @@ impl Grants {
 
     /// Revoke every grant held by one peer — what unpairing must do to bytes
     /// already staged for it. Returns the tags of grants nobody holds anymore.
+    ///
+    /// Same split as `take_expired`: the grant goes whatever its tag is, so
+    /// an unpaired peer loses the capability at once, and only a grant that
+    /// OWNED its staging tag hands one back to delete.
     pub fn revoke_peer(&self, peer: &EndpointId) -> Vec<Tag> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut orphaned = Vec::new();
         map.retain(|_, grant| {
             grant.peers.remove(peer);
             if grant.peers.is_empty() {
-                orphaned.push(grant.tag.clone());
+                if let Some(tag) = &grant.tag {
+                    orphaned.push(tag.clone());
+                }
                 false
             } else {
                 true
@@ -909,6 +1010,23 @@ impl ProtocolHandler for ScopeServer {
         .await
         .ok();
 
+        // Announced only once the ack is queued, and that placement is the
+        // whole meaning of the signal: everything that can still refuse this
+        // connection — the allowlist, the protocol version, the revocation
+        // window around `refresh_device`, the session cap — has already run,
+        // so a host acting on it is acting on a peer that HOLDS a session.
+        //
+        // The concrete consumer is the sender's queue: a device that dials in
+        // is reachable now, and a send accepted for it while it was asleep
+        // should go out on this connection rather than wait out a retry
+        // ladder measured in minutes. The signal is fire-and-forget by
+        // contract, so a sink that does work must not block this path.
+        self.state.signal(HostSignal::PeerConnected {
+            peer: node_id.clone(),
+            device,
+            scope: peer.scope.as_str().to_string(),
+        });
+
         let result = self.serve(&node_id, peer_id, &mut recv, &tx, &handles).await;
         self.state.unregister(id);
         drop(tx);
@@ -1038,6 +1156,67 @@ impl ProtocolHandler for PairServer {
 
 // ── Client: dialing a host ─────────────────────────────────────────────────
 
+/// Why a dial did not end in a session, split by what the caller may do next.
+///
+/// The classification is produced HERE, where the cause is known, and never
+/// re-derived from the message: `McpCore::session` wraps a failed dial as
+/// `"{label} is not reachable: {e}. …"`, which buries `PEER_OFFLINE` in the
+/// middle of the sentence, so no `starts_with` sniff downstream can ever tell
+/// a sleeping phone from a host that answered and refused.
+///
+/// `Display` yields the inner string verbatim on both variants, so every
+/// sentence a user already sees stays byte-for-byte what it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// The peer was never spoken to: the dial itself failed (`endpoint::dial`
+    /// already appends the cause to `PEER_OFFLINE`), or it accepted the
+    /// connection and never answered the handshake. Only this means "asleep".
+    Unreachable(String),
+    /// The peer, or its stream, answered — a refusal, a version mismatch, a
+    /// frame that is not an ack. A retry later cannot change any of these.
+    Refused(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Unreachable(reason) | ConnectError::Refused(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+/// Why a push did not land, split the same way and for the same reason.
+///
+/// `Local` and `Denied` are answers about THIS request and repeating them
+/// changes nothing; only `Transport` can mean the session died under a peer
+/// that is merely asleep, and even then only a fresh dial can say which it
+/// was — `is_closed()` cannot, because `writer_closed` is stored after
+/// `send.finish()` and `reader_closed` after the read loop breaks, so both
+/// still read false while `request` is already returning `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushFailure {
+    /// This side refused before anything went out: the offer policy rejected
+    /// the path, the peer id is malformed, or staging failed.
+    Local(String),
+    /// The session is gone — the request never reached the host, or its
+    /// answer never came back.
+    Transport(String),
+    /// The host answered, and its answer was not `Res::Pushed`.
+    Denied(String),
+}
+
+impl std::fmt::Display for PushFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushFailure::Local(reason)
+            | PushFailure::Transport(reason)
+            | PushFailure::Denied(reason) => f.write_str(reason),
+        }
+    }
+}
+
 /// What a completed `push_artifact` reports back: the name the HOST gave the
 /// landed file (collision handling may have renamed it) and the size it
 /// actually measured — never the numbers this side announced.
@@ -1089,32 +1268,36 @@ impl ClientSession {
         device: String,
         on_event: impl Fn(Event) + Send + Sync + 'static,
         on_closed: impl FnOnce() + Send + 'static,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, ConnectError> {
         let peer = addr.id.to_string();
-        let connection = endpoint::dial(&node.endpoint, addr, proto::SCOPE_ALPN, PEER_OFFLINE).await?;
+        // The two causes that mean the peer is asleep, and the only two: the
+        // dial never reached it, or it took the connection and said nothing.
+        let connection = endpoint::dial(&node.endpoint, addr, proto::SCOPE_ALPN, PEER_OFFLINE)
+            .await
+            .map_err(ConnectError::Unreachable)?;
 
+        // Everything from here on happens on a connection the peer accepted,
+        // so it is a refusal even when it reads like a network fault. Calling
+        // any of it unreachable would let a broken stream look like a nap.
         let (mut send, mut recv) = connection
             .open_bi()
             .await
-            .map_err(|e| format!("cannot open the session stream: {e}"))?;
+            .map_err(|e| ConnectError::Refused(format!("cannot open the session stream: {e}")))?;
 
         write_frame(
             &mut send,
             &Req::Hello { proto: proto::PROTO_VERSION, device },
         )
-        .await?;
+        .await
+        .map_err(ConnectError::Refused)?;
 
         let ack = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame::<Frame>(&mut recv))
             .await
-            .map_err(|_| "the peer did not answer the handshake".to_string())??;
-        let (host_device, scope) = match ack {
-            Frame::Res(Res::Hello(ack)) if ack.proto == proto::PROTO_VERSION => {
-                (ack.device, ack.scope)
-            }
-            Frame::Res(Res::Hello(_)) => return Err("unsupported protocol version".to_string()),
-            Frame::Res(Res::Denied(reason)) => return Err(reason),
-            _ => return Err("the peer answered with an unexpected frame".to_string()),
-        };
+            .map_err(|_| {
+                ConnectError::Unreachable("the peer did not answer the handshake".to_string())
+            })?
+            .map_err(ConnectError::Refused)?;
+        let (host_device, scope) = classify_ack(ack)?;
 
         let (req_tx, mut req_rx) = mpsc::channel::<(Req, oneshot::Sender<Res>)>(32);
         // Responses arrive in request order; the reader pops the matching
@@ -1279,7 +1462,7 @@ impl ClientSession {
         &self,
         path: &Path,
         roots: &RootSet,
-    ) -> Result<PushedArtifact, String> {
+    ) -> Result<PushedArtifact, PushFailure> {
         // Bounded wait for relay + discovery so the host can dial back from
         // another network; on timeout the address still carries direct addrs,
         // which covers the same-LAN case. Same policy as minting a beam
@@ -1297,7 +1480,7 @@ impl ClientSession {
         path: &Path,
         roots: &RootSet,
         socket: std::net::SocketAddr,
-    ) -> Result<PushedArtifact, String> {
+    ) -> Result<PushedArtifact, PushFailure> {
         let addr = endpoint::addr_at_id(self.endpoint.id(), socket);
         self.push_artifact_via(path, roots, addr).await
     }
@@ -1311,36 +1494,165 @@ impl ClientSession {
         path: &Path,
         roots: &RootSet,
         addr: EndpointAddr,
-    ) -> Result<PushedArtifact, String> {
-        let cand = crate::beam::resolve_offerable(path, roots)?;
+    ) -> Result<PushedArtifact, PushFailure> {
+        // Everything up to the frame is this side's own refusal: nothing left
+        // the machine, so nothing about the peer is known yet.
+        let cand = crate::beam::resolve_offerable(path, roots).map_err(PushFailure::Local)?;
         let host: EndpointId = self
             .peer
             .parse()
-            .map_err(|_| "malformed peer id".to_string())?;
+            .map_err(|_| PushFailure::Local("malformed peer id".to_string()))?;
 
         // Peer-locked, through the same pairing the host uses: possession of
         // the ticket is NOT enough on this side either, because the local
         // request gate admits the hash only for the host we are pushing to.
-        let staged = stage_for_peer(&self.store, &self.grants, &cand.canonical, host).await?;
+        let staged = stage_for_peer(&self.store, &self.grants, &cand.canonical, host)
+            .await
+            .map_err(PushFailure::Local)?;
 
         let hash = staged.hash.to_string();
         let ticket =
             iroh_blobs::ticket::BlobTicket::new(addr, staged.hash, staged.format).to_string();
-        let (name, size) = self
-            .request_as(
-                Req::PushArtifact {
-                    name: cand.name,
-                    size: cand.size,
-                    hash: hash.clone(),
-                    ticket,
-                },
-                |res| match res {
-                    Res::Pushed { name, size } => Ok((name, size)),
-                    other => Err(other),
-                },
-            )
-            .await?;
+        // `request_as` is not used here: it collapses a dead session and a
+        // refusal from the host into one string, and those two are exactly
+        // what the caller must tell apart.
+        let res = self
+            .request(Req::PushArtifact {
+                name: cand.name,
+                size: cand.size,
+                hash: hash.clone(),
+                ticket,
+            })
+            .await
+            .map_err(PushFailure::Transport)?;
+        let (name, size) = match res {
+            Res::Pushed { name, size } => (name, size),
+            // A `Denied` and a frame that makes no sense are both the host's
+            // answer to THIS request, and neither improves by being asked
+            // again later; `unexpected` keeps the wording each one had.
+            other => return Err(PushFailure::Denied(unexpected(other))),
+        };
         Ok(PushedArtifact { name, size, hash })
+    }
+
+    /// Push bytes that are ALREADY in this instance's store, named by content
+    /// address instead of by path — the replay half of `push_artifact`.
+    ///
+    /// No file is read here, deliberately: the bytes were captured when the
+    /// user accepted the send, and by the time a sleeping peer answers, the
+    /// source may have been rewritten or deleted. Re-reading it would deliver
+    /// something the user never accepted, or nothing at all.
+    pub async fn push_staged(
+        &self,
+        hash_hex: &str,
+        name: &str,
+        size: u64,
+    ) -> Result<PushedArtifact, PushFailure> {
+        // Before the wait, not after it: a malformed address is this side's
+        // own error and must not cost ten seconds of discovery first.
+        staged_hash(hash_hex)?;
+        // The bounded wait `push_artifact` makes, for the same reason. Skip
+        // it and the ticket carries direct addresses only, so a replayed item
+        // lands on the same LAN and fails everywhere else with "sender
+        // offline" — the exact failure the queue exists to remove.
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.endpoint.online()).await;
+        self.push_staged_via(hash_hex, name, size, self.endpoint.addr()).await
+    }
+
+    /// `push_staged` with the call-back address pinned to one socket, named
+    /// in plain `std` types — the same test seam `push_artifact_at` is.
+    pub async fn push_staged_at(
+        &self,
+        hash_hex: &str,
+        name: &str,
+        size: u64,
+        socket: std::net::SocketAddr,
+    ) -> Result<PushedArtifact, PushFailure> {
+        let addr = endpoint::addr_at_id(self.endpoint.id(), socket);
+        self.push_staged_via(hash_hex, name, size, addr).await
+    }
+
+    /// `push_staged` with an explicit call-back address.
+    ///
+    /// The grant and the ticket are minted FRESH on every attempt, and
+    /// neither is ever stored: a grant lives `GRANT_TTL_SECS` in memory while
+    /// a queued record lives up to a week across restarts, and a ticket names
+    /// addresses this process stops holding the moment it is restarted.
+    pub async fn push_staged_via(
+        &self,
+        hash_hex: &str,
+        name: &str,
+        size: u64,
+        addr: EndpointAddr,
+    ) -> Result<PushedArtifact, PushFailure> {
+        let hash = staged_hash(hash_hex)?;
+        let host: EndpointId = self
+            .peer
+            .parse()
+            .map_err(|_| PushFailure::Local("malformed peer id".to_string()))?;
+
+        // Peer-locked exactly as a fresh push is, but pinning nothing: the
+        // caller owns the tag that keeps these bytes alive, so this grant
+        // must not hand one to the next `stage_for_peer` sweep to delete.
+        self.grants.grant_pinned(hash, host);
+
+        let ticket = iroh_blobs::ticket::BlobTicket::new(addr, hash, BlobFormat::Raw).to_string();
+        // Same reason `push_artifact_via` avoids `request_as`: a dead session
+        // and a refusal from the host are the two answers the caller must
+        // tell apart, and that helper writes both as one string.
+        let res = self
+            .request(Req::PushArtifact {
+                name: name.to_string(),
+                size,
+                hash: hash_hex.to_string(),
+                ticket,
+            })
+            .await
+            .map_err(PushFailure::Transport)?;
+        let (name, size) = match res {
+            Res::Pushed { name, size } => (name, size),
+            other => return Err(PushFailure::Denied(unexpected(other))),
+        };
+        Ok(PushedArtifact { name, size, hash: hash_hex.to_string() })
+    }
+}
+
+/// Parse a content address that arrived from the spool, guarding its length
+/// first — `Hash::from_str` reads any other length as base32 and can PANIC on
+/// malformed input, the same reason `Offers::remove` guards. A record file is
+/// editable by hand and survives a build change, so this string is no more
+/// trusted than one off the wire.
+///
+/// Free function so the refusal is reachable without two endpoints and a
+/// socket: a `ClientSession` cannot be built without both.
+fn staged_hash(hash_hex: &str) -> Result<Hash, PushFailure> {
+    if hash_hex.len() != 64 {
+        return Err(PushFailure::Local("malformed content address".to_string()));
+    }
+    hash_hex
+        .parse()
+        .map_err(|_| PushFailure::Local("malformed content address".to_string()))
+}
+
+/// The handshake answer, classified: the host's device and the scope it
+/// granted, or the reason there is no session.
+///
+/// Split out of `connect` because this is the whole classification table for
+/// an answering peer, and a table nobody can reach without two endpoints and
+/// a socket is a table nobody checks. Every arm is `Refused`: the peer spoke,
+/// so waiting for it to wake up is not the answer to any of them.
+fn classify_ack(ack: Frame) -> Result<(String, String), ConnectError> {
+    match ack {
+        Frame::Res(Res::Hello(ack)) if ack.proto == proto::PROTO_VERSION => {
+            Ok((ack.device, ack.scope))
+        }
+        Frame::Res(Res::Hello(_)) => {
+            Err(ConnectError::Refused("unsupported protocol version".to_string()))
+        }
+        Frame::Res(Res::Denied(reason)) => Err(ConnectError::Refused(reason)),
+        _ => Err(ConnectError::Refused(
+            "the peer answered with an unexpected frame".to_string(),
+        )),
     }
 }
 
@@ -1488,6 +1800,7 @@ fn refused_owned(reason: String) -> AcceptError {
 mod tests {
     use super::*;
     use iroh::SecretKey;
+    use n0_future::StreamExt;
 
     fn id(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
@@ -1495,6 +1808,26 @@ mod tests {
 
     fn tab(path: &str, active: bool) -> TabEntry {
         TabEntry { path: path.to_string(), active }
+    }
+
+    /// Is any tag still rooting these bytes? A blob no tag names is the
+    /// collector's to take, whoever is fetching it.
+    async fn rooted(node: &RemoteNode, hash: Hash) -> bool {
+        let mut tags = node.store.tags().list().await.expect("list the tags");
+        while let Some(info) = tags.next().await {
+            if info.expect("read a tag").hash == hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Age one peer's capability past its hour. Every grant reads `now_unix()`
+    /// itself, so a test that needs a lapsed capability writes the expiry.
+    fn expire_peer(grants: &Grants, hash: &Hash, peer: EndpointId) {
+        let mut map = grants.inner.lock().unwrap();
+        let grant = map.get_mut(hash).expect("a grant on these bytes");
+        *grant.peers.get_mut(&peer).expect("this peer holds it") = now_unix() - 1;
     }
 
     fn state(dir: &tempfile::TempDir, roots: RootSet) -> Arc<ScopeState> {
@@ -1696,6 +2029,7 @@ mod tests {
             scope: Scope::ViewOpen,
             paired_at: 0,
             last_seen: 0,
+            last_ack_scope: None,
         };
         let browser = Peer { scope: Scope::Browse, ..viewer.clone() };
 
@@ -1732,6 +2066,7 @@ mod tests {
             scope: Scope::ViewOpen,
             paired_at: 0,
             last_seen: 0,
+            last_ack_scope: None,
         };
 
         assert!(st.gate_for(&viewer, &starred.to_string_lossy()).is_ok());
@@ -1760,6 +2095,7 @@ mod tests {
             scope: Scope::ViewOpen,
             paired_at: 0,
             last_seen: 0,
+            last_ack_scope: None,
         };
         assert_eq!(st.gate_for(&viewer, &leaked.to_string_lossy()).unwrap_err(), DENIED);
     }
@@ -1868,6 +2204,268 @@ mod tests {
         assert!(!grants.admit(&solo, Some(id(1)), true));
         assert!(!grants.admit(&shared, Some(id(1)), true), "the revoked peer loses the shared grant");
         assert!(grants.admit(&shared, Some(id(2)), true), "the other peer keeps it");
+    }
+
+    #[test]
+    fn an_expired_pinned_grant_is_refused_and_unpins_nothing() {
+        let grants = Grants::new();
+        let hash = Hash::new(b"a queued artifact");
+        grants.grant_pinned(hash, id(1));
+        assert!(grants.admit(&hash, Some(id(1)), true));
+
+        // This is the sweep `stage_for_peer` runs on every single call, with
+        // a clock past the TTL. Two things must be true at once, and they
+        // pull in opposite directions: the CAPABILITY goes, because a fetch
+        // nobody can revoke is worse than a lost delivery; and NO tag comes
+        // back, because the spool record still names the tag that keeps these
+        // bytes on disk for a phone that has not woken up yet.
+        let tags = grants.take_expired(now_unix() + GRANT_TTL_SECS + 1);
+        assert!(tags.is_empty(), "the spool owns this pin, so there is nothing here to delete");
+        assert!(!grants.admit(&hash, Some(id(1)), true), "the capability expires all the same");
+        assert_eq!(grants.len(), 0);
+    }
+
+    #[test]
+    fn a_revoked_peers_pinned_grant_is_dropped_and_unpins_nothing() {
+        let grants = Grants::new();
+        let queued = Hash::new(b"a queued artifact");
+        let asked_for = Hash::new(b"an artifact a peer asked for");
+        grants.grant_pinned(queued, id(1));
+        grants.insert(asked_for, id(1), Tag::from("t1"));
+
+        let orphaned = grants.revoke_peer(&id(1));
+        assert_eq!(orphaned, vec![Tag::from("t1")], "only a grant that owns its tag yields one");
+        assert!(!grants.admit(&queued, Some(id(1)), true), "unpairing takes both capabilities");
+        assert_eq!(grants.len(), 0, "and leaves neither entry behind");
+    }
+
+    #[test]
+    fn staging_content_a_pinned_grant_already_covers_makes_that_grant_adopt_the_fresh_tag() {
+        let grants = Grants::new();
+        let hash = Hash::new(b"a queued artifact");
+        grants.grant_pinned(hash, id(1));
+
+        // The user queues a file for a sleeping phone, then a second peer
+        // asks for the same file: `stage_for_peer` re-adds identical bytes
+        // and gets a fresh tag for them. The grant owns no pin, because the
+        // spool record does — and that record is unpinned the moment the
+        // delivery lands. Hand the fresh tag back to be deleted after that
+        // and the bytes have no root at all, so the collector may take them
+        // while this second peer is fetching. The grant adopts it instead.
+        assert_eq!(grants.insert(hash, id(2), Tag::from("t2")), None, "nothing to delete");
+        assert!(grants.admit(&hash, Some(id(2)), true));
+        assert_eq!(
+            grants.take_expired(now_unix() + GRANT_TTL_SECS + 1),
+            vec![Tag::from("t2")],
+            "the adopted tag is released on the grant's own clock, and only it"
+        );
+    }
+
+    #[test]
+    fn a_retried_delivery_grant_never_postpones_the_hour_another_peer_earned() {
+        let grants = Grants::new();
+        let hash = Hash::new(b"one file, a browse peer and a queued send");
+        // A peer asked for this artifact through a session an hour ago.
+        grants.insert(hash, id(1), Tag::from("t1"));
+        expire_peer(&grants, &hash, id(1));
+
+        // A queued send of the SAME bytes to a second device re-grants the
+        // fetch on every delivery attempt, once a minute for as long as that
+        // device sleeps — up to a week. One clock for the whole grant renews
+        // the first peer's capability with every one of those attempts, so a
+        // fetch nobody asked to keep outlives its hour by days.
+        grants.grant_pinned(hash, id(2));
+
+        assert!(!grants.admit(&hash, Some(id(1)), true), "the browse peer's hour still ran out");
+        assert!(grants.admit(&hash, Some(id(2)), true), "the device being retried can fetch");
+        assert!(
+            grants.take_expired(now_unix()).is_empty(),
+            "and the pin stays while one live peer still holds the grant"
+        );
+        assert_eq!(grants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_grant_sweep_never_deletes_a_tag_the_spool_still_needs() {
+        // The two halves of the `Option<Tag>` change, proved against a real
+        // store: an accepted send keeps its bytes for the week the record
+        // lives, while the grant that lets the host fetch them lives an hour
+        // and is re-minted per attempt.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let queued = work.path().join("report.html");
+        std::fs::write(&queued, "a file a sleeping phone was promised").unwrap();
+        let asked_for = work.path().join("other.html");
+        std::fs::write(&asked_for, "an artifact another peer asked for").unwrap();
+        let node = endpoint::boot(&Dirs::new(state.path()), None, |_| {})
+            .await
+            .expect("boot");
+
+        let record_id = "1700000000001-0000";
+        let hash = crate::beam::stage_outbox(&node, &queued, record_id).await.expect("stage");
+        let staged: Hash = hash.parse().unwrap();
+        node.grants.grant_pinned(staged, id(1));
+
+        // The phone stays asleep past `GRANT_TTL_SECS`. The clock cannot be
+        // moved for `stage_for_peer`, which sweeps with `now_unix()` itself,
+        // so the grant is aged directly instead.
+        expire_peer(&node.grants, &staged, id(1));
+
+        // Any unrelated staging runs that sweep — this one is the host
+        // handing a different artifact to a different peer.
+        stage_for_peer(&node.store, &node.grants, &asked_for, id(2))
+            .await
+            .expect("an ordinary grant is unaffected");
+
+        assert!(
+            !node.grants.admit(&staged, Some(id(1)), true),
+            "the expired capability is gone, exactly as an owned one would be"
+        );
+        assert!(
+            node.store
+                .tags()
+                .get(crate::outbox::tag_name(record_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "but the spool's pin survives the sweep that took the grant"
+        );
+        assert!(
+            crate::beam::outbox_bytes_present(&node, &hash).await,
+            "and so do the bytes the user was told would be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_staging_a_delivered_file_leaves_its_bytes_a_root_of_their_own() {
+        // The same two owners against a real store, one step later in the
+        // life of a send. The record owns the pin only until the delivery
+        // lands, and completing it unpins there and then, while the grant the
+        // delivery minted lives an hour more. The next peer to ask for that
+        // file re-stages identical bytes, so the fresh tag is the ONLY root
+        // they have left: hand it back to be deleted and the collector this
+        // session runs is free to take the file while that peer fetches it.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let sent = work.path().join("report.html");
+        std::fs::write(&sent, "delivered to a phone, then browsed from a laptop").unwrap();
+        let node = endpoint::boot(&Dirs::new(state.path()), None, |_| {})
+            .await
+            .expect("boot");
+
+        let record_id = "1700000000003-0000";
+        let hash = crate::beam::stage_outbox(&node, &sent, record_id).await.expect("stage");
+        let staged: Hash = hash.parse().unwrap();
+        node.grants.grant_pinned(staged, id(1));
+        // The push landed, so `complete` releases the record's pin.
+        crate::beam::unpin_outbox(&node, &crate::outbox::tag_name(record_id)).await;
+
+        // A browse peer now asks the host for the same file.
+        stage_for_peer(&node.store, &node.grants, &sent, id(2)).await.expect("stage");
+
+        assert!(
+            node.grants.admit(&staged, Some(id(2)), true),
+            "the peer that asked may fetch these bytes"
+        );
+        assert!(
+            rooted(&node, staged).await,
+            "and something must still pin them, or there is nothing to fetch"
+        );
+    }
+
+    // ── Failure classification ─────────────────────────────────────────────
+
+    #[test]
+    fn every_connect_failure_reports_its_own_cause_not_one_string() {
+        // The two causes that mean the peer is asleep, spelled exactly as the
+        // call sites print them today: `endpoint::dial` appends its cause to
+        // `PEER_OFFLINE`, and the timeout is a peer that took the connection
+        // and then said nothing. `McpCore::session` wraps both as
+        // "{label} is not reachable: {e}. …", so the cause sits in the MIDDLE
+        // of the sentence and no prefix test downstream could ever find it —
+        // which is the whole reason the variant is made here instead.
+        let dial = ConnectError::Unreachable(format!("{PEER_OFFLINE} (timed out)"));
+        assert_eq!(dial.to_string(), "peer offline — could not reach it (timed out)");
+        let silent = ConnectError::Unreachable("the peer did not answer the handshake".to_string());
+        assert_eq!(silent.to_string(), "the peer did not answer the handshake");
+
+        // Every answer from a peer that DID speak is a refusal, each keeping
+        // the wording the client printed before any of this was typed.
+        assert_eq!(
+            classify_ack(Frame::Res(Res::Denied("not a paired peer".to_string()))),
+            Err(ConnectError::Refused("not a paired peer".to_string())),
+            "the host's own wording survives, verbatim"
+        );
+        assert_eq!(
+            classify_ack(Frame::Res(Res::Hello(HelloAck {
+                proto: proto::PROTO_VERSION + 1,
+                device: "Mac Studio".to_string(),
+                scope: "control".to_string(),
+            }))),
+            Err(ConnectError::Refused("unsupported protocol version".to_string()))
+        );
+        assert_eq!(
+            classify_ack(Frame::Event(Event::TabOpened { path: "/a.html".to_string() })),
+            Err(ConnectError::Refused(
+                "the peer answered with an unexpected frame".to_string()
+            ))
+        );
+
+        // …and the one answer that is a session.
+        assert_eq!(
+            classify_ack(Frame::Res(Res::Hello(HelloAck {
+                proto: proto::PROTO_VERSION,
+                device: "Mac Studio".to_string(),
+                scope: "control".to_string(),
+            }))),
+            Ok(("Mac Studio".to_string(), "control".to_string()))
+        );
+
+        // A push fails on this side, in transit, or at the host, and each
+        // still says only what it said before. WHICH real cause lands in
+        // which variant is pinned where the causes are real — the
+        // two-endpoint proof in tests/push_artifact.rs.
+        assert_eq!(
+            PushFailure::Local("only files can be beamed".to_string()).to_string(),
+            "only files can be beamed"
+        );
+        assert_eq!(
+            PushFailure::Transport("the session is closed".to_string()).to_string(),
+            "the session is closed"
+        );
+        assert_eq!(
+            PushFailure::Denied("not permitted for this peer".to_string()).to_string(),
+            "not permitted for this peer"
+        );
+    }
+
+    #[test]
+    fn a_content_address_of_the_wrong_length_is_refused_instead_of_parsed() {
+        let real = Hash::new(b"a queued artifact");
+        let hex = real.to_string();
+        assert_eq!(staged_hash(&hex), Ok(real));
+
+        // Without the length guard every one of these reaches
+        // `Hash::from_str` as base32, which can PANIC — and a replayed
+        // address does not arrive over the wire but out of a plain JSON file
+        // on the user's own disk, which a hand edit or a half-written record
+        // can leave in any shape at all. A panic there kills the drain for
+        // every OTHER pending delivery too.
+        let one_too_long = format!("{hex}0");
+        let right_length_wrong_alphabet = "z".repeat(64);
+        for bad in [
+            "",
+            "abc",
+            &hex[..63],
+            one_too_long.as_str(),
+            right_length_wrong_alphabet.as_str(),
+        ] {
+            assert_eq!(
+                staged_hash(bad),
+                Err(PushFailure::Local("malformed content address".to_string())),
+                "refused {bad:?}"
+            );
+        }
     }
 
     // ── Tree listing policy ────────────────────────────────────────────────

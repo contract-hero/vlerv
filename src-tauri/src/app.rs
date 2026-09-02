@@ -401,7 +401,31 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
+            // The one signal iOS gives that the app is in front of the user
+            // again. It must be `WindowEvent::Resumed` — that is Tauri's name
+            // for `applicationWillEnterForeground`. `RunEvent::Resumed` looks
+            // like the same thing and is not: on mobile it comes from the
+            // event loop's own `StartCause::Poll` and fires while the phone
+            // is still asleep, so the recovery would run against a frozen
+            // network stack and then never run when it matters.
+            //
+            // Both the arm and its handler are mobile-only, because macOS
+            // never suspends the process. The arm MUST stay cfg-gated:
+            // `WindowEvent::Resumed` itself does not exist off mobile, so an
+            // ungated arm stops the desktop build compiling.
+            #[cfg(mobile)]
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Resumed,
+                ..
+            } = &event
+            {
+                crate::remote::on_foreground(app);
+            }
+            // The handle is read by the arm above and by nothing else, so the
+            // desktop build has to say out loud that it is not reading it.
+            #[cfg(not(mobile))]
+            let _ = app;
             if let tauri::RunEvent::Exit = event {
                 // Flush any debounced state_store write so a quit within the
                 // 250 ms window doesn't lose bookmarks/recents/pane sizes.

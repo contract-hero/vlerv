@@ -15,11 +15,18 @@
 //   2. the scope server refuses a NodeId that is not in peers.json before it
 //      parses a single request byte;
 //   3. iroh / iroh-blobs / iroh-tickets are exact-pinned, and all of their
-//      types stay behind endpoint.rs, beam.rs and scope.rs.
+//      types stay behind endpoint.rs, beam.rs and scope.rs;
+//   4. the send spool is written ONLY by the process holding the blob-store
+//      claim — the pin and the record are two halves of one thing, and a
+//      second writer would unpin bytes it cannot see a record for — and a
+//      queued delivery re-checks the peer record, the granted scope and the
+//      root set at DRAIN time, because all three can change while a device
+//      sleeps.
 
 pub mod beam;
 pub mod endpoint;
 pub mod host;
+pub mod outbox;
 pub mod paths;
 pub mod peers;
 pub mod proto;
