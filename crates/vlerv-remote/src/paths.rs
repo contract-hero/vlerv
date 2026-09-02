@@ -52,6 +52,13 @@ impl Dirs {
         self.remote().join("blobs")
     }
 
+    /// `<base>/remote/blobs.lock` — the file whose exclusive lock says who
+    /// owns `blobs()`. A sibling, not a child: the store directory is redb's,
+    /// and the claim has to be takeable before it is opened.
+    pub fn blobs_lock(&self) -> PathBuf {
+        self.remote().join("blobs.lock")
+    }
+
     /// `<base>/remote/cache/` — artifacts fetched from a scoped peer, named by
     /// content address.
     pub fn cache(&self) -> PathBuf {
@@ -148,6 +155,7 @@ mod tests {
         let dirs = Dirs::new("/tmp/state");
         assert_eq!(dirs.remote(), Path::new("/tmp/state/remote"));
         assert_eq!(dirs.blobs(), Path::new("/tmp/state/remote/blobs"));
+        assert_eq!(dirs.blobs_lock(), Path::new("/tmp/state/remote/blobs.lock"));
         assert_eq!(dirs.cache(), Path::new("/tmp/state/remote/cache"));
         assert_eq!(dirs.received(), Path::new("/tmp/state/received"));
         assert_eq!(dirs.base(), Path::new("/tmp/state"));

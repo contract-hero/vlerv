@@ -33,13 +33,13 @@ pub struct RemoteNode {
     /// The scope server, when this boot was given host state. `None` in the
     /// Beam-only transfer test, which boots endpoints with no peer store.
     pub scope: Option<Arc<scope::ScopeServer>>,
-    /// Held for the life of the node: the exclusive claim on the blob store
-    /// directory. Dropping it (or exiting) lets the next process boot.
+    /// Held for the life of the node: the exclusive claim on the blob store.
+    /// Dropping it (or exiting) lets the next process boot.
     _store_lock: StoreLock,
 }
 
-/// An exclusive advisory lock on one blob-store directory, held by an open
-/// file descriptor for as long as the value lives.
+/// The exclusive claim on one blob store, held by an open file for as long as
+/// the value lives.
 ///
 /// `FsStore` is a redb database, so exactly one process may own it. Without
 /// this claim a second process does not fail — it HANGS: `FsStore::load`
@@ -52,43 +52,37 @@ pub struct RemoteNode {
 /// Every Claude Code session spawns its own `vlerv-mcp` against one state
 /// directory, so this is the ordinary case, not a corner case.
 #[derive(Debug)]
-pub struct StoreLock {
+struct StoreLock {
     _file: std::fs::File,
 }
 
 impl StoreLock {
-    /// Claim `<dir>/blobs.lock`, or report which directory is already taken.
-    /// Non-blocking on purpose: a caller that waited would be back to hanging.
-    fn acquire(dir: &std::path::Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
-        let path = dir.join("blobs.lock");
+    /// Claim `path` (`Dirs::blobs_lock`), or report that someone else holds
+    /// it. Non-blocking: a caller that waited would be back to hanging.
+    fn acquire(path: &std::path::Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&path)
+            .open(path)
             .map_err(|e| format!("cannot open {path:?}: {e}"))?;
 
-        // SAFETY: `flock` needs only a valid fd, which `file` owns for the
-        // whole call and after it. Closing that fd releases the lock, so the
-        // fd lives in the returned value.
-        let rc = unsafe {
-            libc::flock(
-                std::os::unix::io::AsRawFd::as_raw_fd(&file),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.kind() {
-                std::io::ErrorKind::WouldBlock => Err(format!(
-                    "another Vlerv process is already using the blob store at {dir:?}. \
-                     Only one can serve beams at a time — close the other one, \
-                     or point this one at its own VLERV_MCP_STATE_DIR."
-                )),
-                _ => Err(format!("cannot lock {path:?}: {err}")),
-            };
-        }
+        // The remedy stays generic: this layer is shared, and the two
+        // consumers name their state directory with different variables
+        // (`VLERV_MCP_STATE_DIR` for the MCP server, `VLERV_STATE_DIR` for
+        // the app), so naming one of them here misdirects the other's user.
+        file.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => format!(
+                "another Vlerv process is already using the blob store at {path:?}. \
+                 Only one can serve beams at a time — close the other one, \
+                 or give this one its own state directory."
+            ),
+            std::fs::TryLockError::Error(e) => format!("cannot lock {path:?}: {e}"),
+        })?;
         Ok(Self { _file: file })
     }
 }
@@ -133,13 +127,12 @@ pub async fn boot(
     scope_state: Option<Arc<scope::ScopeState>>,
     on_offers_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
 ) -> Result<RemoteNode, String> {
-    let remote_dir = dirs.remote();
-    let secret = load_or_create_identity(&remote_dir)?;
+    // First, before this process reads a key, binds a socket or opens the
+    // store: claim the store, so a refused boot does none of that. Why the
+    // refusal cannot instead be a timeout further down: see `StoreLock`.
+    let store_lock = StoreLock::acquire(&dirs.blobs_lock())?;
 
-    // Before anything binds or opens: claim the blob store. A second process
-    // that skipped this claim would hang forever inside `FsStore::load`
-    // (see `StoreLock`), so the claim comes first and fails loudly.
-    let store_lock = StoreLock::acquire(&remote_dir)?;
+    let secret = load_or_create_identity(&dirs.remote())?;
 
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret)
@@ -307,35 +300,25 @@ mod tests {
     #[test]
     fn second_claim_on_one_store_is_refused_not_queued() {
         let dir = tempfile::TempDir::new().unwrap();
-        let first = StoreLock::acquire(dir.path()).expect("first claim");
+        let lock = Dirs::new(dir.path()).blobs_lock();
+        let first = StoreLock::acquire(&lock).expect("first claim");
 
-        // Refused, and refused IMMEDIATELY. A claim that waited would restore
-        // the hang this lock exists to prevent, so the test bounds the call.
-        let started = std::time::Instant::now();
-        let second = StoreLock::acquire(dir.path());
-        assert!(second.is_err(), "a second process must not get the store");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the refusal must not block"
-        );
-
-        let msg = second.unwrap_err();
+        // Refused, not queued — `try_lock` is what pins that, and a claim
+        // that queued would restore the hang this type exists to prevent.
+        let msg = StoreLock::acquire(&lock).expect_err("a second process must not get the store");
         assert!(
             msg.contains("already using the blob store"),
             "the error has to name the cause, got: {msg}"
         );
         assert!(
-            msg.contains("VLERV_MCP_STATE_DIR"),
+            msg.contains("its own state directory"),
             "the error has to name the way out, got: {msg}"
         );
 
         // Releasing hands the store to the next process — this is what makes
         // "close the other one" an actual fix.
         drop(first);
-        assert!(
-            StoreLock::acquire(dir.path()).is_ok(),
-            "a released store must re-open"
-        );
+        StoreLock::acquire(&lock).expect("a released store must re-open");
     }
 
     #[test]
@@ -344,10 +327,29 @@ mod tests {
         // is the escape hatch the refusal message names.
         let a = tempfile::TempDir::new().unwrap();
         let b = tempfile::TempDir::new().unwrap();
-        let _held_a = StoreLock::acquire(a.path()).expect("first dir");
+        let _held_a = StoreLock::acquire(&Dirs::new(a.path()).blobs_lock()).expect("first dir");
+        StoreLock::acquire(&Dirs::new(b.path()).blobs_lock()).expect("a separate dir is independent");
+    }
+
+    #[tokio::test]
+    async fn boot_consults_the_claim_before_it_opens_anything() {
+        // The ordering IS the fix: the claim has to be read before
+        // `FsStore::load`, because that is the call that hangs. Both unit
+        // tests above would still pass if the `StoreLock::acquire` line were
+        // deleted from `boot`, so this one holds the wiring in place.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dirs = Dirs::new(dir.path());
+        let _held = StoreLock::acquire(&dirs.blobs_lock()).expect("claim the store first");
+
+        // No endpoint is bound and no store is opened on this path, so the
+        // test needs neither a network nor a relay.
+        let msg = boot(&dirs, None, |_| {})
+            .await
+            .err()
+            .expect("boot must refuse a store another holder owns");
         assert!(
-            StoreLock::acquire(b.path()).is_ok(),
-            "a separate dir is independent"
+            msg.contains("already using the blob store"),
+            "boot has to surface the claim's own message, got: {msg}"
         );
     }
 }
