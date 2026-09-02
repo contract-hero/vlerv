@@ -23,6 +23,8 @@ import type {
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { nowSecs } from "../utils/beam-format";
 import { formatRemoteAddress } from "../utils/remote-address";
+import { dialsEveryPeer } from "./remote-reconnect";
+import type { ReconnectReason } from "./remote-reconnect";
 import { applyRemoteTabEvent, toPublishableTabs } from "./remote-tabs";
 import { useWatcherBus } from "./watcher-bus";
 import { useTabs } from "./TabsProvider";
@@ -121,36 +123,22 @@ export function RemoteProvider({
     });
   }, [ipc]);
 
-  // Mount: ONE peer fetch feeds both the list and the launch-time reconnect.
-  //
-  // The reconnect follows design §4's lazy-boot rule, mirrored client-side:
-  // ONLY when `preferences.remote_listen` is on do we proactively dial every
-  // paired peer to learn who's online — otherwise a paired-but-unvisited
-  // peer would never boot the endpoint on its own, and the drawer for it
-  // would just never appear. With listening off, the explicit "Connect" in
-  // Settings (or opening anything that calls `subscribePeer`) is the action
-  // that boots it, same as any other remote command.
+  // False once the provider is gone, so a reconnect still in flight stops
+  // writing state into a tree that unmounted under it. The mount effect's own
+  // `cancelled` flag could not cover `reconnectAll`, which now also runs from
+  // an event, long after that effect settled. Re-armed on mount because a
+  // StrictMode double-mount runs the cleanup before the second mount.
+  const mountedRef = React.useRef(true);
   React.useEffect(() => {
-    if (!ipc.remoteListPeers) return;
-    let cancelled = false;
-    Promise.all([
-      ipc.remoteListPeers(),
-      // A settings read that fails costs us the reconnect, never the peer
-      // list — the preference only decides whether we dial.
-      ipc.getState?.().catch(() => undefined),
-    ])
-      .then(([list, settings]) => {
-        if (cancelled) return;
-        setPeers(list);
-        if (!settings?.preferences?.remote_listen) return;
-        list.forEach((p) => subscribePeer(p.node_id));
-      })
-      .catch((e: unknown) => {
-        console.error("vlerv: failed to list peers", e);
-      });
+    mountedRef.current = true;
     return () => {
-      cancelled = true;
+      mountedRef.current = false;
     };
+  }, []);
+
+  // Mount: ONE peer fetch feeds both the list and the launch-time reconnect.
+  React.useEffect(() => {
+    reconnectAll("launch");
     // Mount-only: the reconnect is one-time, not a live setting toggle —
     // flipping the preference mid-session doesn't retroactively dial peers
     // it missed.
@@ -180,6 +168,19 @@ export function RemoteProvider({
     switch (event.kind) {
       case "peers-updated":
         refreshPeers();
+        break;
+      case "resumed":
+        // iOS froze this app, and the backend has just dropped every session
+        // it held. The subscription set must go with them: `subscribePeer`
+        // returns early for any peer still in it, so a single stale entry
+        // turns the whole reconnect below into a silent no-op and that peer's
+        // drawer never fills again.
+        subscribedRef.current.clear();
+        // "resume", not "launch": the line above threw the subscriptions
+        // away, so a reconnect that consults `remote_listen` and finds it off
+        // would re-establish nothing and leave every drawer empty for the
+        // rest of the session.
+        reconnectAll("resume");
         break;
       case "pair-pending":
         setPairingBusy(false);
@@ -384,6 +385,45 @@ export function RemoteProvider({
       ipc.remoteUnsubscribe?.(peer).catch(() => {});
     },
     [ipc],
+  );
+
+  // Refresh the peer list and, when `dialsEveryPeer` allows it, dial every
+  // paired peer. Two callers, and `reason` is what tells them apart: the
+  // mount effect above ("launch"), and the `resumed` arm for the iOS
+  // foreground hop ("resume") — the app is suspended and resumed far more
+  // often than it is launched, and a resume is exactly when every session
+  // this side holds has already died.
+  //
+  // At launch the dial follows design §4's lazy-boot rule, mirrored
+  // client-side: ONLY when `preferences.remote_listen` is on do we
+  // proactively dial every paired peer to learn who's online — otherwise a
+  // paired-but-unvisited peer would never boot the endpoint on its own, and
+  // the drawer for it would just never appear. With listening off, the
+  // explicit "Connect" in Settings (or opening anything that calls
+  // `subscribePeer`) is the action that boots it, same as any other remote
+  // command. On the phone the backend re-dials its peers itself on resume, so
+  // presence is restored either way — but presence is not a subscription, and
+  // the tab list a drawer shows is.
+  const reconnectAll = React.useCallback(
+    (reason: ReconnectReason) => {
+      if (!ipc.remoteListPeers) return;
+      Promise.all([
+        ipc.remoteListPeers(),
+        // A settings read that fails costs us the reconnect, never the peer
+        // list — the preference only decides whether we dial.
+        ipc.getState?.().catch(() => undefined),
+      ])
+        .then(([list, settings]) => {
+          if (!mountedRef.current) return;
+          setPeers(list);
+          if (!dialsEveryPeer(reason, settings?.preferences?.remote_listen ?? false)) return;
+          list.forEach((p) => subscribePeer(p.node_id));
+        })
+        .catch((e: unknown) => {
+          console.error("vlerv: failed to list peers", e);
+        });
+    },
+    [ipc, subscribePeer],
   );
 
   // ── Host bridge: publish the open-tab list when that list changes ───────

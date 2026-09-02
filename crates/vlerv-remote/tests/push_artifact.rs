@@ -4,6 +4,9 @@
 // `received/` folder — the same folder, the same BLAKE3 verification and the
 // same collision naming an accepted Beam produces.
 //
+// The second proof here is the REPLAY: a push that reads no file at all,
+// because its bytes were captured when the send was accepted.
+//
 // The DATA PATH is loopback, exactly like the Beam and Scope tests: the ticket
 // the guest mints names `127.0.0.1:<guest port>`, so no relay and no discovery
 // lookup carry the push.
@@ -18,9 +21,9 @@ use std::sync::{Arc, Mutex};
 use vlerv_remote::host::{EmptyCatalog, HostSignal};
 use vlerv_remote::peers::{PeerStore, Pairing, Scope};
 use vlerv_remote::proto::Req;
-use vlerv_remote::scope::{ClientSession, ScopeState, TabsCache};
+use vlerv_remote::scope::{ClientSession, PushFailure, ScopeState, TabsCache};
 use vlerv_remote::security::RootSet;
-use vlerv_remote::{endpoint, Dirs};
+use vlerv_remote::{beam, endpoint, Dirs};
 
 /// A node's address with its transport reduced to loopback — the endpoint
 /// binds 0.0.0.0, so 127.0.0.1 always reaches it. Both halves are the crate's
@@ -86,12 +89,15 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
     assert_eq!(session.scope, "browse");
 
     // ── A non-control peer cannot push ──────────────────────────────────────
+    // The VARIANT is asserted beside the wording throughout this test: the
+    // string is what the human reads, and the variant is what tells a caller
+    // whether asking again later could ever change the answer.
     assert_eq!(
         session
             .push_artifact_via(&artifact, &guest_roots, guest_addr.clone())
             .await
             .unwrap_err(),
-        "not permitted for this peer",
+        PushFailure::Denied("not permitted for this peer".to_string()),
         "landing bytes on another machine is control-only"
     );
     assert!(
@@ -158,7 +164,7 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
             .push_artifact_via(&artifact, &RootSet::empty(), guest_addr.clone())
             .await
             .unwrap_err(),
-        "path not found or out of root",
+        PushFailure::Local("path not found or out of root".to_string()),
         "outbound actions stay conservative when no workspace is picked"
     );
     assert_eq!(
@@ -166,7 +172,7 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
             .push_artifact_via(&workspace.path().join("nope.html"), &guest_roots, guest_addr.clone())
             .await
             .unwrap_err(),
-        "path not found or out of root"
+        PushFailure::Local("path not found or out of root".to_string())
     );
     // A directory is not an artifact.
     assert_eq!(
@@ -174,7 +180,7 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
             .push_artifact_via(workspace.path(), &guest_roots, guest_addr.clone())
             .await
             .unwrap_err(),
-        "only files can be beamed"
+        PushFailure::Local("only files can be beamed".to_string())
     );
 
     // ── The ticket is peer-locked ───────────────────────────────────────────
@@ -231,6 +237,86 @@ async fn control_peers_push_artifacts_and_lesser_peers_cannot() {
             .await
             .is_err(),
         "a revoked peer is refused on its very next request"
+    );
+
+    guest.router.shutdown().await.ok();
+    host.router.shutdown().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_push_replays_from_the_store_without_reading_the_source_again() {
+    // Why a queued send stages bytes instead of remembering a path: by the
+    // time a sleeping phone answers, Claude Code has rewritten its own report
+    // — or the user has deleted it. A delivery that re-read the source would
+    // send something nobody accepted, or fail with nothing to send.
+    let host_dir = tempfile::TempDir::new().unwrap();
+    let guest_dir = tempfile::TempDir::new().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let artifact = workspace.path().join("report.html");
+    let body = "<!doctype html><h1>captured when the send was accepted</h1>".repeat(32);
+    std::fs::write(&artifact, &body).unwrap();
+
+    let signals: Arc<Mutex<Vec<HostSignal>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = signals.clone();
+    let host_peers = Arc::new(PeerStore::load(host_dir.path()));
+    let host_state = Arc::new(ScopeState::new(
+        host_peers.clone(),
+        Arc::new(Pairing::new()),
+        Arc::new(TabsCache::new()),
+        RootSet::empty(),
+        "Mac Studio".to_string(),
+        Arc::new(EmptyCatalog),
+        move |signal| sink.lock().unwrap().push(signal),
+    ));
+    let host = endpoint::boot(&Dirs::new(host_dir.path()), Some(host_state), |_| {})
+        .await
+        .expect("host boot");
+    let host_addr = loopback_addr(&host).await;
+
+    let guest = endpoint::boot(&Dirs::new(guest_dir.path()), None, |_| {})
+        .await
+        .expect("guest boot");
+    let guest_addr = loopback_addr(&guest).await;
+    host_peers
+        .seed(&guest.endpoint.id().to_string(), "MacBook", Scope::Control)
+        .unwrap();
+
+    // The send is accepted while the phone is asleep: the bytes are copied
+    // into the guest's own store and pinned under the record's tag.
+    let hash = beam::stage_outbox(&guest, &artifact, "1700000000001-0000")
+        .await
+        .expect("stage");
+
+    // Only now does the file go. From here nothing that reaches the host can
+    // have been re-derived from the workspace.
+    std::fs::remove_file(&artifact).unwrap();
+    assert!(beam::outbox_bytes_present(&guest, &hash).await, "the snapshot outlives its source");
+
+    let session = ClientSession::connect(&guest, host_addr, "MacBook".to_string(), |_| {}, || {})
+        .await
+        .expect("a control peer gets a session");
+    let pushed = session
+        .push_staged_via(&hash, "report.html", body.len() as u64, guest_addr)
+        .await
+        .expect("the replay lands");
+    assert_eq!(pushed.hash, hash, "the address the record named is the one that travelled");
+    assert_eq!(pushed.size, body.len() as u64);
+    assert_eq!(pushed.name, "report.html");
+
+    let landed = signals
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|s| match s {
+            HostSignal::ArtifactReceived { path, hash, .. } => Some((path.clone(), hash.clone())),
+            _ => None,
+        })
+        .expect("the host landed the replayed bytes like any other push");
+    assert_eq!(landed.1, hash, "BLAKE3-verified on the way in, as always");
+    assert_eq!(
+        std::fs::read_to_string(&landed.0).unwrap(),
+        body,
+        "the bytes the user accepted, from a file that no longer exists"
     );
 
     guest.router.shutdown().await.ok();

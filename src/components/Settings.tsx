@@ -110,6 +110,13 @@ function RemoteSettings({
         </>
       }
     >
+      {/* Both platforms. The phone IS the receiving end — a phone that
+          listens to nobody cannot be handed a file another machine already
+          accepted and is holding for it — so its first paired launch turns
+          this switch ON for it (remote.rs `adopts_listen_pref`). The row
+          stays here because that migration is one-way and the value it wrote
+          is the one the backend reads: hiding it would leave a stored
+          preference the user can neither see nor undo. */}
       <ToggleRow
         label="Listen at launch"
         hint="Accept paired devices as soon as the app opens."

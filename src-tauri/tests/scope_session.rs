@@ -104,7 +104,7 @@ async fn scope_pairs_then_serves_under_the_granted_scope() {
     )
     .await
     .expect_err("an unpaired NodeId must not get a session");
-    assert!(!err.is_empty(), "refusal carries a reason: {err}");
+    assert!(!err.to_string().is_empty(), "refusal carries a reason: {err}");
 
     // ── Pairing ─────────────────────────────────────────────────────────────
     let token = host_pairing.mint();

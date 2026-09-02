@@ -37,6 +37,25 @@ pub enum HostSignal {
         /// BLAKE3 content address, hex.
         hash: String,
     },
+    /// A paired peer finished the handshake and holds a live session here.
+    /// Emitted once the `HelloAck` is on its way, so it means "this peer is
+    /// reachable RIGHT NOW" rather than "this peer knocked": the allowlist,
+    /// the version check and the revocation window have all already run.
+    ///
+    /// A host with a send queue is what this exists for. A device that dials
+    /// IN has just proved it is awake and on a network, which is the one fact
+    /// a send waiting for that device needs, and learning it costs no wire
+    /// byte and no extra dial. A host with nothing queued has nothing to do
+    /// with it, which is why it is a signal and not a return value.
+    PeerConnected {
+        peer: String,
+        device: String,
+        /// What THIS machine grants that peer — the scope it was just told in
+        /// the `HelloAck`. It is NOT what the peer grants this machine: that
+        /// is the opposite direction and can only be read from an ack this
+        /// side RECEIVES, so a sender must never cache this value as one.
+        scope: String,
+    },
 }
 
 /// Where host signals go. Implemented by the app.

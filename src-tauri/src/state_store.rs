@@ -77,6 +77,14 @@ pub struct Preferences {
     /// action, which is the lazy-boot contract (design §4). Even when on, the
     /// endpoint only starts if the peer store is non-empty.
     pub remote_listen: bool,
+    /// Bookkeeping, not a preference: the receiving build (the phone) turns
+    /// `remote_listen` on for itself the first launch it has a peer, and this
+    /// records that it already did — see `remote::adopts_listen_pref`. It is
+    /// what makes that migration ONE-WAY, so a user who then turns the switch
+    /// back off is not overruled at the next launch. Absent in every
+    /// state.json written before this build, which reads as false: exactly
+    /// right for a migration that must still run there.
+    pub remote_listen_adopted: bool,
     /// Reserved: a self-hosted `iroh-relay` URL. None = n0's public relays
     /// (design §7, the escape hatch if the trust calculus changes). Read by
     /// nothing yet — the endpoint boots the n0 preset.
@@ -92,6 +100,7 @@ impl Default for Preferences {
             slack_target: None,
             beam_ttl_hours: None,
             remote_listen: false,
+            remote_listen_adopted: false,
             relay_url: None,
         }
     }

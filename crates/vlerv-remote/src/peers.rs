@@ -97,9 +97,23 @@ impl Scope {
             // an artifact on its screen, and landing bytes in its received/
             // folder without a human accepting a link.
             proto::Req::OpenOnHost { .. } | proto::Req::PushArtifact { .. } => {
-                self == Scope::Control
+                self.may_land_artifacts()
             }
         }
+    }
+
+    /// May this scope drive the host — open an artifact on its screen, or
+    /// land bytes in its received/ folder with no human accepting a link?
+    ///
+    /// The receiver's request filter above is one caller. The other is the
+    /// SENDER, which asks the same question before it stages a private copy
+    /// of a user file for a peer that is asleep: a device that never granted
+    /// control would otherwise accumulate full copies of the user's files for
+    /// the whole record TTL, and every one of them would be refused on
+    /// arrival. Two callers, one predicate, so the answer cannot drift
+    /// between the machine that enforces it and the machine that predicts it.
+    pub fn may_land_artifacts(self) -> bool {
+        self == Scope::Control
     }
 }
 
@@ -118,6 +132,25 @@ pub struct Peer {
     pub scope: Scope,
     pub paired_at: u64,
     pub last_seen: u64,
+    /// What the OTHER machine said it grants THIS one, as of the last
+    /// handshake this side completed with it. `scope` above is the opposite
+    /// direction — what this store lets that peer do here — and the two are
+    /// independent grants.
+    ///
+    /// A HINT, never an authority: the receiver's own `Scope::allows` filter
+    /// is the only thing that decides whether bytes may land. It exists so a
+    /// send to a device that is ASLEEP can be refused instead of filling the
+    /// spool with private copies of the user's files that the device would
+    /// deny on arrival. Absent until one handshake has completed, and absent
+    /// is answered as "unverified", never as "no".
+    ///
+    /// `PEERS_SCHEMA` stays 1 on purpose: `Peer` does not
+    /// `deny_unknown_fields`, so a build without this field reads the
+    /// document and merely drops the hint on its next rewrite — which is
+    /// exactly right for a cache, and is not right for anything with
+    /// authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ack_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +299,7 @@ impl PeerStore {
                     scope: on_insert,
                     paired_at: now,
                     last_seen: now,
+                    last_ack_scope: None,
                 };
                 next.push(peer.clone());
                 peer
@@ -294,6 +328,36 @@ impl PeerStore {
             existing.device = device.to_string();
             existing.last_seen = now_unix();
         }
+        self.save_list(&next)?;
+        *peers = next;
+        Ok(true)
+    }
+
+    /// Remember what a peer said it grants this machine, learned from a
+    /// handshake this side completed. Never inserts: a peer that is not
+    /// already trusted has nothing to cache, and returns false so the caller
+    /// knows the entry went away under it.
+    ///
+    /// A write only happens when the answer CHANGED. One `list_devices {
+    /// probe: true }` handshakes every paired device, and rewriting
+    /// peers.json once per device per probe would spend the file's whole
+    /// write budget on a value that almost never moves.
+    pub fn note_ack_scope(&self, node_id: &str, scope: &str) -> Result<bool, String> {
+        let mut peers = self.guard();
+        let Some(current) = peers.iter().find(|p| p.node_id == node_id) else {
+            return Ok(false);
+        };
+        if current.last_ack_scope.as_deref() == Some(scope) {
+            return Ok(true);
+        }
+        let mut next = peers.clone();
+        if let Some(peer) = next.iter_mut().find(|p| p.node_id == node_id) {
+            peer.last_ack_scope = Some(scope.to_string());
+        }
+        // Disk before memory, like every writer but `remove`: the hint
+        // decides whether a send is queued or refused, so a value that only
+        // ever lived in this process would make the same send answer
+        // differently before and after a restart.
         self.save_list(&next)?;
         *peers = next;
         Ok(true)
@@ -687,6 +751,56 @@ mod tests {
     }
 
     #[test]
+    fn the_cached_ack_scope_survives_a_restart_and_never_creates_a_peer() {
+        // The hint decides whether a send to a SLEEPING device is queued or
+        // refused outright, so it has to answer the same before and after a
+        // relaunch — a value that only ever lived in one process would make
+        // the same call refuse today and stock the spool tomorrow.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = store(&dir);
+        s.seed("nodeA", "iPhone", Scope::ViewOpen).unwrap();
+        assert_eq!(s.get("nodeA").unwrap().last_ack_scope, None, "nothing handshook yet");
+
+        assert!(s.note_ack_scope("nodeA", "browse").unwrap());
+        assert_eq!(store(&dir).get("nodeA").unwrap().last_ack_scope.as_deref(), Some("browse"));
+        // The two directions are independent grants: what this store lets the
+        // peer do here is untouched by what the peer says it allows there.
+        assert_eq!(s.get("nodeA").unwrap().scope, Scope::ViewOpen);
+
+        assert!(s.note_ack_scope("nodeA", "control").unwrap());
+        assert_eq!(store(&dir).get("nodeA").unwrap().last_ack_scope.as_deref(), Some("control"));
+
+        // A peer this store does not trust has nothing to cache, and the
+        // caller is told rather than left to read a silent success as a write.
+        assert!(!s.note_ack_scope("nodeB", "control").unwrap());
+        assert!(s.get("nodeB").is_none());
+    }
+
+    #[test]
+    fn a_peers_file_written_before_the_ack_hint_existed_still_trusts_its_devices() {
+        // Written BY HAND in the exact shape the previous build produced: no
+        // `last_ack_scope` key at all. This is what pins the compatibility
+        // claim the field's doc makes, and the failure it guards is the worst
+        // one this store has. `PeerStore::load` treats a document it cannot
+        // parse as EMPTY, so a build that makes this field required — a
+        // `deserialize_with` without a default, a non-Option type, one more
+        // mandatory key on `Peer` — revokes every pairing on every existing
+        // install at the next launch, with no error the user can act on and
+        // nothing to do but pair each device again by hand.
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous_build = r#"{"v":1,"peers":[{"node_id":"nodeA","device":"iPhone","scope":"control","paired_at":10,"last_seen":20}]}"#;
+        std::fs::write(dir.path().join("peers.json"), previous_build).unwrap();
+
+        let s = store(&dir);
+        assert_eq!(s.load_error(), None, "a document this build reads is not a load error");
+        let peer = s.get("nodeA").expect("the pairing survives the upgrade");
+        assert_eq!(peer.scope, Scope::Control, "at the scope it was granted, not a narrower one");
+        assert_eq!(peer.paired_at, 10);
+        assert_eq!(peer.last_seen, 20);
+        assert_eq!(peer.last_ack_scope, None, "absent is answered as unverified, never as denied");
+    }
+
+    #[test]
     fn a_revoked_peer_is_never_re_created_by_a_handshake_refresh() {
         // The revocation race: `ScopeServer::accept` checks the allowlist,
         // then awaits the peer's `Hello` for up to HANDSHAKE_TIMEOUT, then
@@ -848,6 +962,25 @@ mod tests {
         assert!(!Scope::ViewOpen.allows(&push));
         assert!(!Scope::Browse.allows(&push));
         assert!(Scope::Control.allows(&push));
+    }
+
+    #[test]
+    fn the_landing_predicate_answers_exactly_what_the_request_filter_answers() {
+        let push = proto::Req::PushArtifact {
+            name: "report.html".into(),
+            size: 10,
+            hash: "ab".repeat(32),
+            ticket: "blobticket".into(),
+        };
+        let open = proto::Req::OpenOnHost { path: "/w/a.html".into(), reader_mode: false };
+        // The sender consults `may_land_artifacts` before it stages a private
+        // copy for a sleeping peer; the receiver consults `allows` when the
+        // bytes arrive. A scope those two disagree about is a file staged for
+        // a device that will refuse it.
+        for scope in [Scope::ViewOpen, Scope::Browse, Scope::Control] {
+            assert_eq!(scope.may_land_artifacts(), scope.allows(&push));
+            assert_eq!(scope.may_land_artifacts(), scope.allows(&open));
+        }
     }
 
     #[test]

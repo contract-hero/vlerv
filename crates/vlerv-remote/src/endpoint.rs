@@ -9,7 +9,9 @@ use std::time::Duration;
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh_blobs::store::fs::options::Options;
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::GcConfig;
 use iroh_blobs::BlobsProtocol;
 
 use crate::beam::{OfferInfo, Offers};
@@ -20,6 +22,22 @@ use crate::{proto, scope};
 /// machine being offline. One constant for every ALPN: a beam fetch, a scope
 /// session, a pairing handshake and a cache download all wait the same.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the blob store collects the bytes no tag pins any more.
+///
+/// This interval IS the window between "revoked" and "gone" for every staged
+/// copy, because the store deletes nothing on demand: `stop_beam` promises
+/// that a link went dead at once, an expired grant unpins an artifact a peer
+/// asked for, and a delivered queue record releases a private copy of a
+/// user's file. One minute is the cadence the queue itself drains at, and a
+/// mark-and-sweep over a store holding a handful of artifacts costs far less
+/// than the dial that queue makes.
+///
+/// The collector sleeps this interval BEFORE its first run, so a process that
+/// lives less than a minute frees nothing and leaves the work to the next
+/// boot — which is the ordinary case for a short session, and is why the boot
+/// sweep below runs before anything else.
+pub const GC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Backing state for one booted remote node: identity, endpoint, protocol
 /// router, blob store, and the two registries the request gate enforces —
@@ -34,7 +52,9 @@ pub struct RemoteNode {
     /// Beam-only transfer test, which boots endpoints with no peer store.
     pub scope: Option<Arc<scope::ScopeServer>>,
     /// Held for the life of the node: the exclusive claim on the blob store.
-    /// Dropping it (or exiting) lets the next process boot.
+    /// Exiting releases it, and so does dropping this — but a node dropped
+    /// inside a living process has NOT closed its store. `shutdown` is what
+    /// does that, and it states why the two are no longer the same thing.
     ///
     /// MUST stay the LAST field. Fields drop in declaration order, so this
     /// releases only after `store` above has closed. Move it up and a second
@@ -42,6 +62,29 @@ pub struct RemoteNode {
     /// hang this type prevents, with no error anywhere. No test can catch a
     /// reorder: a whole drop completes before the next boot starts.
     _store_lock: StoreLock,
+}
+
+impl RemoteNode {
+    /// Close this node down, store and all, so the next opener of that state
+    /// directory gets a store that is really shut.
+    ///
+    /// DROPPING THE NODE DOES NOT DO THIS, and that is a consequence of
+    /// running a collector: the collection task holds a store handle for as
+    /// long as the store lives, so the store's actor never sees its last
+    /// sender go, its redb stays open, and the lock file this node released
+    /// on the way out says the store is free when it is not. The next opener
+    /// inside this process then meets `DatabaseAlreadyOpen` and HANGS, which
+    /// is the failure `StoreLock` exists to keep out of this crate.
+    ///
+    /// Shutting the router down is what shuts the store down —
+    /// `BlobsProtocol::shutdown` calls `Store::shutdown` — and it also flushes
+    /// state that until then lived only in memory. A process that is exiting
+    /// owes nobody this call: it releases everything by ending.
+    pub async fn shutdown(&self) {
+        // A router that is already down answers `Ok` and does nothing, so
+        // this is safe to call beside an existing `router.shutdown()`.
+        self.router.shutdown().await.ok();
+    }
 }
 
 /// The exclusive claim on one blob store, held by an open file for as long as
@@ -181,6 +224,24 @@ pub async fn boot(
     scope_state: Option<Arc<scope::ScopeState>>,
     on_offers_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
 ) -> Result<RemoteNode, String> {
+    boot_with_gc(dirs, scope_state, on_offers_change, Some(GC_INTERVAL)).await
+}
+
+/// `boot`, with the collector named by the caller: `None` runs none at all.
+///
+/// A test seam, and both halves earn their place. iroh-blobs offers no way to
+/// run a single collection — `Blobs::delete` is `pub(crate)` and `gc_run_once`
+/// is not re-exported — so the only way to watch unpinned bytes actually go is
+/// a store that collects fast. And a store WITH a collector never closes on
+/// drop (see `RemoteNode::shutdown`), so the one test that re-opens a store
+/// this process walked away from has to boot the first one without.
+#[doc(hidden)]
+pub async fn boot_with_gc(
+    dirs: &Dirs,
+    scope_state: Option<Arc<scope::ScopeState>>,
+    on_offers_change: impl Fn(Vec<OfferInfo>) + Send + Sync + 'static,
+    gc_interval: Option<Duration>,
+) -> Result<RemoteNode, String> {
     // First, before this process reads a key, binds a socket or opens the
     // store: claim the store, so a refused boot does none of that. Why the
     // refusal cannot instead be a timeout further down: see `StoreLock`.
@@ -194,9 +255,50 @@ pub async fn boot(
         .await
         .map_err(|e| format!("cannot bind iroh endpoint: {e}"))?;
 
-    let store = FsStore::load(dirs.blobs())
-        .await
-        .map_err(|e| format!("cannot open blob store: {e}"))?;
+    // THE COLLECTOR IS WHAT MAKES DELETING A TAG FREE DISK. `FsStore::load`
+    // builds `Options::new`, whose `gc` is `None`, and `Blobs::delete` is
+    // `pub(crate)` with its own doc saying users must rely on garbage
+    // collection instead. Booted the plain way, this store never gives a byte
+    // back: a revoked beam link, an expired grant and a delivered queue
+    // record each deleted their tag and left a private copy of somebody's
+    // file in `remote/blobs/` for as long as the state directory lived.
+    //
+    // Both path arguments are the ones `FsStore::load` derives from this same
+    // root, so an existing store opens as itself rather than as a second,
+    // empty one beside it.
+    let store = FsStore::load_with_opts(
+        dirs.blobs().join("blobs.db"),
+        Options {
+            // What the collector keeps is what this crate already writes
+            // down: it roots on persistent tags plus the temp tags an import
+            // holds while it runs, so an offer's `auto-…` tag, a grant's
+            // `auto-…` tag and a queued send's `outbox/<id>` all keep their
+            // bytes, and bytes no tag names are exactly the bytes nothing can
+            // reach — the request gate admits a hash only through `Offers` or
+            // `Grants`, and both are built from a tag.
+            gc: gc_interval.map(|interval| GcConfig { interval, add_protected: None }),
+            ..Options::new(&dirs.blobs())
+        },
+    )
+    .await
+    .map_err(|e| format!("cannot open blob store: {e}"))?;
+
+    // Everything a dead process left staged, released here — and the safety
+    // is by construction, not by luck. `StoreLock` above says this process is
+    // the only one that may have this store open, and both registries the
+    // request gate consults live in memory only, so an `auto-…` tag present
+    // at boot was written by a process that is gone and no offer and no grant
+    // can ever name its hash again. Without this the tags themselves
+    // accumulate forever and keep the collector from freeing anything: they
+    // are roots, and nothing else was ever going to delete them.
+    //
+    // `outbox/…` tags are deliberately left alone: those name a promise that
+    // DOES survive a restart, and the spool sweeps its own prefix behind its
+    // own guard.
+    let released = crate::beam::sweep_auto_tags(&store).await;
+    if released > 0 {
+        eprintln!("vlerv: remote: released {released} staged file(s) left by an earlier run");
+    }
 
     let offers = Arc::new(Offers::new());
     let grants = Arc::new(scope::Grants::new());

@@ -193,7 +193,11 @@ export type RemoteEvent =
       role: "host" | "guest";
     }
   | { kind: "pair-link"; peer: string; peer_short: string; device: string; ticket: string }
-  | { kind: "peers-updated" };
+  | { kind: "peers-updated" }
+  /** iOS put the app back in front of the user. The backend has already
+   * dropped every session it held, so nothing this side cached about a live
+   * connection is true any more. */
+  | { kind: "resumed" };
 
 /** `platform_info` — the one signal the frontend uses to tell the desktop
  * and iOS builds apart (PRODUCT.md Operating Context). Optional: older

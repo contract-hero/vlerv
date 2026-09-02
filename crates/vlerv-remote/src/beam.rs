@@ -29,6 +29,7 @@ use n0_future::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::endpoint::{self, RemoteNode};
+use crate::outbox;
 use crate::paths::{base_name, mtime_secs};
 use crate::peers::now_unix;
 use crate::proto;
@@ -46,6 +47,12 @@ pub const HARD_CAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_TTL_HOURS: u32 = 24;
 pub const MIN_TTL_HOURS: u32 = 1;
 pub const MAX_TTL_HOURS: u32 = 24 * 30;
+
+/// The name iroh-blobs gives a tag `add_path` creates for itself, when the
+/// caller does not name one (store/util.rs). Both registries that mint one —
+/// Beam's offers and Scope's grants — remember it in memory and nowhere else,
+/// which is what makes every such tag orphaned the moment the process ends.
+const AUTO_TAG_PREFIX: &str = "auto-";
 
 /// Longest beam name kept from a link's name hint, in chars. Same bounding
 /// idea as `proto::MAX_DEVICE_CHARS`, on a string that also becomes a filename.
@@ -445,6 +452,160 @@ pub(crate) async fn delete_tags(store: &FsStore, tags: Vec<Tag>) {
             eprintln!("vlerv: remote: could not delete blob tag {tag:?}: {e}");
         }
     }
+}
+
+// ── The spool's bytes: staged at enqueue, pinned by name ───────────────────
+
+/// Copy `path` into the store and pin it under `outbox/<id>`, in ONE await.
+/// Returns the content address of the bytes that were captured, or refuses if
+/// `outbox/<id>` already names bytes — see the guard below.
+///
+/// The single await is the point. `add_path` on its own creates an `auto-<ts>`
+/// tag, and the two-step "add, then set the name, then delete the auto tag"
+/// has a crash window that leaks that auto tag: an `outbox/` sweep can never
+/// collect it, and a tag is a collector root, so it pins a private copy of a
+/// user's file until some later boot sweeps the `auto-` prefix — which for a
+/// session that runs for days is the same as forever. `with_named_tag` takes
+/// a TEMP tag, names it, and drops the temp — so a crash anywhere inside
+/// leaves nothing persistent behind.
+///
+/// The bytes are captured HERE, when the send is accepted, and never re-read:
+/// `ImportMode::Copy` makes the store's copy independent of the source, so a
+/// file the user keeps editing — or deletes — is still delivered as it stood
+/// at the moment they asked for it.
+pub async fn stage_outbox(node: &RemoteNode, path: &Path, id: &str) -> Result<String, String> {
+    let tag = outbox::tag_name(id);
+    // A NAME THIS STORE ALREADY HOLDS IS NOT THIS CALL'S TO TAKE.
+    // `with_named_tag` overwrites, and what it would overwrite is the only
+    // thing keeping an already-accepted send's bytes on disk. A repeated id
+    // is then refused by `Outbox::enqueue` — that is what `create_new` is
+    // for — and the caller's cleanup deletes the tag, so the incumbent kept
+    // its record file and lost the copy of the user's file behind it.
+    // Failing here instead is also what makes that cleanup safe: the only
+    // `outbox/` tag it can ever release is one this call created.
+    match node.store.tags().get(tag.clone()).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(format!(
+                "cannot stage file: {tag} already pins the bytes of a send that was accepted \
+                 earlier, and staging over it would lose them"
+            ))
+        }
+        // A tag table that will not answer cannot say the name is free, and
+        // staging on a maybe is the one outcome that destroys bytes.
+        Err(e) => return Err(format!("cannot stage file: cannot read the tag {tag}: {e}")),
+    }
+    let staged = node
+        .store
+        .blobs()
+        .add_path(path)
+        .with_named_tag(tag)
+        .await
+        .map_err(|e| format!("cannot stage file: {e}"))?;
+    // THE COPY IS NOT DURABLE UNTIL THIS RETURNS, and a queued send is a
+    // promise that outlives the process. The store batches its writes into
+    // one redb transaction and commits it up to `max_write_duration` later
+    // (500 ms, store/fs/options.rs), and a file this small is INLINED into
+    // that same transaction — so a session that accepts a send and exits a
+    // moment later leaves the record on disk with no bytes behind it, and the
+    // next boot drops the delivery it promised. `sync_db` is a top-level
+    // command, which the store's actor can only answer once it has closed and
+    // committed the write transaction in flight.
+    node.store
+        .sync_db()
+        .await
+        .map_err(|e| format!("cannot commit the staged copy: {e}"))?;
+    Ok(staged.hash.to_string())
+}
+
+/// Release one spool pin, by the tag name the record stores. The record's own
+/// `tag` field is the argument on purpose: it is what the sweep's keep-set is
+/// built from, so unpinning by anything else could leave the real pin behind.
+pub async fn unpin_outbox(node: &RemoteNode, tag: &str) {
+    delete_tags(&node.store, vec![Tag::from(tag)]).await;
+}
+
+/// Are the bytes a record names still complete in the store? Asked before
+/// every replay: `push_staged` mints a ticket for whatever hash it is given,
+/// so a record whose bytes are gone would announce a fetch the receiver can
+/// never complete, and would do it again at every retry until the TTL.
+///
+/// A store that cannot answer answers TRUE. The two mistakes are not equal:
+/// keeping a record whose bytes are gone costs one failed push and a stated
+/// error, while dropping one on a transient store error deletes a file the
+/// user was promised would arrive.
+pub async fn outbox_bytes_present(node: &RemoteNode, hash_hex: &str) -> bool {
+    // The same length guard `Offers::remove` runs, for the same reason:
+    // `Hash::from_str` reads any other length as base32 and can PANIC, and
+    // this string comes out of a plain JSON file on the user's own disk.
+    if hash_hex.len() != 64 {
+        return false;
+    }
+    let Ok(hash) = hash_hex.parse::<Hash>() else {
+        return false;
+    };
+    match node.store.blobs().has(hash).await {
+        Ok(present) => present,
+        Err(e) => {
+            eprintln!("vlerv: remote: cannot check the staged bytes of {hash_hex}: {e}");
+            true
+        }
+    }
+}
+
+/// Delete every `outbox/` tag the spool no longer claims, and report how many
+/// went. The boot-time sweep for what a crash left pinned: a record file
+/// removed after a delivery landed, or an id claimed by a process that died
+/// before it wrote the record.
+///
+/// `keep` MUST come from `Outbox::live_tags`, which answers `None` when the
+/// spool did not load. Sweeping against a spool that could not be read would
+/// find no live tags at all, unpin every pending send, and lose the files
+/// with no error anywhere.
+pub async fn sweep_outbox_tags(node: &RemoteNode, keep: &[String]) -> usize {
+    sweep_tags(&node.store, outbox::TAG_PREFIX, keep).await
+}
+
+/// Delete every `auto-…` tag in the store and report how many went. Called
+/// once per boot, before this process stages anything of its own.
+///
+/// Keeping none of them is the whole point, and it is safe because of what
+/// holds the store: `StoreLock` means one process at a time, and the two
+/// registries these tags belong to are in-memory only. So every `auto-…` tag
+/// that exists at boot was written by a process that is gone, its hash can
+/// never be admitted again by the request gate, and its bytes are already
+/// unreachable — while the tag itself is a GC root that would keep them on
+/// disk for the life of the install.
+pub(crate) async fn sweep_auto_tags(store: &FsStore) -> usize {
+    sweep_tags(store, AUTO_TAG_PREFIX, &[]).await
+}
+
+/// The listing half both sweeps share: everything under `prefix` that `keep`
+/// does not name, deleted through the one tag sweeper.
+async fn sweep_tags(store: &FsStore, prefix: &str, keep: &[String]) -> usize {
+    let mut orphans: Vec<Tag> = Vec::new();
+    match store.tags().list_prefix(prefix.as_bytes()).await {
+        Ok(mut tags) => {
+            while let Some(info) = tags.next().await {
+                match info {
+                    Ok(info) => {
+                        let name = String::from_utf8_lossy(info.name.as_ref()).into_owned();
+                        if !keep.contains(&name) {
+                            orphans.push(info.name);
+                        }
+                    }
+                    Err(e) => eprintln!("vlerv: remote: cannot read a tag under {prefix}: {e}"),
+                }
+            }
+        }
+        // Nothing is deleted on a failed listing, which is the safe half of
+        // this operation: an unswept tag costs disk, a wrongly swept one
+        // costs the user's file.
+        Err(e) => eprintln!("vlerv: remote: cannot list the tags under {prefix}: {e}"),
+    }
+    let swept = orphans.len();
+    delete_tags(store, orphans).await;
+    swept
 }
 
 /// Stream one blob into `file`, BLAKE3-verified chunk by chunk, enforcing the
@@ -992,6 +1153,333 @@ mod tests {
         assert_eq!(clamp(u32::MAX), 24 * 30 * 3600);
         // The default must be inside the range consumers validate against.
         assert!((MIN_TTL_HOURS..=MAX_TTL_HOURS).contains(&DEFAULT_TTL_HOURS));
+    }
+
+    // ── The spool's bytes ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_tag_sweep_collects_what_no_record_claims_and_keeps_what_one_does() {
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let queued = work.path().join("report.html");
+        std::fs::write(&queued, "a file somebody was promised").unwrap();
+        let abandoned = work.path().join("other.html");
+        std::fs::write(&abandoned, "an id claimed by a process that died").unwrap();
+        let node = endpoint::boot(&crate::Dirs::new(state.path()), None, |_| {})
+            .await
+            .expect("boot");
+
+        // Staging captures the bytes and names the pin in one await.
+        let kept_id = "1700000000001-0000";
+        let hash = stage_outbox(&node, &queued, kept_id).await.expect("stage");
+        assert_eq!(
+            hash,
+            Hash::new(b"a file somebody was promised").to_string(),
+            "the address names the bytes that were captured, not the path"
+        );
+        assert!(outbox_bytes_present(&node, &hash).await);
+
+        // Editing the source afterwards changes nothing: the store holds its
+        // own copy, which is the whole reason bytes are staged at enqueue.
+        std::fs::write(&queued, "rewritten by the model two seconds later").unwrap();
+        assert!(outbox_bytes_present(&node, &hash).await, "the snapshot is independent");
+
+        // A pin whose record never made it to disk — the crash the sweep
+        // exists to clean up after.
+        let orphan_id = "1700000000002-0000";
+        let orphan = stage_outbox(&node, &abandoned, orphan_id).await.expect("stage");
+
+        let swept = sweep_outbox_tags(&node, &[outbox::tag_name(kept_id)]).await;
+        assert_eq!(swept, 1, "only the tag no record claims");
+        let tags = node.store.tags();
+        assert!(
+            tags.get(outbox::tag_name(kept_id)).await.unwrap().is_some(),
+            "a pending record keeps its pin"
+        );
+        assert!(tags.get(outbox::tag_name(orphan_id)).await.unwrap().is_none());
+
+        // Delivering unpins by the name the record stores.
+        unpin_outbox(&node, &outbox::tag_name(kept_id)).await;
+        assert!(tags.get(outbox::tag_name(kept_id)).await.unwrap().is_none());
+        // The bytes behind a released pin are the collector's business, and
+        // this node boots at the product's cadence, so nothing has collected
+        // yet — `a_released_pin_frees_the_bytes_and_a_live_one_keeps_them`
+        // is where that half is proved.
+        assert!(
+            outbox_bytes_present(&node, &orphan).await,
+            "the sweep releases tags; it does not itself delete a byte"
+        );
+
+        // A content address off a hand-editable JSON file is not trusted:
+        // `Hash::from_str` reads a wrong length as base32 and can panic, and
+        // a panic here would strand every other pending delivery.
+        assert!(!outbox_bytes_present(&node, "").await);
+        assert!(!outbox_bytes_present(&node, &hash[..63]).await);
+        assert!(!outbox_bytes_present(&node, &"z".repeat(64)).await);
+        assert!(
+            !outbox_bytes_present(&node, &Hash::new(b"never staged").to_string()).await,
+            "bytes nobody staged are absent, not present"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_refuses_an_id_whose_pin_already_holds_another_sends_bytes() {
+        // `with_named_tag` OVERWRITES, and the name it would overwrite is the
+        // only thing keeping an already-accepted send's bytes on disk. Two
+        // runs mint the same `{millis}-{seq}` id when the clock goes
+        // backwards, or on a machine reporting a time before 1970, where the
+        // millisecond half is 0 for every run. The second run's staging then
+        // moved the incumbent's pin onto its own bytes, `Outbox::enqueue`
+        // refused the repeated id, and `queue_send`'s cleanup deleted that
+        // pin — so the id claim kept the incumbent's record file and lost the
+        // copy of the user's file it named.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let incumbent = work.path().join("report.html");
+        std::fs::write(&incumbent, "accepted first, and still owed to somebody").unwrap();
+        let intruder = work.path().join("other.html");
+        std::fs::write(&intruder, "a second run minting the very same id").unwrap();
+        let node = endpoint::boot(&crate::Dirs::new(state.path()), None, |_| {})
+            .await
+            .expect("boot");
+
+        // The id every process mints first when `now_millis` answers 0.
+        let id = "0000000000000-0000";
+        let owed = stage_outbox(&node, &incumbent, id).await.expect("stage");
+
+        let err = stage_outbox(&node, &intruder, id).await.expect_err("the name is taken");
+        assert!(err.contains(&outbox::tag_name(id)), "the refusal names the pin, got: {err}");
+
+        // Both halves of what the incumbent was promised are still here.
+        let pinned = node.store.tags().get(outbox::tag_name(id)).await.unwrap().expect("the pin");
+        assert_eq!(pinned.hash.to_string(), owed, "the pin still names the bytes it was made for");
+        assert!(outbox_bytes_present(&node, &owed).await, "and those bytes are still in the store");
+        // A refused send costs the user nothing either: no second private
+        // copy of a file inside the state directory.
+        let refused = Hash::new(b"a second run minting the very same id").to_string();
+        assert!(
+            !outbox_bytes_present(&node, &refused).await,
+            "the refused call must not have copied anything in"
+        );
+    }
+
+    /// How long the test below waits for the store a dropped node left behind
+    /// to finish closing. Generous, because the close runs on the store's own
+    /// thread and answers to nothing here; bounded, because a store that
+    /// never closes has to fail this suite rather than hang it.
+    const STORE_CLOSE_WAIT: Duration = Duration::from_secs(15);
+    const STORE_CLOSE_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// Wait for the redb under `dirs` to be really shut, and answer whether
+    /// it is.
+    ///
+    /// The claim that has to be free is redb's own: it holds an exclusive
+    /// lock on its database file for as long as that database is open, and
+    /// takes the same lock again on load. Taking it here and dropping it at
+    /// once is the whole probe. The file is the one `boot_with_gc` hands
+    /// `FsStore::load_with_opts`, so a rename there makes this time out and
+    /// say so rather than pass by accident.
+    ///
+    /// `StoreLock` is the wrong thing to poll for this, even though it is the
+    /// type whose doc names the hang. It is a separate lock file, and it is
+    /// released the instant the node's last field drops — measured at tens of
+    /// microseconds after the drop, while redb stays open for another ten
+    /// milliseconds or more. A poll on `blobs.lock` would return at once and
+    /// leave the race exactly where a fixed sleep left it.
+    async fn store_closed_within_the_bound(dirs: &crate::Dirs) -> bool {
+        let db = dirs.blobs().join("blobs.db");
+        let deadline = std::time::Instant::now() + STORE_CLOSE_WAIT;
+        while std::time::Instant::now() < deadline {
+            let free = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db)
+                .is_ok_and(|file| file.try_lock().is_ok());
+            if free {
+                return true;
+            }
+            tokio::time::sleep(STORE_CLOSE_INTERVAL).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_staged_copy_outlives_the_process_that_took_it() {
+        // The failure this pins: a queued send is a promise that outlives the
+        // session that accepted it, and the store commits its writes up to
+        // half a second late. A person who asks for a send and closes the
+        // terminal ends the process inside that window, and a record with no
+        // bytes behind it is dropped by the next boot — a promise broken with
+        // nothing on screen either time. Neither `shutdown` nor a grace
+        // period is used below, deliberately: an exiting process gives none.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let queued = work.path().join("report.html");
+        std::fs::write(&queued, "accepted, then the session ended").unwrap();
+        let dirs = crate::Dirs::new(state.path());
+
+        let id = "1700000000003-0000";
+        let hash = {
+            // The one boot in this crate that runs NO collector, and the
+            // reason is this test's own shape: a store with a collector never
+            // closes on drop (`RemoteNode::shutdown`), and shutting this one
+            // down would flush exactly the state whose absence is the bug.
+            // What is under test — that `stage_outbox` returns only once the
+            // copy is committed — does not depend on the collector at all.
+            let node = endpoint::boot_with_gc(&dirs, None, |_| {}, None).await.expect("boot");
+            stage_outbox(&node, &queued, id).await.expect("stage")
+        };
+
+        // The store closes on its own thread after the handle is dropped, and
+        // opening the same redb before it has is the in-process hang
+        // `StoreLock` documents — not a queue failure, and not what this test
+        // is about. A real second session is a second PROCESS and is never in
+        // this window.
+        //
+        // So the close is waited for, not slept over. A fixed span is a bet
+        // on how loaded the machine is, and losing it does not redden this
+        // test — it hangs the suite, with no output naming the reason.
+        assert!(
+            store_closed_within_the_bound(&dirs).await,
+            "the store the dropped node left behind never released its database, and \
+             booting over one that is still open hangs this test instead of failing it"
+        );
+        let next = endpoint::boot(&dirs, None, |_| {}).await.expect("the next session");
+        assert!(
+            outbox_bytes_present(&next, &hash).await,
+            "the copy the user was promised has to be there for the next process"
+        );
+        // The pin has to survive with it, or the boot sweep collects the very
+        // bytes the record still names.
+        assert_eq!(
+            sweep_outbox_tags(&next, &[]).await,
+            1,
+            "the pin was on disk too — this is the sweep taking it, not it never having been there"
+        );
+    }
+
+    // ── Reclaiming the bytes ────────────────────────────────────────────────
+
+    /// How long a test waits for a collection that ticks every
+    /// `GC_TEST_INTERVAL`. Generous, because the collector runs on the store's
+    /// own runtime and answers to nothing here; bounded, because a collector
+    /// that never runs has to fail this suite rather than hang it.
+    const GC_TEST_WAIT: Duration = Duration::from_secs(15);
+    const GC_TEST_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Wait for `hash` to leave the store, and answer whether it did.
+    async fn gone_within_the_bound(node: &RemoteNode, hash: &str) -> bool {
+        let deadline = std::time::Instant::now() + GC_TEST_WAIT;
+        while std::time::Instant::now() < deadline {
+            if !outbox_bytes_present(node, hash).await {
+                return true;
+            }
+            tokio::time::sleep(GC_TEST_INTERVAL).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_released_pin_frees_the_bytes_and_a_live_one_keeps_them() {
+        // The claim every earlier build could not make: unpinning is now
+        // deletion, eventually. Before the collector was configured, a
+        // delivered send, a revoked link and an expired grant all deleted
+        // their tag and left a private copy of a user's file in the state
+        // directory for as long as the install lived.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let delivered = work.path().join("delivered.html");
+        std::fs::write(&delivered, "handed over, and no longer owed to anybody").unwrap();
+        let waiting = work.path().join("waiting.html");
+        std::fs::write(&waiting, "still queued for a device that is asleep").unwrap();
+
+        // The one thing this test cannot do at the product's cadence: there
+        // is no way to ask iroh-blobs for a single collection — `delete` is
+        // pub(crate) and `gc_run_once` is not re-exported — so the proof has
+        // to be a store whose collector ticks fast.
+        let node = endpoint::boot_with_gc(
+            &crate::Dirs::new(state.path()),
+            None,
+            |_| {},
+            Some(GC_TEST_INTERVAL),
+        )
+        .await
+        .expect("boot");
+
+        let delivered_id = "1700000000004-0000";
+        let waiting_id = "1700000000005-0000";
+        let released = stage_outbox(&node, &delivered, delivered_id).await.expect("stage");
+        let kept = stage_outbox(&node, &waiting, waiting_id).await.expect("stage");
+
+        // The delivery landed: the record file goes first, then its pin.
+        unpin_outbox(&node, &outbox::tag_name(delivered_id)).await;
+
+        assert!(
+            gone_within_the_bound(&node, &released).await,
+            "the copy nothing owes anybody has to leave the disk"
+        );
+        // The other half, and the one a mistake here would cost a user: the
+        // collector roots on persistent tags, so a record that is still
+        // waiting keeps the bytes it was promised would arrive.
+        assert!(
+            outbox_bytes_present(&node, &kept).await,
+            "a pinned record must survive every collection until it is delivered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_boot_releases_what_the_last_run_staged_and_keeps_what_a_record_still_names() {
+        // An offer and a grant both pin their bytes under an `auto-…` tag and
+        // remember that tag in memory only, so a process that exits leaves
+        // roots nothing can ever name again. They are roots: the collector
+        // keeps their bytes forever, which is why the boot sweep runs before
+        // this process stages anything of its own.
+        let state = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let shared = work.path().join("chart.html");
+        std::fs::write(&shared, "beamed once by a session that is over").unwrap();
+        let queued = work.path().join("report.html");
+        std::fs::write(&queued, "accepted for a device that is still asleep").unwrap();
+        let dirs = crate::Dirs::new(state.path());
+
+        let id = "1700000000006-0000";
+        let (offered, promised) = {
+            let node = endpoint::boot(&dirs, None, |_| {}).await.expect("boot");
+            // What `offer` and `stage_for_peer` both do, without `offer`'s
+            // bounded wait on `online()`: an unnamed `add_path` mints the
+            // `auto-…` tag itself.
+            let staged = node.store.blobs().add_path(&shared).await.expect("stage an offer");
+            assert!(
+                String::from_utf8_lossy(staged.name.as_ref()).starts_with(AUTO_TAG_PREFIX),
+                "the tag this sweep collects is the one iroh-blobs names itself"
+            );
+            let promised = stage_outbox(&node, &queued, id).await.expect("stage");
+            // A session that ends properly, which is what this test is about:
+            // the run is over and the next one opens the same store. Dropping
+            // alone would leave it open — see `RemoteNode::shutdown`.
+            node.shutdown().await;
+            (staged.hash.to_string(), promised)
+        };
+
+        // Same reopen window the sibling test documents: the store closes on
+        // its own thread, and a real second session is a second process.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let next = endpoint::boot_with_gc(&dirs, None, |_| {}, Some(GC_TEST_INTERVAL))
+            .await
+            .expect("the next session");
+
+        assert!(
+            gone_within_the_bound(&next, &offered).await,
+            "bytes only a dead process could have served have to go with it"
+        );
+        assert!(
+            outbox_bytes_present(&next, &promised).await,
+            "a queued send survives the restart — the sweep stops at its own prefix"
+        );
+        assert!(
+            next.store.tags().get(outbox::tag_name(id)).await.unwrap().is_some(),
+            "and it keeps the pin, or the next collection takes the bytes with it"
+        );
     }
 
     // ── Partial download names ──────────────────────────────────────────────

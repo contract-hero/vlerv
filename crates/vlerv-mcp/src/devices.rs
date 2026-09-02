@@ -217,6 +217,7 @@ mod tests {
             scope: Scope::Control,
             paired_at: 1,
             last_seen: 2,
+            last_ack_scope: None,
         }
     }
 

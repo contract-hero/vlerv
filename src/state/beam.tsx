@@ -17,6 +17,7 @@ import * as React from "react";
 import type { BeamOffer, BeamReceivedEntry, IpcSurface } from "../ipc";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { basename } from "../utils/path";
+import { arrivalOpensTab } from "./beam-burst";
 import { useTabsDispatch } from "./TabsProvider";
 
 /** Payload of `vlerv://beam-send-request` (CLI / deep-link initiated). */
@@ -173,11 +174,26 @@ export function BeamProvider({
     setOffers(list);
   });
 
+  // When the previous artifact landed, or null while none has. A sender that
+  // queued files while this device was unreachable delivers them in one run
+  // as soon as it can reach it, so arrivals come in bursts and one tab each
+  // would bury whatever the user is reading under a stack they never asked
+  // for. `arrivalOpensTab` holds the whole rule, and beam-burst.test.ts holds
+  // its cases.
+  const lastReceivedAtRef = React.useRef<number | null>(null);
+
   // A pushed artifact arrives already on disk and already verified — there is
-  // no dialog to gate (the host's control-scope grant IS the consent), so it
-  // opens exactly like an accepted receive does.
+  // no dialog to gate (the host's control-scope grant IS the consent), so an
+  // arrival that opens a tab opens it exactly like an accepted receive does.
+  // The rest of a burst only refresh the Received list, which is where a run
+  // of files belongs.
   useTauriEvent<BeamReceivedPayload>("vlerv://beam-received", (file) => {
-    dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
+    const at = Date.now();
+    const opens = arrivalOpensTab(lastReceivedAtRef.current, at);
+    lastReceivedAtRef.current = at;
+    if (opens) {
+      dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
+    }
     ipc.beamListReceived?.().then(setReceived).catch(() => {});
   });
 
