@@ -289,7 +289,9 @@ session closed) or the TTL expired. Mint a new one.
 directory serves one process at a time, and every Claude Code session starts
 its own `vlerv-mcp`. Close the other session, or give this one its own
 `VLERV_MCP_STATE_DIR`. A separate state directory means a separate node id, so
-that server starts with no paired devices.
+that server starts with no paired devices. (The message itself says "its own
+state directory" rather than naming the variable: the same check guards
+Vlervtifacts, which reads `VLERV_STATE_DIR` instead.)
 
 Watch for orphaned headless runs: `claude --print` sessions keep their server
 alive, and one that never exits holds the store indefinitely. Find them with

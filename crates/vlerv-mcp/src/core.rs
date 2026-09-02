@@ -267,7 +267,15 @@ pub struct McpCore {
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Received>>,
-    node: tokio::sync::Mutex<Option<Arc<endpoint::RemoteNode>>>,
+    /// The booted node, or nothing yet — the lazy-boot contract.
+    ///
+    /// A `OnceCell` rather than a `Mutex<Option<_>>` so that reading whether
+    /// a node exists never waits on, or is defeated by, a boot in flight: a
+    /// mutex held across `boot` also blocks the read side, and `try_lock`
+    /// would answer "not booted" for a server that is serving.
+    /// `get_or_try_init` does not cache a failure, so a refusal stays
+    /// retryable once the other process exits.
+    node: tokio::sync::OnceCell<Arc<endpoint::RemoteNode>>,
     /// Live sessions, one per peer. `Arc` because a session that closes
     /// evicts its own entry from here — see `session`.
     sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>>,
@@ -293,7 +301,7 @@ impl McpCore {
             cwd,
             home,
             dirs,
-            node: tokio::sync::Mutex::new(None),
+            node: tokio::sync::OnceCell::new(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             started: Instant::now(),
             loopback: Mutex::new(None),
@@ -346,34 +354,32 @@ impl McpCore {
     /// process — which is what keeps a beam link fetchable after the tool call
     /// that minted it returned.
     async fn node(&self) -> Result<Arc<endpoint::RemoteNode>, String> {
-        let mut guard = self.node.lock().await;
-        if let Some(node) = guard.as_ref() {
-            return Ok(node.clone());
-        }
-        let state = Arc::new(ScopeState::new(
-            self.peers.clone(),
-            self.pairing.clone(),
-            Arc::new(TabsCache::new()),
-            self.roots.clone(),
-            self.device.clone(),
-            // Headless: no bookmarks, no recents, no open tabs. A view-open
-            // peer is therefore told about nothing and may fetch nothing.
-            Arc::new(EmptyCatalog),
-            McpSink { pairing: self.pairing.clone(), received: self.received.clone() },
-        ));
-        let node = Arc::new(endpoint::boot(&self.dirs, Some(state), |_| {}).await?);
-        *guard = Some(node.clone());
-        Ok(node)
+        self.node
+            .get_or_try_init(|| async {
+                let state = Arc::new(ScopeState::new(
+                    self.peers.clone(),
+                    self.pairing.clone(),
+                    Arc::new(TabsCache::new()),
+                    self.roots.clone(),
+                    self.device.clone(),
+                    // Headless: no bookmarks, no recents, no open tabs. A
+                    // view-open peer is therefore told about nothing and may
+                    // fetch nothing.
+                    Arc::new(EmptyCatalog),
+                    McpSink { pairing: self.pairing.clone(), received: self.received.clone() },
+                ));
+                endpoint::boot(&self.dirs, Some(state), |_| {}).await.map(Arc::new)
+            })
+            .await
+            .cloned()
     }
 
-    /// The node IF one is already booted — never a wait.
-    ///
-    /// `node()` holds this lock across the whole boot, so awaiting it here
-    /// would put every read-only caller (`server_status`, `stop_beam`) behind
-    /// an in-flight boot. `try_lock` answers "not booted yet" instead, which
-    /// is true while a boot runs and keeps status answerable when one is stuck.
-    async fn booted(&self) -> Option<Arc<endpoint::RemoteNode>> {
-        self.node.try_lock().ok()?.clone()
+    /// The node IF one is already booted — never a wait, and never a false
+    /// negative. `stop_beam` reads this to decide there is nothing to revoke,
+    /// so an answer of "not booted" for a server that IS serving would report
+    /// a live link as already dead.
+    fn booted(&self) -> Option<Arc<endpoint::RemoteNode>> {
+        self.node.get().cloned()
     }
 
     /// Resolve a caller-supplied path, confine it to this server's roots, and
@@ -435,7 +441,7 @@ impl McpCore {
     /// link that went to the wrong place. Boots nothing: with no endpoint
     /// there is no offer to revoke.
     pub async fn stop_beam(&self, hash: Option<&str>) -> Result<Vec<OfferSummary>, String> {
-        let Some(node) = self.booted().await else {
+        let Some(node) = self.booted() else {
             return Ok(Vec::new());
         };
         let live = node.offers.list();
@@ -729,7 +735,7 @@ impl McpCore {
     // ── server_status ──────────────────────────────────────────────────────
 
     pub async fn server_status(&self) -> Result<ServerStatus, String> {
-        let node = self.booted().await;
+        let node = self.booted();
         let active_offers = node
             .as_ref()
             .map(|n| n.offers.list().into_iter().map(OfferSummary::from).collect())
