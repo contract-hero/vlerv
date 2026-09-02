@@ -71,6 +71,23 @@ const QUERY_VALUE_SET: &AsciiSet = &CONTROLS
     .add(b'[').add(b'\\').add(b']').add(b'^').add(b'`').add(b'{').add(b'|')
     .add(b'}');
 
+/// Parse a BLAKE3 content address in hex, guarding its LENGTH first.
+///
+/// The guard is the whole point: `Hash::from_str` reads any string that is
+/// not 64 chars as base32 and can PANIC on malformed input. Every caller
+/// hands it a string this process did not mint — an offer id off IPC, a
+/// content address off the wire, one read back out of a hand-editable record
+/// file — so the panic is reachable from each of them.
+///
+/// `None` is the only refusal this returns; each caller maps it to the error
+/// type its own surface reports.
+pub(crate) fn parse_hash(hex: &str) -> Option<Hash> {
+    if hex.len() != 64 {
+        return None;
+    }
+    hex.parse().ok()
+}
+
 /// One active offer, as surfaced to the webview and the offers indicator.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OfferInfo {
@@ -156,13 +173,9 @@ impl Offers {
 
     fn remove(&self, id: &str) -> Option<Tag> {
         // An offer id IS the blob hash in hex (see `offer`), so the key is
-        // derivable — no scan. The length guard keeps the parse on the hex
-        // path: `Hash::from_str` treats other lengths as base32 and can
-        // PANIC on malformed input, and this id arrives over IPC.
-        if id.len() != 64 {
-            return None;
-        }
-        let hash: Hash = id.parse().ok()?;
+        // derivable — no scan. The id arrives over IPC, which is why the
+        // parse goes through `parse_hash`.
+        let hash = parse_hash(id)?;
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(&hash).map(|e| e.tag)
     }
@@ -535,13 +548,9 @@ pub async fn unpin_outbox(node: &RemoteNode, tag: &str) {
 /// error, while dropping one on a transient store error deletes a file the
 /// user was promised would arrive.
 pub async fn outbox_bytes_present(node: &RemoteNode, hash_hex: &str) -> bool {
-    // The same length guard `Offers::remove` runs, for the same reason:
-    // `Hash::from_str` reads any other length as base32 and can PANIC, and
-    // this string comes out of a plain JSON file on the user's own disk.
-    if hash_hex.len() != 64 {
-        return false;
-    }
-    let Ok(hash) = hash_hex.parse::<Hash>() else {
+    // This string comes out of a plain JSON file on the user's own disk, so
+    // it is parsed the guarded way — see `parse_hash`.
+    let Some(hash) = parse_hash(hash_hex) else {
         return false;
     };
     match node.store.blobs().has(hash).await {
@@ -1263,11 +1272,35 @@ mod tests {
         );
     }
 
-    /// How long the test below waits for the store a dropped node left behind
-    /// to finish closing. Generous, because the close runs on the store's own
-    /// thread and answers to nothing here; bounded, because a store that
-    /// never closes has to fail this suite rather than hang it.
-    const STORE_CLOSE_WAIT: Duration = Duration::from_secs(15);
+    /// How long any wait below polls before it gives up. Generous, because
+    /// every condition polled here settles on somebody else's thread and
+    /// answers to nothing in this suite; bounded, because a condition that
+    /// never arrives has to FAIL this suite rather than hang it.
+    const POLL_BOUND: Duration = Duration::from_secs(15);
+
+    /// Poll `probe` every `interval` until it answers true, and report
+    /// whether it did inside `POLL_BOUND`.
+    ///
+    /// Both waits below are this loop. A fixed sleep in their place is a bet
+    /// on how loaded the machine is, and losing that bet does not redden a
+    /// test — it hangs the suite, with no output naming the reason.
+    async fn within_the_bound<F, Fut>(interval: Duration, mut probe: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + POLL_BOUND;
+        while std::time::Instant::now() < deadline {
+            if probe().await {
+                return true;
+            }
+            tokio::time::sleep(interval).await;
+        }
+        false
+    }
+
+    /// Ten milliseconds because that is the order the wait itself is: redb
+    /// stays open for about that long after the node's last field drops.
     const STORE_CLOSE_INTERVAL: Duration = Duration::from_millis(10);
 
     /// Wait for the redb under `dirs` to be really shut, and answer whether
@@ -1288,19 +1321,15 @@ mod tests {
     /// leave the race exactly where a fixed sleep left it.
     async fn store_closed_within_the_bound(dirs: &crate::Dirs) -> bool {
         let db = dirs.blobs().join("blobs.db");
-        let deadline = std::time::Instant::now() + STORE_CLOSE_WAIT;
-        while std::time::Instant::now() < deadline {
-            let free = std::fs::OpenOptions::new()
+        let db = db.as_path();
+        within_the_bound(STORE_CLOSE_INTERVAL, move || async move {
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&db)
-                .is_ok_and(|file| file.try_lock().is_ok());
-            if free {
-                return true;
-            }
-            tokio::time::sleep(STORE_CLOSE_INTERVAL).await;
-        }
-        false
+                .open(db)
+                .is_ok_and(|file| file.try_lock().is_ok())
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1360,23 +1389,18 @@ mod tests {
 
     // ── Reclaiming the bytes ────────────────────────────────────────────────
 
-    /// How long a test waits for a collection that ticks every
-    /// `GC_TEST_INTERVAL`. Generous, because the collector runs on the store's
-    /// own runtime and answers to nothing here; bounded, because a collector
-    /// that never runs has to fail this suite rather than hang it.
-    const GC_TEST_WAIT: Duration = Duration::from_secs(15);
+    /// The collector's tick in these tests, and so also the interval there
+    /// is any point polling it on. The collector runs on the store's own
+    /// runtime and answers to nothing here, which is why the wait around it
+    /// is bounded — see `POLL_BOUND`.
     const GC_TEST_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Wait for `hash` to leave the store, and answer whether it did.
     async fn gone_within_the_bound(node: &RemoteNode, hash: &str) -> bool {
-        let deadline = std::time::Instant::now() + GC_TEST_WAIT;
-        while std::time::Instant::now() < deadline {
-            if !outbox_bytes_present(node, hash).await {
-                return true;
-            }
-            tokio::time::sleep(GC_TEST_INTERVAL).await;
-        }
-        false
+        within_the_bound(GC_TEST_INTERVAL, move || async move {
+            !outbox_bytes_present(node, hash).await
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1462,8 +1486,15 @@ mod tests {
         };
 
         // Same reopen window the sibling test documents: the store closes on
-        // its own thread, and a real second session is a second process.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // its own thread, and a real second session is a second process. And
+        // for the same reason, the close is waited for rather than slept
+        // over — a fixed span is a bet on how loaded the machine is, and
+        // losing it does not redden this test, it hangs the suite.
+        assert!(
+            store_closed_within_the_bound(&dirs).await,
+            "the store the last session left behind never released its database, and \
+             booting over one that is still open hangs this test instead of failing it"
+        );
         let next = endpoint::boot_with_gc(&dirs, None, |_| {}, Some(GC_TEST_INTERVAL))
             .await
             .expect("the next session");

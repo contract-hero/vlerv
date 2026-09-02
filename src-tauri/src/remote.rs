@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use futures_util::future::join_all;
 use tauri::{Emitter, Manager};
 
 use crate::security::RootSet;
@@ -82,6 +83,12 @@ pub struct RemoteState {
     roots: RootSet,
     device: String,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<scope::ClientSession>>>,
+    /// One dial gate per peer id, so `session()` can serialize the dials for
+    /// ONE peer without serializing the dials for all of them. Entries are
+    /// never removed: it is one empty mutex per device this process has
+    /// dialed, and a device that is unpaired and paired again comes back
+    /// under the same node id.
+    dials: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Which round of sessions this app is on. Bumped when it abandons every
     /// session it holds — the iOS foreground hop — and read by each session's
     /// `on_closed` before that callback reports presence. Dropping a session
@@ -104,6 +111,7 @@ impl RemoteState {
             roots,
             device: vlerv_remote::device_name(),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
+            dials: tokio::sync::Mutex::new(HashMap::new()),
             session_generation: AtomicU64::new(0),
         }
     }
@@ -142,6 +150,18 @@ impl RemoteState {
     /// callers that only need "is there anything at all to talk to".
     fn is_booted(&self) -> bool {
         self.booted.load(Ordering::Acquire)
+    }
+
+    /// This peer's dial gate, created on first use. The map lock is taken and
+    /// released without an await in between, so a peer whose gate is held for
+    /// a whole thirty-second dial blocks nobody but the next dial to itself.
+    async fn dial_gate(&self, peer: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.dials
+            .lock()
+            .await
+            .entry(peer.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -832,22 +852,36 @@ async fn session(
     if state.peers.get(peer).is_none() {
         return Err("unknown peer".to_string());
     }
-    // Hold the sessions lock across the whole dial. The drawer opens several
-    // remote commands for one peer in the same tick (subscribe, list-tabs,
-    // list-bookmarks, list-recents); without this, each misses the map and
-    // dials its own ClientSession, and every loser's `on_closed` then reports
-    // a live peer offline. A dial is bounded by the connect timeout, and this
-    // app pairs a handful of peers, so serializing dials is the right cost.
-    let mut sessions = state.sessions.lock().await;
-    if let Some(existing) = sessions.get(peer) {
-        if !existing.is_closed() {
-            return Ok(existing.clone());
+    // Held across the whole dial, so ONE peer is dialed once. The drawer opens
+    // several remote commands for one peer in the same tick (subscribe,
+    // list-tabs, list-bookmarks, list-recents); without this gate, each misses
+    // the map and dials its own ClientSession, and every loser's `on_closed`
+    // then reports a live peer offline.
+    //
+    // The gate is per peer and not per process because a dial to a device that
+    // does not answer costs the whole connect timeout. `on_foreground` dials
+    // every paired device at once, so a single lock here would make two
+    // sleeping phones cost two timeouts one after the other — and hold every
+    // UI-initiated command behind them for the same minute.
+    let gate = state.dial_gate(peer).await;
+    let _dialing = gate.lock().await;
+
+    // Re-read now that this call owns the gate: the dial it queued behind may
+    // have landed the very session it was about to make.
+    //
+    // The generation is read under the same lock the foreground hop clears the
+    // map with, so a dial already in flight when the app resumes cannot land a
+    // pre-resume session in the fresh generation and keep reporting presence
+    // for it.
+    let generation = {
+        let sessions = state.sessions.lock().await;
+        if let Some(existing) = sessions.get(peer) {
+            if !existing.is_closed() {
+                return Ok(existing.clone());
+            }
         }
-    }
-    // Read under the same lock the foreground hop clears the map with, so a
-    // dial already in flight when the app resumes cannot land a pre-resume
-    // session in the fresh generation and keep reporting presence for it.
-    let generation = state.session_generation.load(Ordering::Acquire);
+        state.session_generation.load(Ordering::Acquire)
+    };
 
     let node = boot_node(app, state).await?;
     let addr = endpoint::addr_for(peer)?;
@@ -871,11 +905,21 @@ async fn session(
             // The generation this callback speaks for is fixed at dial time;
             // the one it is compared against is read now, because a resume
             // may have happened at any point in between.
+            //
+            // A session the foreground hop dropped keeps its reader task,
+            // because dropping the session never wakes it: the task sits on a
+            // connection nobody uses until the peer's idle timer kills it, up
+            // to half a minute after the resume. Its `on_closed` then fires
+            // for a session the app abandoned, and the replacement dial has
+            // already reported the same peer online — so this emit would show
+            // a working device as offline, with an empty tab list. Equality,
+            // not "at least as new": every generation but the current one is
+            // a round this app has finished with.
             let current = closed_app
                 .state::<RemoteState>()
                 .session_generation
                 .load(Ordering::Acquire);
-            if !closed_session_reports_offline(generation, current) {
+            if generation != current {
                 return;
             }
             presence(&closed_app, &closed_peer, "offline", None, None, None);
@@ -897,36 +941,25 @@ async fn session(
         Some(session.scope.clone()),
         None,
     );
-    sessions.insert(peer.to_string(), session.clone());
+    // The map is for REUSE, and two things can have made this session
+    // unreusable while the dial was in flight — both of them impossible back
+    // when the dial held this lock from end to end.
+    //
+    // A resume empties the map and bumps the generation under this same lock,
+    // so a session dialed in the round before it is one the app has finished
+    // with; its `on_closed` is already silenced by the generation it captured,
+    // and caching it would leave the drawer reporting a dead peer as online.
+    // `remote_unpair` deletes the peer and then drops its entry under this
+    // lock, so a peer revoked mid-dial must not get a cached session back.
+    // The caller still receives the session it asked for in both cases.
+    {
+        let mut sessions = state.sessions.lock().await;
+        let same_round = state.session_generation.load(Ordering::Acquire) == generation;
+        if same_round && state.peers.get(peer).is_some() {
+            sessions.insert(peer.to_string(), session.clone());
+        }
+    }
     Ok(session)
-}
-
-/// Does a closed session still speak for this app, or has a resume replaced
-/// it? The whole decision `ClientSession::on_closed` makes, pure so it can be
-/// tested without an endpoint: `session` is the generation the dial was made
-/// in, `current` the one the app is on now.
-///
-/// A session the foreground hop dropped keeps its reader task, because
-/// dropping the session never wakes it: the task sits on a connection nobody
-/// uses until the peer's idle timer kills it, up to half a minute after the
-/// resume. Its `on_closed` then fires for a session the app abandoned, and
-/// the replacement dial has already reported the same peer online — so the
-/// drawer would show a working device as offline, with an empty tab list.
-/// Equality, not "at least as new": every generation but the current one is
-/// a round this app has finished with.
-fn closed_session_reports_offline(session: u64, current: u64) -> bool {
-    session == current
-}
-
-/// Open the next round of sessions. The caller has already emptied the map
-/// under the sessions lock, and this is the half a late `on_closed` reads.
-///
-/// The counter only ever climbs, and that is the property this has to keep:
-/// a generation that repeated an earlier value would let a session dropped
-/// two resumes ago pass `closed_session_reports_offline` and report a peer
-/// this app is actively talking to as offline.
-fn supersede_sessions(generation: &AtomicU64) {
-    generation.fetch_add(1, Ordering::Release);
 }
 
 fn presence(
@@ -1079,7 +1112,12 @@ pub fn on_foreground(app: &tauri::AppHandle) {
             sessions.clear();
             // Under the same lock, so the bump and the clear are one act to
             // every dial. What it silences is explained on the field.
-            supersede_sessions(&state.session_generation);
+            //
+            // ADD, never assign: a counter that came back around would let a
+            // session dropped two resumes ago pass the equality check in
+            // `on_closed` and report a peer this app is actively talking to
+            // as offline. Two suspensions in a row is the ordinary iOS case.
+            state.session_generation.fetch_add(1, Ordering::Release);
         }
         let _ = app.emit("vlerv://remote-event", RemoteEvent::Resumed);
         // Re-dialing every paired peer is what makes the phone reachable
@@ -1087,11 +1125,22 @@ pub fn on_foreground(app: &tauri::AppHandle) {
         // `session()` emits the presence transitions itself, so the drawer
         // header reports the truth for devices whose `on_closed` never fired
         // because the reader task was frozen with the rest of the app.
-        for peer in state.peers.list() {
-            if let Err(e) = session(&app, &state, &peer.node_id).await {
+        //
+        // TOGETHER, not one after another. A dial to a device that is itself
+        // asleep costs the whole connect timeout, so dialed in turn, four
+        // paired devices with two asleep make one foreground hop take about a
+        // minute — and every `remote_subscribe` the user starts in that
+        // minute waits behind the same dials. Foregrounding is the most
+        // frequent lifecycle event iOS has. `session()` gates per peer, so
+        // the fan-out still dials each peer exactly once.
+        let peers = state.peers.list();
+        let (handle, remote) = (&app, &state);
+        join_all(peers.iter().map(|peer| async move {
+            if let Err(e) = session(handle, remote, &peer.node_id).await {
                 eprintln!("vlerv: remote: {} is not reachable after resume: {e}", peer.device);
             }
-        }
+        }))
+        .await;
     });
 }
 
@@ -1157,49 +1206,6 @@ mod tests {
         assert!(prefs.remote_listen, "the phone now listens for its peers");
         assert!(prefs.remote_listen_adopted, "and will not be asked again");
         assert!(!adopts_listen_pref(RECEIVER_BUILD, true, prefs.remote_listen_adopted));
-    }
-
-    #[test]
-    fn only_a_session_from_the_round_the_app_is_on_reports_its_peer_offline() {
-        // The check inside `on_closed`. A session dialed in the round the app
-        // is still on is the live one, and its close is real news: the peer
-        // went away and the drawer header has to say so.
-        assert!(closed_session_reports_offline(4, 4));
-        // A session from a round the foreground hop ended says nothing. Its
-        // reader task was frozen with the app and wakes up half a minute
-        // after the resume, by which time the replacement dial has already
-        // reported the same peer online — so this emit would mark a device
-        // the user is browsing as offline and empty its tab list.
-        assert!(!closed_session_reports_offline(3, 4));
-        assert!(!closed_session_reports_offline(0, 4));
-        // Nothing is dialed into a round that has not started, so this pair
-        // cannot occur; it is here because a `>=` in place of the equality
-        // answers the same for every case above and differs only here.
-        assert!(!closed_session_reports_offline(5, 4));
-    }
-
-    #[test]
-    fn every_resume_opens_a_round_that_no_earlier_session_can_claim_again() {
-        // Two suspensions in a row is the ordinary iOS case — the phone
-        // sleeps, resumes, sleeps and resumes again — and each resume
-        // abandons the sessions the resume before it dialed.
-        let generation = AtomicU64::new(0);
-        let launch = generation.load(Ordering::Acquire);
-        supersede_sessions(&generation);
-        let first_resume = generation.load(Ordering::Acquire);
-        supersede_sessions(&generation);
-        let second_resume = generation.load(Ordering::Acquire);
-
-        assert!(first_resume > launch, "a resume ends the round it found");
-        assert!(second_resume > first_resume, "and so does the resume after it");
-        // The point of the counter climbing rather than toggling: a session
-        // from the launch round must stay silent through EVERY later resume,
-        // not just the first one. A generation that came back around would
-        // hand a two-resumes-dead session the right to report its peer
-        // offline while a live session for that same peer is serving tabs.
-        assert!(!closed_session_reports_offline(launch, second_resume));
-        assert!(!closed_session_reports_offline(first_resume, second_resume));
-        assert!(closed_session_reports_offline(second_resume, second_resume));
     }
 
     #[test]

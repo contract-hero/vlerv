@@ -407,12 +407,17 @@ export function RemoteProvider({
   const reconnectAll = React.useCallback(
     (reason: ReconnectReason) => {
       if (!ipc.remoteListPeers) return;
-      Promise.all([
-        ipc.remoteListPeers(),
-        // A settings read that fails costs us the reconnect, never the peer
-        // list — the preference only decides whether we dial.
-        ipc.getState?.().catch(() => undefined),
-      ])
+      // A resume dials every peer whatever the preference says, so
+      // `dialsEveryPeer` never reads it and this round trip would decide
+      // nothing — while the peer list, and every drawer waiting on it, waits
+      // for the answer. A resume is the frequent one, as the note above says.
+      const settingsRead =
+        reason === "resume"
+          ? undefined
+          : // A settings read that fails costs us the reconnect, never the
+            // peer list — the preference only decides whether we dial.
+            ipc.getState?.().catch(() => undefined);
+      Promise.all([ipc.remoteListPeers(), settingsRead])
         .then(([list, settings]) => {
           if (!mountedRef.current) return;
           setPeers(list);

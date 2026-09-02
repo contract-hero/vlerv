@@ -255,7 +255,7 @@ pub async fn boot_with_gc(
         .await
         .map_err(|e| format!("cannot bind iroh endpoint: {e}"))?;
 
-    // THE COLLECTOR IS WHAT MAKES DELETING A TAG FREE DISK. `FsStore::load`
+    // The collector is what makes deleting a tag free disk. `FsStore::load`
     // builds `Options::new`, whose `gc` is `None`, and `Blobs::delete` is
     // `pub(crate)` with its own doc saying users must rely on garbage
     // collection instead. Booted the plain way, this store never gives a byte

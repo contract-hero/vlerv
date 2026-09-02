@@ -376,19 +376,12 @@ pub struct ReceivedArtifact {
 enum Attempt {
     /// The host answered `Res::Pushed` and reported what it landed.
     Landed(PushedArtifact),
-    /// Nothing on the other side answered the dial. THE queue-eligible cause.
+    /// Nothing on the other side answered the dial. The queue-eligible cause.
     Asleep(String),
     /// The session died under the request. Queue-eligible only after a fresh
     /// dial has confirmed it, because a cached session's `is_closed()` flag
     /// cannot tell a sleeping peer from an awake one.
     SessionDied(String),
-}
-
-/// What one dial produced. A refusal never reaches here: it leaves through
-/// the caller's own `Err`, which is what keeps it out of the spool.
-enum Dialed {
-    Session(Arc<ClientSession>),
-    Asleep(String),
 }
 
 /// Why the drain was asked to wake up. The two reasons buy different things,
@@ -476,7 +469,7 @@ impl EventSink for McpSink {
                 }
             }
             HostSignal::PeerConnected { peer, device, scope } => {
-                // THE PRECISE WAKE TRIGGER. This device holds a session right
+                // The precise wake trigger. This device holds a session right
                 // now, so anything queued for it goes out on this pass
                 // whatever its backoff says — the ladder exists to stop this
                 // server naming a sleeping phone to n0 discovery every few
@@ -623,6 +616,13 @@ impl McpCore {
         *self.loopback.lock().unwrap_or_else(|p| p.into_inner()) = Some(host);
     }
 
+    /// Whether the seam above is set, over this server's OWN handle. Reading
+    /// it through a `Drainer` cost nine field clones — seven `Arc`s and two
+    /// `String`s — to look at one `Mutex`, on every send.
+    fn loopback(&self) -> Option<SocketAddr> {
+        *self.loopback.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn device(&self) -> &str {
         &self.device
     }
@@ -680,7 +680,7 @@ impl McpCore {
                 ));
                 let node = Arc::new(endpoint::boot(&self.dirs, Some(state), |_| {}).await?);
 
-                // THE DRAIN IS SPAWNED HERE AND NOWHERE ELSE, for two
+                // The drain is spawned here and nowhere else, for two
                 // reasons. The lazy-boot contract: a registered but unused
                 // server must still bind nothing, and this initializer is the
                 // one place that has already given that up. And the blob
@@ -969,31 +969,40 @@ impl McpCore {
         peer: &Peer,
         cand: &beam::OfferCandidate,
     ) -> Result<Attempt, String> {
-        let mut session = match self.dialed(node, peer).await? {
-            Dialed::Session(session) => session,
-            Dialed::Asleep(why) => return Ok(Attempt::Asleep(why)),
+        // `ConnectError::Unreachable` is THE queue door, and it is matched
+        // here rather than behind a wrapper type so the rule reads where it
+        // is enforced: every other dial failure leaves through `Err` and can
+        // never reach the spool.
+        let mut session = match self.drainer(node).dial_session(peer).await {
+            Ok(session) => session,
+            Err(ConnectError::Unreachable(why)) => return Ok(Attempt::Asleep(why)),
+            Err(refused) => return Err(not_reachable(peer, &refused)),
         };
         // The scope in the handshake is what the DEVICE granted this server.
         // Checking it here turns the host's one deliberately vague refusal
         // ("not permitted for this peer") into an instruction the human can
-        // act on.
-        if session.scope != Scope::Control.as_str() {
+        // act on. A scope this build cannot parse is treated as NOT granting
+        // control (`unwrap_or(false)`), which is what a raw `!= "control"`
+        // compare did: a live push is about to happen, so an unreadable grant
+        // must refuse rather than guess.
+        if !grants_control(&session.scope).unwrap_or(false) {
             // A session reports the grant as it stood when it connected, so a
             // cached one can be stale: the human may have widened the scope
             // between two tool calls. Re-handshake once before refusing.
             forget_session(&self.sessions, &peer.node_id).await;
-            session = match self.dialed(node, peer).await? {
-                Dialed::Session(session) => session,
-                Dialed::Asleep(why) => return Ok(Attempt::Asleep(why)),
+            session = match self.drainer(node).dial_session(peer).await {
+                Ok(session) => session,
+                Err(ConnectError::Unreachable(why)) => return Ok(Attempt::Asleep(why)),
+                Err(refused) => return Err(not_reachable(peer, &refused)),
             };
         }
-        if session.scope != Scope::Control.as_str() {
+        if !grants_control(&session.scope).unwrap_or(false) {
             return Err(needs_control(peer, &session.scope, &self.device));
         }
 
         // The canonical path the gate resolved, not the caller's string: the
         // push re-applies the same policy, and it must see the same file.
-        let pushed = match self.drainer(node).own_loopback().await {
+        let pushed = match own_loopback(self.loopback(), node).await {
             Some(own) => session.push_artifact_at(&cand.canonical, &self.roots, own).await,
             None => session.push_artifact(&cand.canonical, &self.roots).await,
         };
@@ -1029,14 +1038,18 @@ impl McpCore {
                 label(peer)
             ));
         };
-        // THE GRANT PRE-CHECK. A device that has not granted control refuses
+        // The grant pre-check. A device that has not granted control refuses
         // these bytes the moment it wakes, so queuing them would keep a
         // private copy of the user's file for a week to deliver a refusal.
         // The same predicate the RECEIVER enforces answers it, so the two
         // cannot drift. Never handshaken (`None`) is not a no: that send is
-        // queued, and its answer says the grant is unverified.
+        // queued, and its answer says the grant is unverified. A scope this
+        // build cannot parse is not a no either (`unwrap_or(true)`): the
+        // string comes off a hand-editable `peers.json`, and refusing an
+        // accept on a cached hint nobody can read would lose a send that the
+        // next real handshake may well permit.
         if let Some(granted) = peer.last_ack_scope.as_deref() {
-            if Scope::parse(granted).is_ok_and(|scope| !scope.may_land_artifacts()) {
+            if !grants_control(granted).unwrap_or(true) {
                 return Err(format!(
                     "{} Nothing was queued: a device that has not granted control refuses \
                      these bytes on arrival, and the file would sit here as a private copy \
@@ -1150,7 +1163,16 @@ impl McpCore {
     /// read by the send path and by `server_status`, so a refusal and the
     /// status that explains it cannot tell two different stories.
     fn queue_blocked_reason(&self) -> Option<String> {
-        self.last_boot_error().or_else(|| self.outbox.load_error())
+        self.blocked_by(self.outbox.load_error())
+    }
+
+    /// The half of the answer above that does not touch the spool, for a
+    /// caller that already holds `load_error` from a wider read. It exists so
+    /// `server_status` can take the spool ONCE and still route the answer
+    /// through the one producer, rather than spelling the `or` out a second
+    /// time and letting the two orders drift.
+    fn blocked_by(&self, load_error: Option<String>) -> Option<String> {
+        self.last_boot_error().or(load_error)
     }
 
     /// Test seam: how many peer sessions this server is holding. A session
@@ -1234,22 +1256,6 @@ impl McpCore {
     async fn session(&self, peer: &Peer) -> Result<Arc<ClientSession>, String> {
         let node = self.node().await?;
         self.drainer(&node).dial_session(peer).await.map_err(|e| not_reachable(peer, &e))
-    }
-
-    /// `Drainer::dial_session`, with the two answers the SEND path can act on
-    /// kept apart and everything else already refused. `Dialed::Asleep` is
-    /// the only door to the queue, and it is this narrow on purpose: a
-    /// refusal queued as if it were a nap would repeat itself for a week.
-    async fn dialed(
-        &self,
-        node: &Arc<endpoint::RemoteNode>,
-        peer: &Peer,
-    ) -> Result<Dialed, String> {
-        match self.drainer(node).dial_session(peer).await {
-            Ok(session) => Ok(Dialed::Session(session)),
-            Err(ConnectError::Unreachable(why)) => Ok(Dialed::Asleep(why)),
-            Err(refused) => Err(not_reachable(peer, &refused)),
-        }
     }
 
     // ── pair_device / pair_status / confirm_pairing ────────────────────────
@@ -1352,26 +1358,25 @@ impl McpCore {
             let log = self.received.lock().unwrap_or_else(|p| p.into_inner());
             Received { items: log.items.clone(), total: log.total }
         };
+        // ONE read of the spool for the three answers shown side by side. The
+        // same argument the sum below makes: a pending list, an unaccounted
+        // list and a load error taken in three separate locks can straddle a
+        // `reload`, and then the status names one delivery on two lists, or
+        // reports an empty queue beside no reason for it.
+        let spool = self.outbox.report();
         let queued: Vec<QueuedDelivery> =
-            self.outbox.list().into_iter().map(QueuedDelivery::from).collect();
+            spool.records.into_iter().map(QueuedDelivery::from).collect();
         // Summed from the listed records, not read off the spool again: a
         // total that disagreed with the list beside it would send a reader
         // hunting for a record that is not there.
         let queued_bytes: u64 = queued.iter().map(|q| q.size).sum();
-        // ONE COPY BACKS EVERY RECORD THAT NAMES THE SAME CONTENT. The store
+        // One copy backs every record that names the same content. The store
         // is content-addressed, so a file queued for the phone and the iPad
-        // is two records, two pins and ONE blob — counting it twice would
+        // is two records, two pins and one blob — counting it twice would
         // report a disk cost that is not there.
         let mut counted: BTreeSet<&str> = BTreeSet::new();
         let retained_bytes: u64 =
             queued.iter().filter(|q| counted.insert(&q.hash)).map(|q| q.size).sum();
-        let mut queue_unreadable = self.outbox.quarantined();
-        queue_unreadable.extend(self.outbox.foreign());
-        // The third cause, and the only one that may fix itself: the file
-        // would not read this boot. It is on this list for the same reason as
-        // the other two — it is off the pending list, so a status that stayed
-        // silent would report the delivery as simply gone.
-        queue_unreadable.extend(self.outbox.io_faults());
         Ok(ServerStatus {
             node_id_short: short_id(&node_id),
             node_id,
@@ -1389,9 +1394,13 @@ impl McpCore {
             queued,
             queued_bytes,
             retained_bytes,
-            queue_unreadable,
+            // Every cause in one list, including the only one that may fix
+            // itself — a file that would not read this boot. All of them are
+            // off the pending list, so a status that stayed silent would
+            // report the delivery as simply gone.
+            queue_unreadable: spool.unaccounted,
             draining: self.draining(),
-            queue_blocked_reason: self.queue_blocked_reason(),
+            queue_blocked_reason: self.blocked_by(spool.load_error),
             roots: self.roots.roots(),
         })
     }
@@ -1481,11 +1490,8 @@ impl Drainer {
         *self.loopback.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// This server's own `127.0.0.1:<port>`, and only in loopback mode — the
-    /// address a pushed ticket names so the peer dials back over loopback.
     async fn own_loopback(&self) -> Option<SocketAddr> {
-        self.loopback()?;
-        endpoint::loopback_socket(&self.node).await
+        own_loopback(self.loopback(), &self.node).await
     }
 
     /// What a boot owes the spool before anything else touches it.
@@ -1532,17 +1538,14 @@ impl Drainer {
         for expired in self.outbox.take_expired(peers::now_unix()) {
             beam::unpin_outbox(&self.node, &expired.tag).await;
         }
-        // GROUPED BY PEER, and that is the whole shape of this pass: a dial
+        // Grouped by peer, and that is the whole shape of this pass: a dial
         // to a suspended phone costs DIAL_TIMEOUT, so five records for one
-        // device must cost ONE dial, not five. The peers then run together,
+        // device must cost one dial, not five. The peers then run together,
         // the way `list_devices { probe: true }` probes, so one sleeping
         // device does not hold up a delivery to an awake one.
         let due: Vec<String> = self
             .outbox
-            .list()
-            .into_iter()
-            .map(|record| record.peer)
-            .collect::<BTreeSet<String>>()
+            .pending_peers()
             .into_iter()
             .filter(|peer| forced == Some(peer.as_str()) || self.due(peer))
             .collect();
@@ -1616,13 +1619,26 @@ impl Drainer {
         };
         // The grant as the DEVICE reports it, re-read on every pass. A record
         // queued for a device that has since narrowed its grant must say so
-        // rather than collect "not permitted for this peer" forever.
-        if !Scope::parse(&session.scope).is_ok_and(|scope| scope.may_land_artifacts()) {
+        // rather than collect "not permitted for this peer" forever. A scope
+        // this build cannot parse HOLDS the record (`unwrap_or(false)`) — it
+        // is neither pushed nor dropped, so a newer build that understands
+        // the string still delivers it inside the TTL.
+        if !grants_control(&session.scope).unwrap_or(false) {
             self.hold_peer(peer_id, &records, needs_control(&peer, &session.scope, &self.device));
             return;
         }
 
         let mut landed = false;
+        // Both are INVARIANT for this pass, and both were rebuilt per record.
+        // The loopback answer is this node's own bound port, which no record
+        // can change; the roots sentence takes the `RootSet` lock, clones
+        // every root and joins them, and `record_attempt` then usually
+        // discards the string because it equals the reason already stored.
+        // The record loop is bounded only for PUSHES, so a peer whose records
+        // are all held paid both costs once per record, every pass, for the
+        // seven days the records live.
+        let own = self.own_loopback().await;
+        let listed = listed_roots(&self.roots);
         // Pushes made, and it is COUNTED rather than taken off the front of
         // the list. `MAX_PER_PASS` exists to stop one peer holding a session
         // for minutes, and only a record that reaches `push_staged` costs
@@ -1645,7 +1661,7 @@ impl Drainer {
             // differs between projects and a session started elsewhere can
             // still serve it.
             if !self.roots.contains(&record.source) {
-                self.note(record, held_outside_roots(record, &self.roots));
+                self.note(record, held_outside_roots(record, &listed));
                 continue;
             }
             // `push_staged` mints a ticket for whatever hash it is handed, so
@@ -1661,7 +1677,7 @@ impl Drainer {
             pushes += 1;
             // The STAGED bytes, named by content address: nothing re-reads
             // the source, which by now may have been rewritten or deleted.
-            let pushed = match self.own_loopback().await {
+            let pushed = match own {
                 Some(own) => {
                     session.push_staged_at(&record.hash, &record.name, record.size, own).await
                 }
@@ -1822,21 +1838,53 @@ async fn forget_session(sessions: &SessionCache, node_id: &str) {
     sessions.lock().await.remove(node_id);
 }
 
+/// This server's own `127.0.0.1:<port>`, and only in loopback mode — the
+/// address a pushed ticket names so the peer dials back over loopback.
+///
+/// A free function over the two handles the answer needs — the `use_loopback`
+/// pin and the booted node — so the send path and the drain share ONE
+/// resolution while each reads the pin through the handle it already holds.
+async fn own_loopback(pin: Option<SocketAddr>, node: &endpoint::RemoteNode) -> Option<SocketAddr> {
+    pin?;
+    endpoint::loopback_socket(node).await
+}
+
 /// What a record whose source has left this server's roots is told.
 ///
 /// It is HELD, not dropped: `VLERV_MCP_ROOTS` differs between projects, so a
 /// delivery accepted in one may only ever be served by a session started in
 /// another. Saying which roots refused it is the difference between a user
 /// who can start that session and one who watches a count that never moves.
-fn held_outside_roots(record: &Record, roots: &RootSet) -> String {
-    let listed: Vec<String> = roots.roots().iter().map(|root| format!("{root:?}")).collect();
+fn held_outside_roots(record: &Record, listed: &str) -> String {
     format!(
-        "held, not sent: {:?} is outside this server's send roots ({}), so it is neither \
+        "held, not sent: {:?} is outside this server's send roots ({listed}), so it is neither \
          delivered nor dropped. A Claude Code session whose VLERV_MCP_ROOTS covers that file \
          delivers this record; otherwise it waits here until it expires.",
-        record.source,
-        listed.join(", ")
+        record.source
     )
+}
+
+/// This server's send roots as the sentence above names them. Split out
+/// because only `record.source` varies per record: taking the `RwLock`,
+/// cloning every `PathBuf` and re-joining them once per HELD record was the
+/// same string rebuilt for every record in the spool.
+fn listed_roots(roots: &RootSet) -> String {
+    roots.roots().iter().map(|root| format!("{root:?}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Does this scope STRING let the device land artifacts? `None` means the
+/// string parsed as nothing this build knows.
+///
+/// Both strings this answers about are outside this process's control — the
+/// scope a peer reports in its `HelloAck`, and `last_ack_scope`, which is
+/// plain text in a hand-editable `peers.json` — so "unparseable" is a real
+/// input, not a theoretical one. It gets no default HERE on purpose: the
+/// three callers want opposite ones (the accept site queues, the live push
+/// and the drain refuse), and three inline spellings of the fallback are how
+/// one of them silently stopped matching the other two. Each caller states
+/// its own `unwrap_or` and says why.
+fn grants_control(scope: &str) -> Option<bool> {
+    Scope::parse(scope).ok().map(Scope::may_land_artifacts)
 }
 
 /// The refusal a device that has not granted this server "control" gets.
@@ -2230,12 +2278,15 @@ mod tests {
     }
 
     /// An endpoint that answers the transport and speaks no scope protocol.
+    /// Why the proofs stand a deaf device up rather than a suspended one is
+    /// written out at `boot_asleep` in tests/tool_handlers.rs: a real
+    /// suspension costs `DIAL_TIMEOUT` — thirty seconds — and this fails the
+    /// same `endpoint::dial` in milliseconds on the same
+    /// `ConnectError::Unreachable`.
     ///
-    /// A device that is really asleep costs `DIAL_TIMEOUT` — thirty seconds —
-    /// to give up on, which is a minute of test time for the two sends the
-    /// dedupe proof needs. This one fails the SAME `endpoint::dial` in
-    /// milliseconds and produces the SAME `ConnectError::Unreachable`, which
-    /// is the one input the decision to queue reads.
+    /// This twin keeps the identity its own boot mints, and copies none in.
+    /// No proof in this module ever brings the device back, so nothing has to
+    /// answer for the same node id a second time.
     async fn deaf_device(dir: &tempfile::TempDir) -> Arc<endpoint::RemoteNode> {
         Arc::new(endpoint::boot(&Dirs::new(dir.path()), None, |_| {}).await.unwrap())
     }
@@ -2258,6 +2309,42 @@ mod tests {
             .seed(&device.endpoint.id().to_string(), "Val's iPhone", Scope::Control)
             .unwrap();
         core
+    }
+
+    /// The same core wired to an AWAKE device, and booted: what every drain
+    /// proof needs before it can lay out a queue.
+    ///
+    /// A SECOND helper rather than an argument on the one above, because the
+    /// order cannot be shared: `awake_device` seeds its grant for THIS core's
+    /// node id, so the core has to exist before the device does, while
+    /// `core_paired_with` takes the device as an argument.
+    ///
+    /// Hands back, in order: the core, its booted node (what `queue_staged`
+    /// and `drainer` take), the phone, the phone's signal log (what landed on
+    /// it), and the peer id the drain is driven by.
+    async fn core_draining_to(
+        state: &tempfile::TempDir,
+        workspace: &tempfile::TempDir,
+        phone_dir: &tempfile::TempDir,
+    ) -> (
+        McpCore,
+        Arc<endpoint::RemoteNode>,
+        Arc<endpoint::RemoteNode>,
+        Arc<Mutex<Vec<HostSignal>>>,
+        String,
+    ) {
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let (phone, signals) = awake_device(phone_dir, &core.node_id().unwrap()).await;
+        let phone_id = phone.endpoint.id().to_string();
+        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        let node = core.node().await.unwrap();
+        (core, node, phone, signals, phone_id)
     }
 
     /// The same device AWAKE: a headless `vlerv-remote` host that already
@@ -2348,19 +2435,10 @@ mod tests {
         let workspace = tempfile::TempDir::new().unwrap();
         let other_project = tempfile::TempDir::new().unwrap();
 
-        let core = McpCore::new(
-            state.path().to_path_buf(),
-            vec![workspace.path().to_path_buf()],
-            workspace.path().to_path_buf(),
-            None,
-        );
-        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
-        let phone_id = phone.endpoint.id().to_string();
-        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
-        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-        let node = core.node().await.unwrap();
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
 
-        // One MORE than the bound, so a budget spent per record looked at
+        // One more than the bound, so a budget spent per record looked at
         // runs out before the queue does.
         for n in 0..=outbox::MAX_PER_PASS {
             let file = other_project.path().join(format!("held-{n}.html"));
@@ -2419,17 +2497,8 @@ mod tests {
         let phone_dir = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
 
-        let core = McpCore::new(
-            state.path().to_path_buf(),
-            vec![workspace.path().to_path_buf()],
-            workspace.path().to_path_buf(),
-            None,
-        );
-        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
-        let phone_id = phone.endpoint.id().to_string();
-        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
-        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-        let node = core.node().await.unwrap();
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
 
         // Two past the bound. All inside this session's roots, all with their
         // bytes in the store and all for one awake device that grants
@@ -2495,17 +2564,8 @@ mod tests {
         let held = other_project.path().join("report.html");
         std::fs::write(&held, "<h1>queued in another project</h1>").unwrap();
 
-        let core = McpCore::new(
-            state.path().to_path_buf(),
-            vec![workspace.path().to_path_buf()],
-            workspace.path().to_path_buf(),
-            None,
-        );
-        let (phone, signals) = awake_device(&phone_dir, &core.node_id().unwrap()).await;
-        let phone_id = phone.endpoint.id().to_string();
-        core.use_loopback(endpoint::loopback_socket(&phone).await.unwrap());
-        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-        let node = core.node().await.unwrap();
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
         queue_staged(&core, &node, &phone_id, &held).await;
         assert!(core.drainer(&node).due(&phone_id), "nothing has failed for it yet");
 
@@ -2698,7 +2758,7 @@ mod tests {
     async fn two_devices_owed_one_file_are_owed_one_copy_of_it() {
         // What the status must not do is add a disk cost that is not there.
         // The store is content-addressed and a record pins a hash, so one
-        // file queued for two devices is two records, two pins and ONE blob.
+        // file queued for two devices is two records, two pins and one blob.
         // The spool is written straight to disk here: `McpCore::new` reads it
         // back, and neither number needs a socket, a device or a store.
         let state = tempfile::TempDir::new().unwrap();

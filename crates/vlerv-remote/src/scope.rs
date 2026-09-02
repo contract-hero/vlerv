@@ -32,7 +32,7 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::beam::delete_tags;
+use crate::beam::{delete_tags, parse_hash};
 use crate::endpoint::{self, RemoteNode};
 use crate::paths::{base_name, mtime_secs, Dirs, DEFAULT_IGNORED};
 use crate::peers::{self, now_unix, Peer, PeerStore, Pairing, PendingPair, Scope};
@@ -114,8 +114,17 @@ struct Grant {
     tag: Option<Tag>,
 }
 
+/// A grant for one peer, its hour already started. The two minting call
+/// sites — `Grants::insert` and `Grants::grant_pinned` — differ only in
+/// whether they own a tag, and the peer's expiry has to be the SAME
+/// expression at both: a grant minted with a clock the gate does not use is a
+/// capability that lapses at the wrong moment.
+fn new_grant(peer: EndpointId, tag: Option<Tag>) -> Grant {
+    Grant { peers: HashMap::from([(peer, now_unix() + GRANT_TTL_SECS)]), tag }
+}
+
 impl Grant {
-    /// Let one more peer fetch these bytes, and restart THAT PEER's clock — a
+    /// Let one more peer fetch these bytes, and restart that peer's clock — a
     /// peer that just asked is about to fetch. Every other peer on this hash
     /// keeps the expiry it earned, so one peer's traffic cannot extend
     /// another's capability.
@@ -186,19 +195,13 @@ impl Grants {
                 }
             }
             None => {
-                map.insert(
-                    hash,
-                    Grant {
-                        peers: HashMap::from([(peer, now_unix() + GRANT_TTL_SECS)]),
-                        tag: Some(tag),
-                    },
-                );
+                map.insert(hash, new_grant(peer, Some(tag)));
                 None
             }
         }
     }
 
-    /// `insert` for bytes THIS GRANT DOES NOT OWN: admit an existing grant, or
+    /// `insert` for bytes this grant does not own: admit an existing grant, or
     /// mint one that pins nothing. `push_staged_via` calls it once per
     /// delivery attempt — a grant is in-memory and lives `GRANT_TTL_SECS`,
     /// so nothing durable may ever store one and replay it later.
@@ -218,13 +221,7 @@ impl Grants {
         match map.get_mut(&hash) {
             Some(existing) => existing.admit(peer),
             None => {
-                map.insert(
-                    hash,
-                    Grant {
-                        peers: HashMap::from([(peer, now_unix() + GRANT_TTL_SECS)]),
-                        tag: None,
-                    },
-                );
+                map.insert(hash, new_grant(peer, None));
             }
         }
     }
@@ -1617,21 +1614,15 @@ impl ClientSession {
     }
 }
 
-/// Parse a content address that arrived from the spool, guarding its length
-/// first — `Hash::from_str` reads any other length as base32 and can PANIC on
-/// malformed input, the same reason `Offers::remove` guards. A record file is
-/// editable by hand and survives a build change, so this string is no more
-/// trusted than one off the wire.
+/// A content address that arrived from the spool, as the push path's own
+/// error. A record file is editable by hand and survives a build change, so
+/// this string is no more trusted than one off the wire — `parse_hash` holds
+/// the reason the length is guarded before the parse.
 ///
 /// Free function so the refusal is reachable without two endpoints and a
 /// socket: a `ClientSession` cannot be built without both.
 fn staged_hash(hash_hex: &str) -> Result<Hash, PushFailure> {
-    if hash_hex.len() != 64 {
-        return Err(PushFailure::Local("malformed content address".to_string()));
-    }
-    hash_hex
-        .parse()
-        .map_err(|_| PushFailure::Local("malformed content address".to_string()))
+    parse_hash(hash_hex).ok_or_else(|| PushFailure::Local("malformed content address".to_string()))
 }
 
 /// The handshake answer, classified: the host's device and the scope it
@@ -1732,12 +1723,9 @@ pub async fn fetch_into_cache(
     ext: &str,
     cache_dir: &Path,
 ) -> Result<PathBuf, String> {
-    // Length guard first: `Hash::from_str` treats other lengths as base32 and
-    // can panic on malformed input, and this string arrives over the wire.
-    if hash_hex.len() != 64 {
-        return Err("malformed content address".to_string());
-    }
-    let hash: Hash = hash_hex.parse().map_err(|_| "malformed content address".to_string())?;
+    // The string arrives over the wire, so it is parsed the guarded way —
+    // see `parse_hash`.
+    let hash = parse_hash(hash_hex).ok_or_else(|| "malformed content address".to_string())?;
     let target = cache_dir.join(format!("{hash_hex}{ext}"));
     if target.is_file() {
         return Ok(target);
