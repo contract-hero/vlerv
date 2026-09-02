@@ -35,6 +35,12 @@ pub struct RemoteNode {
     pub scope: Option<Arc<scope::ScopeServer>>,
     /// Held for the life of the node: the exclusive claim on the blob store.
     /// Dropping it (or exiting) lets the next process boot.
+    ///
+    /// MUST stay the LAST field. Fields drop in declaration order, so this
+    /// releases only after `store` above has closed. Move it up and a second
+    /// process can open redb while this one is still closing it — the very
+    /// hang this type prevents, with no error anywhere. No test can catch a
+    /// reorder: a whole drop completes before the next boot starts.
     _store_lock: StoreLock,
 }
 
@@ -42,12 +48,16 @@ pub struct RemoteNode {
 /// the value lives.
 ///
 /// `FsStore` is a redb database, so exactly one process may own it. Without
-/// this claim a second process does not fail — it HANGS: `FsStore::load`
-/// blocks, and unwinding it deadlocks inside `RtWrapper::drop`, which drops a
-/// tokio `BlockingPool` from inside `block_in_place`. A `timeout` cannot
-/// rescue that, because the stuck work is a synchronous drop inside a poll,
-/// not an await that can be cancelled. So the contention has to be caught
-/// BEFORE the store is opened, which is what this type does.
+/// this claim a second process does not fail — it HANGS. redb itself is not
+/// the problem: it reports `DatabaseAlreadyOpen` at once. Unwinding THAT
+/// error deadlocks, inside `RtWrapper::drop`, which drops a tokio runtime
+/// from inside `block_in_place`.
+///
+/// A `timeout` around the load does return — that drop runs on the store's
+/// own private runtime, not in the caller's poll — but it does not rescue
+/// anything: every attempt leaks a wedged worker thread and a runtime that
+/// never shuts down, and still yields no store. So the contention has to be
+/// caught BEFORE the store is opened, which is what this type does.
 ///
 /// Every Claude Code session spawns its own `vlerv-mcp` against one state
 /// directory, so this is the ordinary case, not a corner case.
@@ -57,9 +67,13 @@ struct StoreLock {
 }
 
 impl StoreLock {
-    /// Claim `path` (`Dirs::blobs_lock`), or report that someone else holds
+    /// Claim the blob store `dirs` names, or report that someone else holds
     /// it. Non-blocking: a caller that waited would be back to hanging.
-    fn acquire(path: &std::path::Path) -> Result<Self, String> {
+    ///
+    /// Takes the `Dirs`, not a path, so the claim can only ever land beside
+    /// the store it guards — there is no way to lock the wrong file.
+    fn acquire(dirs: &Dirs) -> Result<Self, String> {
+        let path = &dirs.blobs_lock();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
@@ -81,34 +95,74 @@ impl StoreLock {
                  Only one can serve beams at a time — close the other one, \
                  or give this one its own state directory."
             ),
+            // A filesystem with no locks (NFS, SMB, some FUSE mounts) is the
+            // one refusal that is not contention. Failing closed is still
+            // right — booting unguarded restores the hang — but "cannot
+            // lock" alone reads as "someone else holds it", which sends the
+            // user hunting a process that does not exist.
+            std::fs::TryLockError::Error(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                format!(
+                    "this filesystem cannot lock files, so Vlerv cannot be sure it is the \
+                     only process using the blob store at {path:?} — and an unguarded \
+                     second process hangs instead of failing. Point the state directory \
+                     at a local disk."
+                )
+            }
             std::fs::TryLockError::Error(e) => format!("cannot lock {path:?}: {e}"),
         })?;
         Ok(Self { _file: file })
     }
 }
 
+/// How many times `load_or_create_identity` re-reads a key another writer is
+/// still creating. `create_private` creates the file and writes its 32 bytes
+/// as two steps, so a reader can arrive in between and see an empty file.
+/// The window is one `write` on a 32-byte file, so a couple of retries is
+/// generous; the bound exists so a genuinely truncated key still reports
+/// itself instead of spinning.
+const IDENTITY_READ_RETRIES: u32 = 3;
+
 /// Load the persisted ed25519 secret key, generating one on first use.
 /// The file is written 0600: the secret IS the instance's identity.
+///
+/// Safe to call concurrently. Two callers racing on a fresh install do not
+/// both win: `create_private` uses `create_new`, so the loser is told the
+/// file exists and reads the winner's key instead of writing a second one.
+/// A caller that catches the winner mid-write sees a short file and re-reads
+/// rather than reporting the user's key corrupt.
 pub fn load_or_create_identity(dir: &std::path::Path) -> Result<SecretKey, String> {
     let key_path = dir.join("identity.key");
-    match std::fs::read(&key_path) {
-        Ok(bytes) => {
-            let bytes: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| format!("identity.key is corrupt (not 32 bytes): {key_path:?}"))?;
-            Ok(SecretKey::from_bytes(&bytes))
+    for _ in 0..IDENTITY_READ_RETRIES {
+        match std::fs::read(&key_path) {
+            // A complete key. The common path, and the only one that is not
+            // racing anybody.
+            Ok(bytes) if bytes.len() == 32 => {
+                let bytes: [u8; 32] = bytes.try_into().expect("length checked above");
+                return Ok(SecretKey::from_bytes(&bytes));
+            }
+            // Short, but not empty-and-absent: either another process is
+            // between `create_new` and `write_all`, or the file really is
+            // damaged. Re-read; the retry bound decides which it was.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                let key = SecretKey::generate();
+                // `create_private`, not `write_private`: two boots racing on
+                // a fresh install must not each write a key and leave one of
+                // them holding a NodeId the file no longer names.
+                match paths::create_private(&key_path, &key.to_bytes()) {
+                    Ok(()) => return Ok(key),
+                    // Lost the race. The winner's key is the real identity,
+                    // so drop ours and go round to read theirs — failing
+                    // here would report "File exists" as a boot error.
+                    Err(_) if key_path.exists() => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(format!("cannot read {key_path:?}: {e}")),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            let key = SecretKey::generate();
-            // `create_private`, not `write_private`: two boots racing on a
-            // fresh install must not each write a key and leave one of them
-            // holding a NodeId the file no longer names.
-            paths::create_private(&key_path, &key.to_bytes())?;
-            Ok(key)
-        }
-        Err(e) => Err(format!("cannot read {key_path:?}: {e}")),
     }
+    Err(format!("identity.key is corrupt (not 32 bytes): {key_path:?}"))
 }
 
 /// Boot the node: identity, endpoint (n0 preset: hole-punching + encrypted
@@ -130,7 +184,7 @@ pub async fn boot(
     // First, before this process reads a key, binds a socket or opens the
     // store: claim the store, so a refused boot does none of that. Why the
     // refusal cannot instead be a timeout further down: see `StoreLock`.
-    let store_lock = StoreLock::acquire(&dirs.blobs_lock())?;
+    let store_lock = StoreLock::acquire(dirs)?;
 
     let secret = load_or_create_identity(&dirs.remote())?;
 
@@ -300,12 +354,12 @@ mod tests {
     #[test]
     fn second_claim_on_one_store_is_refused_not_queued() {
         let dir = tempfile::TempDir::new().unwrap();
-        let lock = Dirs::new(dir.path()).blobs_lock();
-        let first = StoreLock::acquire(&lock).expect("first claim");
+        let dirs = Dirs::new(dir.path());
+        let first = StoreLock::acquire(&dirs).expect("first claim");
 
         // Refused, not queued — `try_lock` is what pins that, and a claim
         // that queued would restore the hang this type exists to prevent.
-        let msg = StoreLock::acquire(&lock).expect_err("a second process must not get the store");
+        let msg = StoreLock::acquire(&dirs).expect_err("a second process must not get the store");
         assert!(
             msg.contains("already using the blob store"),
             "the error has to name the cause, got: {msg}"
@@ -318,7 +372,7 @@ mod tests {
         // Releasing hands the store to the next process — this is what makes
         // "close the other one" an actual fix.
         drop(first);
-        StoreLock::acquire(&lock).expect("a released store must re-open");
+        StoreLock::acquire(&dirs).expect("a released store must re-open");
     }
 
     #[test]
@@ -327,8 +381,8 @@ mod tests {
         // is the escape hatch the refusal message names.
         let a = tempfile::TempDir::new().unwrap();
         let b = tempfile::TempDir::new().unwrap();
-        let _held_a = StoreLock::acquire(&Dirs::new(a.path()).blobs_lock()).expect("first dir");
-        StoreLock::acquire(&Dirs::new(b.path()).blobs_lock()).expect("a separate dir is independent");
+        let _held_a = StoreLock::acquire(&Dirs::new(a.path())).expect("first dir");
+        StoreLock::acquire(&Dirs::new(b.path())).expect("a separate dir is independent");
     }
 
     #[tokio::test]
@@ -339,10 +393,12 @@ mod tests {
         // deleted from `boot`, so this one holds the wiring in place.
         let dir = tempfile::TempDir::new().unwrap();
         let dirs = Dirs::new(dir.path());
-        let _held = StoreLock::acquire(&dirs.blobs_lock()).expect("claim the store first");
+        let _held = StoreLock::acquire(&dirs).expect("claim the store first");
 
         // No endpoint is bound and no store is opened on this path, so the
-        // test needs neither a network nor a relay.
+        // test needs neither a network nor a relay — and the two assertions
+        // below are what hold that, rather than this comment. Without them
+        // the claim could move down past the bind and this stays green.
         let msg = boot(&dirs, None, |_| {})
             .await
             .err()
@@ -351,5 +407,34 @@ mod tests {
             msg.contains("already using the blob store"),
             "boot has to surface the claim's own message, got: {msg}"
         );
+        assert!(
+            !dirs.remote().join("identity.key").exists(),
+            "a refused boot must not have read or written the identity key"
+        );
+        assert!(
+            !dirs.blobs().exists(),
+            "a refused boot must not have opened the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_boot_releases_the_claim_it_took() {
+        // `get_or_try_init` retries a failed boot, so a claim leaked by a
+        // failure would refuse this process its own store for the rest of
+        // its life — a self-deadlock, reported as somebody else's fault.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dirs = Dirs::new(dir.path());
+        std::fs::create_dir_all(dirs.remote()).unwrap();
+        std::fs::write(dirs.remote().join("identity.key"), b"short").unwrap();
+
+        // Fails AFTER the claim is taken, and before any socket is bound.
+        let msg = boot(&dirs, None, |_| {})
+            .await
+            .err()
+            .expect("a corrupt identity must fail the boot");
+        assert!(msg.contains("corrupt"), "expected the identity error, got: {msg}");
+
+        StoreLock::acquire(&dirs)
+            .expect("a failed boot must not keep the claim it took");
     }
 }

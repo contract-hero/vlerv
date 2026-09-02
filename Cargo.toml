@@ -5,3 +5,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# `std::fs::File::try_lock` and `std::fs::TryLockError` — the blob-store claim
+# in `vlerv-remote/src/endpoint.rs`. Stable since 1.89; without this the build
+# fails on an older toolchain with an unresolved-method error that says
+# nothing about the toolchain.
+rust-version = "1.89"

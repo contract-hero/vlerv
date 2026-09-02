@@ -176,6 +176,11 @@ pub struct ServerStatus {
     pub state_dir: PathBuf,
     /// False until a tool needed the network — the lazy-boot contract.
     pub booted: bool,
+    /// Why the last boot failed, when one was tried and refused. `booted:
+    /// false` alone cannot tell an idle server from one that is locked out
+    /// for its whole life; this is the difference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_error: Option<String>,
     pub uptime_secs: u64,
     pub paired_devices: usize,
     pub active_offers: Vec<OfferSummary>,
@@ -276,6 +281,14 @@ pub struct McpCore {
     /// `get_or_try_init` does not cache a failure, so a refusal stays
     /// retryable once the other process exits.
     node: tokio::sync::OnceCell<Arc<endpoint::RemoteNode>>,
+    /// Why the last boot attempt failed, if one did. `node` being empty says
+    /// only "no node"; it does not say whether nobody asked yet or whether
+    /// every attempt was refused. Without this, a server locked out for its
+    /// whole life reports the same `booted: false` as a healthy idle one,
+    /// and `stop_beam` answers "nothing to revoke" without having looked.
+    /// Overwritten, not accumulated: a refusal is retryable, so only the
+    /// most recent attempt is worth reporting.
+    last_boot_error: Mutex<Option<String>>,
     /// Live sessions, one per peer. `Arc` because a session that closes
     /// evicts its own entry from here — see `session`.
     sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<ClientSession>>>>,
@@ -302,6 +315,7 @@ impl McpCore {
             home,
             dirs,
             node: tokio::sync::OnceCell::new(),
+            last_boot_error: Mutex::new(None),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             started: Instant::now(),
             loopback: Mutex::new(None),
@@ -354,6 +368,15 @@ impl McpCore {
     /// process — which is what keeps a beam link fetchable after the tool call
     /// that minted it returned.
     async fn node(&self) -> Result<Arc<endpoint::RemoteNode>, String> {
+        let booted = self.boot().await;
+        // Remember a refusal so the read-only tools can say WHY they see no
+        // node, instead of reporting the same thing an idle server reports.
+        *self.last_boot_error.lock().unwrap_or_else(|p| p.into_inner()) =
+            booted.as_ref().err().cloned();
+        booted
+    }
+
+    async fn boot(&self) -> Result<Arc<endpoint::RemoteNode>, String> {
         self.node
             .get_or_try_init(|| async {
                 let state = Arc::new(ScopeState::new(
@@ -375,11 +398,18 @@ impl McpCore {
     }
 
     /// The node IF one is already booted — never a wait, and never a false
-    /// negative. `stop_beam` reads this to decide there is nothing to revoke,
-    /// so an answer of "not booted" for a server that IS serving would report
-    /// a live link as already dead.
+    /// negative that matters. `stop_beam` reads this to decide there is
+    /// nothing to revoke; an offer can only exist after `node()` has
+    /// returned, so a `None` here never hides a live link. (It IS `None`
+    /// while a boot is still running, which is the honest answer then.)
     fn booted(&self) -> Option<Arc<endpoint::RemoteNode>> {
         self.node.get().cloned()
+    }
+
+    /// Why the last boot failed, for the tools that find no node and have to
+    /// tell the caller whether that means "idle" or "locked out".
+    fn last_boot_error(&self) -> Option<String> {
+        self.last_boot_error.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Resolve a caller-supplied path, confine it to this server's roots, and
@@ -442,6 +472,11 @@ impl McpCore {
     /// there is no offer to revoke.
     pub async fn stop_beam(&self, hash: Option<&str>) -> Result<Vec<OfferSummary>, String> {
         let Some(node) = self.booted() else {
+            // "No offers" and "I could not look" are different answers, and
+            // only one of them means the caller's link is dead.
+            if let Some(e) = self.last_boot_error() {
+                return Err(format!("cannot check beam links: {e}"));
+            }
             return Ok(Vec::new());
         };
         let live = node.offers.list();
@@ -482,13 +517,18 @@ impl McpCore {
     /// Every paired device. With `probe`, each one is dialed once to report
     /// live presence; without it, presence is "online" only for a session
     /// this process already holds.
-    pub async fn list_devices(&self, probe: bool) -> Vec<DeviceInfo> {
+    pub async fn list_devices(&self, probe: bool) -> Result<Vec<DeviceInfo>, String> {
         let peers = self.peers.list();
         // Pay the lazy endpoint boot ONCE, outside the per-device probe budget.
         // Otherwise the first probe on a cold server spends its whole timeout
         // on bind + relay + store load and reports a reachable device offline.
+        //
+        // A boot that FAILS is the answer, not a detail to swallow: every
+        // probe below would then dial through the same failure and report
+        // "offline", sending the user to debug phones and networks over a
+        // fault that is neither. Say the real reason once.
         if probe {
-            let _ = self.node().await;
+            self.node().await?;
         }
         // The probes run TOGETHER. Dialed one after another, a fleet where
         // three devices are asleep costs three PROBE_TIMEOUTs before the list
@@ -496,7 +536,7 @@ impl McpCore {
         // many devices are paired.
         let presence =
             join_all(peers.iter().map(|peer| self.presence(peer, probe))).await;
-        peers
+        Ok(peers
             .into_iter()
             .zip(presence)
             .map(|(peer, presence)| DeviceInfo {
@@ -508,7 +548,7 @@ impl McpCore {
                 last_seen: peer.last_seen,
                 presence,
             })
-            .collect()
+            .collect())
     }
 
     async fn presence(&self, peer: &Peer, probe: bool) -> &'static str {
@@ -755,6 +795,7 @@ impl McpCore {
             identity_dir: self.dirs.remote(),
             state_dir: self.dirs.base().to_path_buf(),
             booted: node.is_some(),
+            boot_error: node.is_none().then(|| self.last_boot_error()).flatten(),
             uptime_secs: self.started.elapsed().as_secs(),
             paired_devices: self.peers.list().len(),
             active_offers,
