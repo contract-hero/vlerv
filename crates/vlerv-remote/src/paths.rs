@@ -120,6 +120,35 @@ pub fn create_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     write_private_inner(path, bytes, true)
 }
 
+/// `write_private`, made crash-safe: stage the bytes beside `path` under the
+/// same name plus `.tmp`, then rename over the target. The one atomic writer
+/// for this crate's 0600 documents — peers.json and every outbox record —
+/// because a half-written capability document is a peer list missing the
+/// machine that was just paired, or a queued send naming no peer at all.
+///
+/// THE STAGING NAME IS LOAD-BEARING. `outbox::Spool::read` skips what a crash
+/// leaves behind by testing the LAST extension of every name in the
+/// directory, so a `<id>.json.tmp` leftover is passed over while a name
+/// ending in `.json` would be read back as a record.
+///
+/// The parent directory is created here rather than at each call site, which
+/// is where both writers did it before. It is not redundant for the spool:
+/// the outbox directory is made by `outbox::Outbox::enqueue` and by nothing
+/// else, so an attempt recorded after the state directory was cleared out
+/// from under a running server restores the file instead of failing.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+    }
+    // Appended, not `with_extension`: that would REPLACE `.json`, and both
+    // documents are read back by a rule that keys off the extension.
+    let mut staging = path.as_os_str().to_os_string();
+    staging.push(".tmp");
+    let tmp = PathBuf::from(staging);
+    write_private(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {path:?}: {e}"))
+}
+
 #[cfg(unix)]
 fn write_private_inner(path: &Path, bytes: &[u8], exclusive: bool) -> Result<(), String> {
     use std::io::Write;
@@ -134,11 +163,12 @@ fn write_private_inner(path: &Path, bytes: &[u8], exclusive: bool) -> Result<(),
     let mut f = options
         .open(path)
         .map_err(|e| format!("cannot create {path:?}: {e}"))?;
-    // `mode` applies at CREATION only. The non-exclusive path is the
-    // `peers.json.tmp` staging file, which a crash between write and rename can
-    // leave behind: reopening it would keep whatever mode it already had. Set
-    // the mode on the open handle so the renamed file is 0600 either way — it
-    // names the machines this install trusts.
+    // `mode` applies at CREATION only. The non-exclusive path is the `.tmp`
+    // staging file `write_private_atomic` writes, which a crash between write
+    // and rename can leave behind: reopening it would keep whatever mode it
+    // already had. Set the mode on the open handle so the renamed file is 0600
+    // either way — it names the machines this install trusts, or a file one of
+    // them may fetch.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("cannot restrict {path:?}: {e}"))?;
     f.write_all(bytes).map_err(|e| e.to_string())

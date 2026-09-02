@@ -36,6 +36,11 @@ base64 = "0.22"
 # request gate and the RootSet path gate. Every iroh type stays inside it
 # (pins included), so this crate holds the Tauri layer and nothing else.
 vlerv-remote = { path = "../crates/vlerv-remote" }
+# Only for `join_all`: the iOS foreground hop re-dials every paired peer at
+# once, so the hop bounds at about one connect timeout rather than one per
+# sleeping device. Already in this crate's tree through iroh, so it is a
+# direct name for a crate that was being compiled either way.
+futures-util = "0.3"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 
 # ── macOS-only surface ──────────────────────────────────────────────────────

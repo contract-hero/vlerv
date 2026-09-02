@@ -432,12 +432,7 @@ impl PeerStore {
         }
         let doc = PeersDoc { v: PEERS_SCHEMA, peers: peers.to_vec() };
         let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        paths::write_private(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("cannot write {:?}: {e}", self.path))
+        paths::write_private_atomic(&self.path, json.as_bytes())
     }
 }
 

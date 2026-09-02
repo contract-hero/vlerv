@@ -32,7 +32,7 @@
 // from memory whose file stays comes back at the next boot with its pin
 // already released, which is a delivery that can never succeed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -44,7 +44,7 @@ use crate::beam::human_bytes;
 use crate::paths;
 use crate::peers::now_unix;
 
-/// On-disk schema version of ONE record. Versioned per file rather than per
+/// On-disk schema version of one record. Versioned per file rather than per
 /// spool: a document written by a newer build must be left alone, and a whole
 /// list would make one such document hide every other pending send.
 pub const OUTBOX_SCHEMA: u32 = 1;
@@ -79,12 +79,12 @@ pub const RECORD_TTL_SECS: u64 = 7 * 24 * 3600;
 /// observation of who talks to whom.
 pub const DRAIN_TICK: Duration = Duration::from_secs(60);
 
-/// Records one pass may push to ONE peer. A bound, not a batch size: a pass
+/// Records one pass may push to one peer. A bound, not a batch size: a pass
 /// that tried to empty a full spool down one session would hold that peer for
 /// minutes and starve every other one.
 pub const MAX_PER_PASS: usize = 8;
 
-/// The tag that pins one record's bytes. THE one deriver: `stage_outbox`
+/// The tag that pins one record's bytes. The one deriver: `stage_outbox`
 /// names the pin with it before the record exists, `enqueue` stores what it
 /// returns, and the sweep's keep-set is built from the stored names — so a
 /// record and the tag holding its bytes cannot drift apart.
@@ -150,10 +150,10 @@ pub struct Staged {
 
 /// Everything one directory read produced, replaced as a unit by `reload`.
 ///
-/// The report fields sit under the SAME lock as the records because they are
-/// read together: a keep-set built from a fresh record list and a stale
-/// quarantine list would unpin bytes belonging to a file this build could not
-/// parse.
+/// The report list sits under the same lock as the records because the two
+/// are read together: a keep-set built from a fresh record list and a stale
+/// unaccounted list would unpin bytes belonging to a file this build could
+/// not parse.
 #[derive(Default)]
 struct Spool {
     records: BTreeMap<String, Record>,
@@ -161,16 +161,33 @@ struct Spool {
     /// stands, `enqueue` refuses (so a caller reports a hard error instead of
     /// a false promise) and `live_tags` answers `None` (so no sweep runs).
     load_error: Option<String>,
-    /// Stems this build could not parse, quarantined to `.broken.<unix>`.
-    /// Rebuilt from the moved-aside files themselves on every read, so the
-    /// list does not empty out on the second one.
-    quarantined: Vec<String>,
-    /// Stems whose schema version this build does not write.
-    foreign: Vec<String>,
-    /// Stems whose file would not READ this time — not corrupt, just not
-    /// available to this process right now. Left untouched so a later boot
-    /// can pick the delivery back up.
-    io_faults: Vec<String>,
+    /// Every stem this build could not put on the record list above: parsed
+    /// and quarantined to `.broken.<unix>`, written by a schema this build
+    /// does not read, or not readable at all this time round.
+    ///
+    /// ONE list, because every consumer wants exactly that union — the tag
+    /// keep-set, the id counter and the status surface each take all of it.
+    /// Kept apart, a fourth cause reaches only the lists somebody remembered
+    /// to widen, and a stem missing from `live_tags` unpins a pending send
+    /// with no error anywhere. `Fault` still separates the three where the
+    /// difference is real: it decides what happens to the file and what the
+    /// operator is told.
+    ///
+    /// Rebuilt from the directory on every read, the moved-aside files
+    /// included, so the list does not empty out on the second one.
+    unaccounted: Vec<String>,
+}
+
+/// One consistent read of the spool: what is pending, what could not be
+/// accounted for, and why the directory did not load. `Outbox::report` is the
+/// only producer, and the three fields leave the lock together.
+pub struct Report {
+    /// Every pending record, in id order. Same list `Outbox::list` returns.
+    pub records: Vec<Record>,
+    /// Same list `Outbox::unaccounted` returns.
+    pub unaccounted: Vec<String>,
+    /// Same value `Outbox::load_error` returns.
+    pub load_error: Option<String>,
 }
 
 /// Why one record file did not become a live record. All three answers keep
@@ -252,31 +269,51 @@ impl Outbox {
         self.guard().load_error.clone()
     }
 
-    /// Stems moved aside as `<id>.json.broken.<unix>`. Counted and surfaced
-    /// so an unparseable record is a visible fact rather than a delivery that
-    /// silently never happens.
-    pub fn quarantined(&self) -> Vec<String> {
-        self.guard().quarantined.clone()
-    }
-
-    /// Stems written by a newer schema. Left byte-for-byte alone: the build
-    /// that wrote them is the one that can finish them.
-    pub fn foreign(&self) -> Vec<String> {
-        self.guard().foreign.clone()
-    }
-
-    /// Stems whose file would not read this time. Surfaced beside `foreign`
-    /// and for the same reason: the record is not on the pending list, so a
-    /// caller that did not report it would show a delivery as simply gone.
-    /// The file is untouched, so the next boot may well read it.
-    pub fn io_faults(&self) -> Vec<String> {
-        self.guard().io_faults.clone()
+    /// Stems this build could not account for: moved aside as
+    /// `<id>.json.broken.<unix>`, written by a newer schema and left
+    /// byte-for-byte alone, or unreadable this time and also left alone so a
+    /// later boot can pick the delivery back up.
+    ///
+    /// Named rather than counted, and surfaced rather than logged once: none
+    /// of them is on the pending list, so a caller that stayed silent would
+    /// show a delivery the user was promised as simply gone.
+    pub fn unaccounted(&self) -> Vec<String> {
+        self.guard().unaccounted.clone()
     }
 
     /// Every pending record, in id order — which is enqueue order, because
     /// the id starts with the millisecond it was accepted at.
     pub fn list(&self) -> Vec<Record> {
         self.guard().records.values().cloned().collect()
+    }
+
+    /// Everything a status surface reports about the spool, read under ONE
+    /// lock.
+    ///
+    /// The three answers are shown side by side, so they must come from one
+    /// picture of the directory: `list`, `unaccounted` and `load_error` taken
+    /// in turn each re-lock, and a `reload` between two of them lets a status
+    /// name a record on the pending list AND on the unaccounted list, or
+    /// report an empty queue beside no reason for it. It is the same argument
+    /// the caller already makes when it sums the queued bytes from the list
+    /// it just built rather than asking the spool a second time.
+    pub fn report(&self) -> Report {
+        let spool = self.guard();
+        Report {
+            records: spool.records.values().cloned().collect(),
+            unaccounted: spool.unaccounted.clone(),
+            load_error: spool.load_error.clone(),
+        }
+    }
+
+    /// The peers holding at least one pending record, deduplicated by the
+    /// set itself. What a drain pass groups by, and it reads the peer field
+    /// ALONE on purpose: `list` deep-clones every record — five Strings and a
+    /// PathBuf each — and a pass that then looks at nothing but `record.peer`
+    /// throws all of that away, on every idle tick as much as on a
+    /// delivering one.
+    pub fn pending_peers(&self) -> BTreeSet<String> {
+        self.guard().records.values().map(|r| r.peer.clone()).collect()
     }
 
     /// The records queued for one peer, in id order. The drain groups by peer
@@ -509,9 +546,7 @@ impl Outbox {
             return None;
         }
         let mut tags: Vec<String> = spool.records.values().map(|r| r.tag.clone()).collect();
-        tags.extend(spool.quarantined.iter().map(|stem| tag_name(stem)));
-        tags.extend(spool.foreign.iter().map(|stem| tag_name(stem)));
-        tags.extend(spool.io_faults.iter().map(|stem| tag_name(stem)));
+        tags.extend(spool.unaccounted.iter().map(|stem| tag_name(stem)));
         Some(tags)
     }
 
@@ -542,12 +577,7 @@ impl Outbox {
     fn save_record(&self, record: &Record) -> Result<(), String> {
         let doc = RecordDoc { v: OUTBOX_SCHEMA, record: record.clone() };
         let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("cannot create {:?}: {e}", self.dir))?;
-        let path = self.path_of(&record.id);
-        let tmp = path.with_extension("json.tmp");
-        paths::write_private(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {path:?}: {e}"))
+        paths::write_private_atomic(&self.path_of(&record.id), json.as_bytes())
     }
 }
 
@@ -613,7 +643,7 @@ impl Spool {
             // `queue_unreadable` list, which is the only place a human hears
             // about the delivery at all.
             if let Some(stem) = broken_stem(name) {
-                spool.quarantined.push(stem.to_string());
+                spool.unaccounted.push(stem.to_string());
                 continue;
             }
             // Records only. This also skips what a crash leaves behind — a
@@ -634,14 +664,14 @@ impl Spool {
                         "vlerv: remote: outbox record {stem} is schema v{v} but this build \
                          reads v{OUTBOX_SCHEMA} — leaving it alone, and keeping its staged bytes"
                     );
-                    spool.foreign.push(stem);
+                    spool.unaccounted.push(stem);
                 }
                 Err(Fault::Io(why)) => {
                     eprintln!(
                         "vlerv: remote: outbox record {stem} could not be read ({why}) — leaving \
                          it alone, and keeping its staged bytes; a later boot retries it"
                     );
-                    spool.io_faults.push(stem);
+                    spool.unaccounted.push(stem);
                 }
                 Err(Fault::Unreadable(why)) => {
                     eprintln!(
@@ -649,20 +679,18 @@ impl Spool {
                          aside; it is never replayed and never rewritten"
                     );
                     quarantine(&path);
-                    spool.quarantined.push(stem);
+                    spool.unaccounted.push(stem);
                 }
             }
         }
         // read_dir yields whatever order the filesystem likes; the records
-        // are sorted by the map, and these three are reported to a human.
-        spool.quarantined.sort();
+        // are sorted by the map, and this list is reported to a human.
+        spool.unaccounted.sort();
         // One stem, one entry. A clock that went backwards can hand a stem
-        // whose file was already moved aside back to `enqueue`, so a second
-        // `.broken.<unix>` for one stem is reachable, and naming the same
-        // dead delivery twice would read as two.
-        spool.quarantined.dedup();
-        spool.foreign.sort();
-        spool.io_faults.sort();
+        // whose file was already moved aside back to `enqueue`, so one stem
+        // can own both a `.broken.<unix>` file and an `<id>.json`, and naming
+        // the same dead delivery twice would read as two.
+        spool.unaccounted.dedup();
         spool
     }
 }
@@ -737,7 +765,7 @@ fn quarantine(path: &Path) {
 /// no id this process mints can repeat one — two ids differ as soon as their
 /// counters do, whatever the clock says about the millisecond half.
 ///
-/// EVERY stem counts, not just the live records. A quarantined, foreign or
+/// Every stem counts, not just the live records. A quarantined, foreign or
 /// unreadable-this-time file keeps its `outbox/<id>` pin in the keep-set, and
 /// re-minting one of those ids is the worse half of the collision: the file
 /// is named `<id>.json.broken.<unix>` or holds a schema this build will not
@@ -748,9 +776,7 @@ fn next_seq_after(spool: &Spool) -> u64 {
     spool
         .records
         .keys()
-        .chain(spool.quarantined.iter())
-        .chain(spool.foreign.iter())
-        .chain(spool.io_faults.iter())
+        .chain(spool.unaccounted.iter())
         .filter_map(|stem| seq_of(stem))
         .max()
         .map_or(0, |seq| seq.saturating_add(1))
@@ -917,6 +943,32 @@ mod tests {
     }
 
     #[test]
+    fn the_drain_gets_one_entry_per_peer_and_no_record_clone() {
+        // A dial to a sleeping phone costs DIAL_TIMEOUT, so a pass groups by
+        // peer: five records for one device must cost one dial. The peer
+        // field is all that grouping reads, and `list` would clone five
+        // Strings and a PathBuf per record to hand it over.
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = spool(&dir);
+        for (peer, device) in [("nodeA", "iPhone"), ("nodeB", "iPad"), ("nodeA", "iPhone")] {
+            let id = out.next_id();
+            out.enqueue(staged(&id, peer, device, 10)).unwrap();
+        }
+        assert_eq!(
+            out.pending_peers(),
+            BTreeSet::from(["nodeA".to_string(), "nodeB".to_string()]),
+            "two devices, three records"
+        );
+
+        // A peer with nothing left is not on the list, or the pass would dial
+        // a device it owes nothing.
+        for id in out.for_peer("nodeB").iter().map(|r| r.id.clone()) {
+            out.complete(&id).unwrap();
+        }
+        assert_eq!(out.pending_peers(), BTreeSet::from(["nodeA".to_string()]));
+    }
+
+    #[test]
     fn an_expired_record_leaves_and_hands_its_pin_back() {
         let dir = tempfile::TempDir::new().unwrap();
         let out = spool(&dir);
@@ -988,8 +1040,11 @@ mod tests {
         std::fs::write(outbox_dir.join("0000000000000-0031.json"), r#"{"v":99}"#).unwrap();
 
         let next = spool(&dir);
-        assert_eq!(next.quarantined(), vec!["0000000000000-0007".to_string()]);
-        assert_eq!(next.foreign(), vec!["0000000000000-0031".to_string()]);
+        assert_eq!(
+            next.unaccounted(),
+            vec!["0000000000000-0007".to_string(), "0000000000000-0031".to_string()],
+            "the unparseable stem and the newer-schema one are both ids no run may re-mint"
+        );
         for id in (0..4).map(|_| next.next_id()) {
             assert!(
                 seq_of(&id).unwrap() > 31,
@@ -1048,7 +1103,7 @@ mod tests {
         let reloaded = spool(&dir);
         assert_eq!(reloaded.list().len(), 1, "one bad record poisons one delivery, not the spool");
         assert_eq!(reloaded.list()[0].id, good);
-        assert_eq!(reloaded.quarantined(), vec!["0000000000001-0099".to_string()]);
+        assert_eq!(reloaded.unaccounted(), vec!["0000000000001-0099".to_string()]);
         assert!(reloaded.load_error().is_none(), "one bad file is not an unreadable directory");
 
         // Moved aside, not deleted, and not re-read on the next load.
@@ -1065,7 +1120,7 @@ mod tests {
         // Read again: the file has already been moved, so it is counted from
         // its `.broken.<unix>` name and NOT moved a second time.
         let again = spool(&dir);
-        assert_eq!(again.quarantined(), vec!["0000000000001-0099".to_string()]);
+        assert_eq!(again.unaccounted(), vec!["0000000000001-0099".to_string()]);
         let still: Vec<PathBuf> = std::fs::read_dir(&outbox_dir)
             .unwrap()
             .flatten()
@@ -1077,7 +1132,7 @@ mod tests {
 
     #[test]
     fn a_quarantined_stem_survives_every_later_read_and_keeps_its_pin() {
-        // THE STEM IS THE ONLY THING KEEPING THE BYTES. `Drainer::reconcile`
+        // The stem is the only thing keeping the bytes. `Drainer::reconcile`
         // reloads the spool and then builds the sweep keep-set from
         // `live_tags`, so a quarantine that only counted on the read that
         // moved the file aside left the stem out of the keep-set on the very
@@ -1094,11 +1149,11 @@ mod tests {
         // Read one moves it aside. Reads two and three see only the moved
         // file, which is exactly what a second process and a later boot see.
         let first = spool(&dir);
-        assert_eq!(first.quarantined(), vec!["0000000000001-0099".to_string()]);
+        assert_eq!(first.unaccounted(), vec!["0000000000001-0099".to_string()]);
         for read in 2..=3 {
             let later = spool(&dir);
             assert_eq!(
-                later.quarantined(),
+                later.unaccounted(),
                 vec!["0000000000001-0099".to_string()],
                 "read {read} must still name the dead delivery"
             );
@@ -1112,7 +1167,7 @@ mod tests {
         // And `reload` on a spool that is already open answers the same, which
         // is the call `reconcile` actually makes before it sweeps.
         out.reload();
-        assert_eq!(out.quarantined(), vec!["0000000000001-0099".to_string()]);
+        assert_eq!(out.unaccounted(), vec!["0000000000001-0099".to_string()]);
         assert!(out
             .live_tags()
             .expect("a clean load answers")
@@ -1133,7 +1188,7 @@ mod tests {
         }
 
         let out = spool(&dir);
-        assert!(out.quarantined().is_empty(), "none of those names a record");
+        assert!(out.unaccounted().is_empty(), "none of those names a record");
         assert_eq!(out.live_tags(), Some(Vec::new()));
     }
 
@@ -1148,19 +1203,17 @@ mod tests {
 
         let out = spool(&dir);
         assert!(out.is_empty(), "a record this build cannot read is not a delivery it can make");
-        assert_eq!(out.foreign(), vec!["0000000000002-0000".to_string()]);
+        assert_eq!(out.unaccounted(), vec!["0000000000002-0000".to_string()]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), future, "never rewritten, never moved");
     }
 
     #[test]
     fn a_record_that_will_not_read_is_left_alone_for_a_later_boot() {
-        // AN I/O ERROR IS NOT CORRUPTION, and the difference is a delivery.
-        // A backup restore that changes the owner, a permissions repair that
-        // leaves EACCES, a bad sector that answers EIO: the record behind the
-        // file may be perfectly valid, and renaming it to `.broken.<unix>`
-        // abandons a promised send over a condition that passes on its own.
+        // Pins the rule stated on `read_record`: an I/O error is not
+        // corruption. Quarantining a record over one abandons a promised send
+        // that the next boot could still make.
         //
-        // A DIRECTORY where a record file belongs produces exactly that
+        // A directory where a record file belongs produces exactly that
         // failure — `read_dir` lists it, `read_to_string` answers EISDIR —
         // without the test having to depend on the uid it runs as.
         let dir = tempfile::TempDir::new().unwrap();
@@ -1173,8 +1226,7 @@ mod tests {
         let reloaded = spool(&dir);
         assert_eq!(depth(&reloaded), 1, "one unreadable file poisons one delivery");
         assert_eq!(reloaded.list()[0].id, good);
-        assert!(reloaded.quarantined().is_empty(), "it is not corrupt, so it is not moved aside");
-        assert_eq!(reloaded.io_faults(), vec!["0000000000007-0000".to_string()]);
+        assert_eq!(reloaded.unaccounted(), vec!["0000000000007-0000".to_string()]);
         assert!(reloaded.load_error().is_none(), "one bad file is not an unreadable directory");
 
         // Untouched, so the boot that can read it still finds it under the
@@ -1208,7 +1260,7 @@ mod tests {
 
         let reloaded = spool(&dir);
         assert!(reloaded.is_empty());
-        assert_eq!(reloaded.quarantined(), vec![id]);
+        assert_eq!(reloaded.unaccounted(), vec![id]);
     }
 
     #[test]

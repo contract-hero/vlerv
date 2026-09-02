@@ -70,7 +70,7 @@ fn device_identity(dir: &std::path::Path) -> String {
 ///
 /// A device that is really suspended costs `DIAL_TIMEOUT` — thirty seconds —
 /// to give up on, which is half a minute of test time per queued send. This
-/// fails the SAME `endpoint::dial` in milliseconds and produces the SAME
+/// fails the same `endpoint::dial` in milliseconds and produces the same
 /// `ConnectError::Unreachable`, which is the one input the decision to queue
 /// reads.
 ///
@@ -108,6 +108,67 @@ async fn queue_while_asleep(
             panic!("a device that did not answer must never be reported delivered: {landed:?}")
         }
     }
+}
+
+/// The four temporary directories the stage below stands on, in ONE field so
+/// that a test which reads only some of them still keeps all of them. A
+/// `TempDir` deletes its tree when it drops, and the sleeping node, the spool
+/// and the artifact are all sitting inside these.
+struct StageDirs {
+    /// The receiving device's: its identity key, its peer store, and where an
+    /// artifact lands once it wakes.
+    host: tempfile::TempDir,
+    /// The server's: the spool, the blob store and the identity. The proofs
+    /// that survive a process reopen this one with a SECOND core.
+    mcp: tempfile::TempDir,
+    /// The one root the server may send from, holding the artifact.
+    workspace: tempfile::TempDir,
+    /// The sleeping twin's own, which `boot_asleep` explains may not be the
+    /// host's. No test names it; it is here to outlive the node.
+    _asleep: tempfile::TempDir,
+}
+
+/// The stage every queue proof opens on, because none of them can say a word
+/// until all of it is standing: a workspace holding one artifact, a device
+/// that does not answer, and both peer stores paired at control.
+struct Asleep {
+    dirs: StageDirs,
+    artifact: std::path::PathBuf,
+    core: McpCore,
+    asleep: endpoint::RemoteNode,
+    phone_id: String,
+}
+
+/// Build that stage, with `body` as the artifact's contents — the one part
+/// each proof wants its own copy of, because the bytes and the size are what
+/// it goes on to assert landed.
+async fn asleep_fixture(body: &str) -> Asleep {
+    let host = tempfile::TempDir::new().unwrap();
+    let asleep_dir = tempfile::TempDir::new().unwrap();
+    let mcp = tempfile::TempDir::new().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let artifact = workspace.path().join("report.html");
+    std::fs::write(&artifact, body).unwrap();
+
+    // The identity is minted before the twin boots, because both peer stores
+    // have to name the device while it is still down.
+    let phone_id = device_identity(host.path());
+    let asleep = boot_asleep(asleep_dir.path(), host.path()).await;
+
+    let core = McpCore::new(
+        mcp.path().to_path_buf(),
+        vec![workspace.path().to_path_buf()],
+        workspace.path().to_path_buf(),
+        None,
+    );
+    // Both peer stores at control, the way `confirm_pairing` writes them.
+    let phone_peers = PeerStore::load(host.path());
+    core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+    phone_peers.seed(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
+
+    let dirs = StageDirs { host, mcp, workspace, _asleep: asleep_dir };
+    Asleep { dirs, artifact, core, asleep, phone_id }
 }
 
 impl Host {
@@ -171,15 +232,21 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
 
     // ── The device grants control; the very next call re-handshakes ─────────
     host.peers.set_scope(&mcp_id, Scope::Control).unwrap();
-    let delivery = delivered(
-        core.send_to_device(artifact.to_str().unwrap(), "iPhone")
-            .await
-            .expect("a control grant lets the push land"),
-    );
-    assert_eq!(delivery.name, "report.html");
-    assert_eq!(delivery.size, body.len() as u64, "the receiver reports the bytes it measured");
-    assert_eq!(delivery.device, "Val's iPhone");
-    assert_eq!(delivery.node_id, host.node_id());
+    let delivery = core
+        .send_to_device(artifact.to_str().unwrap(), "iPhone")
+        .await
+        .expect("a control grant lets the push land");
+    // WHICH answer came back is itself an assertion, here and at both sites
+    // below: a queued send that read as a delivered one is the exact failure
+    // the tagged answer exists to make impossible, and a test that shrugged
+    // at it would let it back in.
+    let Delivery::Delivered { device, node_id, name, size, hash } = delivery else {
+        panic!("expected a delivery, got a queued send: {delivery:?}")
+    };
+    assert_eq!(name, "report.html");
+    assert_eq!(size, body.len() as u64, "the receiver reports the bytes it measured");
+    assert_eq!(device, "Val's iPhone");
+    assert_eq!(node_id, host.node_id());
 
     // The session this first successful send established. Every later send
     // must reuse it — checked once the sends are done.
@@ -188,22 +255,29 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
 
     let landed = host.received();
     assert_eq!(landed.len(), 1, "the host surfaced exactly one artifact");
-    let (from, path, name, size, hash) = &landed[0];
+    let (from, path, landed_name, landed_size, landed_hash) = &landed[0];
     assert_eq!(from, &mcp_id, "the signal names the MCP server as the sender");
-    assert_eq!(name, "report.html");
-    assert_eq!(*size, body.len() as u64);
-    assert_eq!(hash, &delivery.hash, "both sides verified the same content address");
+    assert_eq!(landed_name, "report.html");
+    assert_eq!(*landed_size, body.len() as u64);
+    assert_eq!(landed_hash, &hash, "both sides verified the same content address");
     assert_eq!(std::fs::read_to_string(path).unwrap(), body, "verified bytes landed");
     assert!(path.starts_with(host.dirs.received()), "it landed in the host's own state dir");
 
     // A second send of the same file gets a fresh name on the receiving side —
     // the Beam collision rule, because it IS the Beam landing path.
-    let again = delivered(core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap());
-    assert_eq!(again.name, "report-2.html");
+    let again = core.send_to_device(artifact.to_str().unwrap(), "iPhone").await.unwrap();
+    let Delivery::Delivered { name: again_name, .. } = again else {
+        panic!("expected a delivery, got a queued send: {again:?}")
+    };
+    assert_eq!(again_name, "report-2.html");
 
     // ── A node-id prefix names the same device ─────────────────────────────
-    let by_prefix = core.send_to_device(artifact.to_str().unwrap(), &host.node_id()[..8]).await;
-    assert_eq!(delivered(by_prefix.unwrap()).node_id, host.node_id());
+    let by_prefix =
+        core.send_to_device(artifact.to_str().unwrap(), &host.node_id()[..8]).await.unwrap();
+    let Delivery::Delivered { node_id: by_prefix_node, .. } = by_prefix else {
+        panic!("expected a delivery, got a queued send: {by_prefix:?}")
+    };
+    assert_eq!(by_prefix_node, host.node_id());
 
     // ── The path policy is the share sheet's, not a wider one ──────────────
     let missing = workspace.path().join("nope.html");
@@ -255,38 +329,18 @@ async fn send_to_device_lands_a_verified_artifact_on_a_paired_host() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes() {
-    // THE PROOF THE WHOLE QUEUE EXISTS FOR. A file is sent to a device that
+    // The proof the whole queue exists for. A file is sent to a device that
     // does not answer; the tool says so instead of failing, and when that
     // same device — same identity key, same node id, new address — comes
     // back, the bytes captured at the moment of the send land there
     // verified, with nobody asking again.
-    let host_dir = tempfile::TempDir::new().unwrap();
-    let asleep_dir = tempfile::TempDir::new().unwrap();
-    let mcp_dir = tempfile::TempDir::new().unwrap();
-    let workspace = tempfile::TempDir::new().unwrap();
-
-    let artifact = workspace.path().join("report.html");
     let body = "<!doctype html><h1>written while the phone was asleep</h1>".repeat(16);
-    std::fs::write(&artifact, &body).unwrap();
-
-    let phone_id = device_identity(host_dir.path());
-    let asleep = boot_asleep(asleep_dir.path(), host_dir.path()).await;
-
-    let core = McpCore::new(
-        mcp_dir.path().to_path_buf(),
-        vec![workspace.path().to_path_buf()],
-        workspace.path().to_path_buf(),
-        None,
-    );
-    // Both peer stores at control, the way `confirm_pairing` writes them.
-    let phone_peers = PeerStore::load(host_dir.path());
-    core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-    phone_peers.seed(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
+    let Asleep { dirs, artifact, core, asleep, phone_id } = asleep_fixture(&body).await;
 
     // ── Accepted, and nothing has arrived anywhere ─────────────────────────
     let (id, hash) = queue_while_asleep(&core, &asleep, &artifact).await;
     assert!(
-        !Dirs::new(host_dir.path()).received().exists(),
+        !Dirs::new(dirs.host.path()).received().exists(),
         "a queued send has landed nowhere — that is what queued MEANS"
     );
     assert_eq!(core.server_status().await.unwrap().queued_total, 1);
@@ -297,7 +351,7 @@ async fn a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes() {
     // node id.
     asleep.router.shutdown().await.ok();
     drop(asleep);
-    let phone = boot_host(host_dir.path(), "Val's iPhone").await;
+    let phone = boot_host(dirs.host.path(), "Val's iPhone").await;
     assert_eq!(phone.node_id(), phone_id, "the same device, so the record still names it");
     // Read LIVE by the drain, which has been running since the send booted
     // this server: a device that comes back at another address is the case.
@@ -315,7 +369,7 @@ async fn a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes() {
     assert_eq!(*size, body.len() as u64, "the device reports the bytes it measured");
     assert_eq!(landed_hash, &hash, "the copy taken at enqueue is the copy that was verified");
     assert_eq!(std::fs::read_to_string(path).unwrap(), body);
-    assert!(path.starts_with(Dirs::new(host_dir.path()).received()));
+    assert!(path.starts_with(Dirs::new(dirs.host.path()).received()));
 
     // ── And the promise is retired, record and pin ─────────────────────────
     assert!(
@@ -326,7 +380,7 @@ async fn a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes() {
     assert_eq!(status.queued_bytes, 0);
     assert_eq!(status.retained_bytes, 0, "the private copy is no longer owed to anybody");
     assert!(
-        !Dirs::new(mcp_dir.path()).outbox().join(format!("{id}.json")).exists(),
+        !Dirs::new(dirs.mcp.path()).outbox().join(format!("{id}.json")).exists(),
         "the record file goes with the delivery, or the next boot replays it"
     );
 
@@ -335,7 +389,7 @@ async fn a_send_to_a_sleeping_device_is_accepted_and_lands_when_it_wakes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_dials_in_delivers_its_own_queue_without_being_asked() {
-    // THE WAKE SIGNAL, END TO END. Nothing here calls `wake_drain` and
+    // The wake signal, end to end. Nothing here calls `wake_drain` and
     // nothing waits for a timer: the device comes back, dials THIS server the
     // way the app does when it returns to the foreground, and the file it was
     // owed goes out because of that connection alone.
@@ -344,26 +398,8 @@ async fn a_device_that_dials_in_delivers_its_own_queue_without_being_asked() {
     // that found the device asleep armed the first rung of the retry ladder,
     // so no timer pass would dial this peer for sixty seconds, and the tick
     // is sixty seconds away as well — while `wait_until` gives up after five.
-    let host_dir = tempfile::TempDir::new().unwrap();
-    let asleep_dir = tempfile::TempDir::new().unwrap();
-    let mcp_dir = tempfile::TempDir::new().unwrap();
-    let workspace = tempfile::TempDir::new().unwrap();
-    let artifact = workspace.path().join("report.html");
     let body = "<h1>written while the phone was locked</h1>";
-    std::fs::write(&artifact, body).unwrap();
-
-    let phone_id = device_identity(host_dir.path());
-    let asleep = boot_asleep(asleep_dir.path(), host_dir.path()).await;
-
-    let core = McpCore::new(
-        mcp_dir.path().to_path_buf(),
-        vec![workspace.path().to_path_buf()],
-        workspace.path().to_path_buf(),
-        None,
-    );
-    let phone_peers = PeerStore::load(host_dir.path());
-    core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-    phone_peers.seed(&core.node_id().unwrap(), core.device(), Scope::Control).unwrap();
+    let Asleep { dirs, artifact, core, asleep, phone_id: _ } = asleep_fixture(body).await;
 
     let (_, hash) = queue_while_asleep(&core, &asleep, &artifact).await;
     assert_eq!(core.server_status().await.unwrap().queued_total, 1);
@@ -371,7 +407,7 @@ async fn a_device_that_dials_in_delivers_its_own_queue_without_being_asked() {
     // ── The device comes back and connects, as it does on resume ───────────
     asleep.router.shutdown().await.ok();
     drop(asleep);
-    let phone = boot_host(host_dir.path(), "Val's iPhone").await;
+    let phone = boot_host(dirs.host.path(), "Val's iPhone").await;
     core.use_loopback(endpoint::loopback_socket(&phone.node).await.unwrap());
     assert!(phone.received().is_empty(), "an address alone delivers nothing");
 
@@ -409,26 +445,8 @@ async fn a_spooled_delivery_survives_the_process_that_accepted_it() {
     // The queued answer promises the user that the file goes out at the
     // first network-touching tool call of a LATER session over the same
     // state directory. This is that sentence, tested.
-    let host_dir = tempfile::TempDir::new().unwrap();
-    let asleep_dir = tempfile::TempDir::new().unwrap();
-    let mcp_dir = tempfile::TempDir::new().unwrap();
-    let workspace = tempfile::TempDir::new().unwrap();
-    let artifact = workspace.path().join("report.html");
     let body = "<h1>accepted by a session that is now gone</h1>";
-    std::fs::write(&artifact, body).unwrap();
-
-    let phone_id = device_identity(host_dir.path());
-    let asleep = boot_asleep(asleep_dir.path(), host_dir.path()).await;
-
-    let accepted = McpCore::new(
-        mcp_dir.path().to_path_buf(),
-        vec![workspace.path().to_path_buf()],
-        workspace.path().to_path_buf(),
-        None,
-    );
-    let phone_peers = PeerStore::load(host_dir.path());
-    accepted.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-    phone_peers.seed(&accepted.node_id().unwrap(), accepted.device(), Scope::Control).unwrap();
+    let Asleep { dirs, artifact, core: accepted, asleep, phone_id } = asleep_fixture(body).await;
 
     let (id, hash) = queue_while_asleep(&accepted, &asleep, &artifact).await;
     let promised = accepted.server_status().await.unwrap().queued[0].clone();
@@ -436,9 +454,9 @@ async fn a_spooled_delivery_survives_the_process_that_accepted_it() {
 
     // ── A SECOND server over the same state directory ──────────────────────
     let next = McpCore::new(
-        mcp_dir.path().to_path_buf(),
-        vec![workspace.path().to_path_buf()],
-        workspace.path().to_path_buf(),
+        dirs.mcp.path().to_path_buf(),
+        vec![dirs.workspace.path().to_path_buf()],
+        dirs.workspace.path().to_path_buf(),
         None,
     );
     let status = next.server_status().await.unwrap();
@@ -447,7 +465,7 @@ async fn a_spooled_delivery_survives_the_process_that_accepted_it() {
     assert!(!status.draining, "nothing has booted here, so nothing is moving it");
     // The pin the record names has to survive with it: without the tag, the
     // bytes are the next sweep's orphan and the delivery cannot happen.
-    let on_disk = Outbox::load(&Dirs::new(mcp_dir.path()).outbox()).list();
+    let on_disk = Outbox::load(&Dirs::new(dirs.mcp.path()).outbox()).list();
     assert_eq!(on_disk.len(), 1);
     assert_eq!(on_disk[0].id, id);
     assert_eq!(on_disk[0].hash, hash);
@@ -459,7 +477,7 @@ async fn a_spooled_delivery_survives_the_process_that_accepted_it() {
     // ── The phone wakes, and the next tool call delivers ───────────────────
     asleep.router.shutdown().await.ok();
     drop(asleep);
-    let phone = boot_host(host_dir.path(), "Val's iPhone").await;
+    let phone = boot_host(dirs.host.path(), "Val's iPhone").await;
     next.use_loopback(endpoint::loopback_socket(&phone.node).await.unwrap());
     // The first server's drain task holds the node — and with it the blob
     // store claim — until its wake channel closes, which happens a scheduler
@@ -492,26 +510,11 @@ async fn a_queued_record_outside_the_current_roots_is_held_and_says_so() {
     // would break a promise another session can still keep. It is HELD, and
     // the reason is on the status surface, because a count that never moves
     // and says nothing is the silent failure this queue exists to remove.
-    let host_dir = tempfile::TempDir::new().unwrap();
-    let asleep_dir = tempfile::TempDir::new().unwrap();
-    let mcp_dir = tempfile::TempDir::new().unwrap();
-    let accepted_in = tempfile::TempDir::new().unwrap();
+    // The fixture's own workspace is the project this send is accepted in; it
+    // needs no name here, because every assertion below is about the other one.
+    let Asleep { dirs, artifact, core: accepted, asleep, phone_id: _ } =
+        asleep_fixture("<h1>report</h1>").await;
     let other_project = tempfile::TempDir::new().unwrap();
-    let artifact = accepted_in.path().join("report.html");
-    std::fs::write(&artifact, "<h1>report</h1>").unwrap();
-
-    let phone_id = device_identity(host_dir.path());
-    let asleep = boot_asleep(asleep_dir.path(), host_dir.path()).await;
-
-    let accepted = McpCore::new(
-        mcp_dir.path().to_path_buf(),
-        vec![accepted_in.path().to_path_buf()],
-        accepted_in.path().to_path_buf(),
-        None,
-    );
-    let phone_peers = PeerStore::load(host_dir.path());
-    accepted.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
-    phone_peers.seed(&accepted.node_id().unwrap(), accepted.device(), Scope::Control).unwrap();
     queue_while_asleep(&accepted, &asleep, &artifact).await;
     drop(accepted);
 
@@ -519,14 +522,14 @@ async fn a_queued_record_outside_the_current_roots_is_held_and_says_so() {
     // project, so the file the record names is outside everything it may
     // send.
     let elsewhere = McpCore::new(
-        mcp_dir.path().to_path_buf(),
+        dirs.mcp.path().to_path_buf(),
         vec![other_project.path().to_path_buf()],
         other_project.path().to_path_buf(),
         None,
     );
     asleep.router.shutdown().await.ok();
     drop(asleep);
-    let phone = boot_host(host_dir.path(), "Val's iPhone").await;
+    let phone = boot_host(dirs.host.path(), "Val's iPhone").await;
     elsewhere.use_loopback(endpoint::loopback_socket(&phone.node).await.unwrap());
     assert!(
         wait_until(|| async { elsewhere.list_devices(true).await.is_ok() }).await,
@@ -687,30 +690,6 @@ async fn a_claimed_store_refuses_the_send_instead_of_promising_it() {
 /// different outcomes and only one of them is right for a caller error.
 async fn spool(core: &McpCore) -> usize {
     core.server_status().await.unwrap().queued_total
-}
-
-/// The delivered half of an outcome, or a panic naming what came back
-/// instead. Every assertion here states which of the two it expects: a queued
-/// send that read as a delivered one is the exact failure the tagged answer
-/// exists to make impossible, and a test that shrugged at it would let it
-/// back in.
-fn delivered(outcome: Delivery) -> Landed {
-    match outcome {
-        Delivery::Delivered { device, node_id, name, size, hash } => {
-            Landed { device, node_id, name, size, hash }
-        }
-        Delivery::Queued { device, reason, .. } => {
-            panic!("expected a delivery to {device}, got a queued send: {reason}")
-        }
-    }
-}
-
-struct Landed {
-    device: String,
-    node_id: String,
-    name: String,
-    size: u64,
-    hash: String,
 }
 
 /// Poll a condition for up to five seconds. The eviction runs on the session's
