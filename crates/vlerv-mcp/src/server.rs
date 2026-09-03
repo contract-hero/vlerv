@@ -111,7 +111,10 @@ impl VlervMcp {
                        and the scope each one granted. Call this before send_to_device to learn \
                        the exact device names, or when the user asks which devices are available. \
                        Presence is reported as \"unknown\" unless probe is true, which dials each \
-                       device once."
+                       device once. A probed device reads \"online\", \"offline\" (it did not \
+                       answer), or \"refused\" — it answered and turned this server away, which \
+                       means it no longer lists this server as a paired peer. Never tell the \
+                       user to check the network of a device reported \"refused\"."
     )]
     async fn list_devices(
         &self,

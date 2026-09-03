@@ -96,7 +96,13 @@ pub struct DeviceInfo {
     pub scope: String,
     pub paired_at: u64,
     pub last_seen: u64,
-    /// "online", "offline", or "unknown" when nothing dialed it.
+    /// "online", "refused", "offline", or "unknown" when nothing dialed it.
+    ///
+    /// "refused" and "offline" are different facts and are kept apart here
+    /// because the user acts on them differently: a refusing device is awake
+    /// and on the network, and the thing to fix is its peer list, not its
+    /// Wi-Fi. One word for both is the same failure the dial message used to
+    /// have.
     pub presence: &'static str,
 }
 
@@ -898,6 +904,14 @@ impl McpCore {
             .collect())
     }
 
+    /// One device's presence, and the third answer is the point of it.
+    ///
+    /// Collapsing every failed probe to "offline" told the user a device was
+    /// asleep while it was awake and refusing this server — the same lie the
+    /// dial message used to tell, in one word. A device that answers and
+    /// turns this node away is REACHABLE, and calling it offline sends its
+    /// owner to check a network that is working. The variant is what tells
+    /// the two apart, so the probe takes the dial that still carries it.
     async fn presence(&self, peer: &Peer, probe: bool) -> &'static str {
         if let Some(session) = self.sessions.lock().await.get(&peer.node_id) {
             if !session.is_closed() {
@@ -907,8 +921,14 @@ impl McpCore {
         if !probe {
             return "unknown";
         }
-        match tokio::time::timeout(PROBE_TIMEOUT, self.session(peer)).await {
+        // `list_devices` booted once for the whole probe fan-out and returned
+        // any failure as the call's own, so this cannot be the first boot.
+        let Ok(node) = self.node().await else {
+            return "offline";
+        };
+        match tokio::time::timeout(PROBE_TIMEOUT, self.drainer(&node).dial_session(peer)).await {
             Ok(Ok(_)) => "online",
+            Ok(Err(ConnectError::Refused(_))) => "refused",
             _ => "offline",
         }
     }
@@ -3352,6 +3372,32 @@ mod tests {
         assert_eq!(status.queued_total, 2, "both devices are still owed the file");
         assert_eq!(status.queued_bytes, 8192, "and that is what is owed, added up");
         assert_eq!(status.retained_bytes, 4096, "but one copy is what it costs this disk");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_that_is_refused_says_refused_and_not_offline() {
+        // A device that is up, speaking the scope protocol, and does not list
+        // this server. The old probe collapsed this to "offline" — the same
+        // word a phone in a drawer gets — so the surface a user reads to
+        // answer "why did my send fail" pointed at the network while the
+        // device was awake and turning this node away on purpose.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+
+        // It grants SOMEBODY ELSE control, which is the state a device is in
+        // a moment after its owner removes this server from its peer list.
+        let (phone, _signals) = awake_device(&phone_dir, &"cd".repeat(32)).await;
+        let core = core_paired_with(&state, &workspace, &phone).await;
+
+        let devices = core.list_devices(true).await.expect("the probe runs");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].presence, "refused",
+            "it answered, so the thing to fix is its peer list and not its network"
+        );
+
+        phone.router.shutdown().await.ok();
     }
 
     #[test]
