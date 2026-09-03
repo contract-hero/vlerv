@@ -465,6 +465,17 @@ struct Session {
     /// registry and the request handler cannot end up looking at different
     /// flags. Pairing two `Arc` fields by hand was how they could.
     handles: Arc<SessionHandles>,
+    /// How to cut this session's TRANSPORT, not just its registration.
+    ///
+    /// Unregistering a revoked peer stops the fan-out, and `serve` re-reads
+    /// the peer per request so the next one is refused — but neither ends the
+    /// QUIC connection, and a client that is not asking for anything sits
+    /// there believing it still holds a session. Measured: 1.5 seconds after
+    /// an unpair the client's `is_closed()` was still false.
+    ///
+    /// A closure rather than the `Connection` itself, so the registry stays a
+    /// plain value the unit tests can build without two live endpoints.
+    cut: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// The per-session state the request handler mutates and the fan-out reads.
@@ -537,8 +548,26 @@ impl ScopeState {
 
     /// Drop every session held by a peer — what revocation does to sessions
     /// that were already open when the user unpaired.
+    ///
+    /// The connection goes with the registration. Dropping only the entry
+    /// left the transport up until that peer next asked for something, so a
+    /// device the user had just unpaired went on showing itself as connected;
+    /// the unpairing was one-sided and silent on the wire as well as in the
+    /// peer file. Closing it is what makes the other side notice.
     pub fn drop_sessions_for(&self, node_id: &str) {
-        self.sessions().retain(|s| s.peer != node_id);
+        // Collected under the lock and cut outside it: `close` is not
+        // expected to block, and holding the registry across another module's
+        // code is how a lock order gets invented by accident.
+        let revoked: Vec<Arc<dyn Fn() + Send + Sync>> = {
+            let mut sessions = self.sessions();
+            let (going, staying): (Vec<Session>, Vec<Session>) =
+                sessions.drain(..).partition(|s| s.peer == node_id);
+            *sessions = staying;
+            going.into_iter().map(|s| s.cut).collect()
+        };
+        for cut in revoked {
+            cut();
+        }
     }
 
     /// Push a tab list from the reducer and fan the derived events out to
@@ -986,12 +1015,21 @@ impl ProtocolHandler for ScopeServer {
         let (tx, mut rx) = mpsc::channel::<Frame>(SESSION_QUEUE);
         let handles = Arc::new(SessionHandles::new());
         let id = self.state.next_session_id.fetch_add(1, Ordering::SeqCst);
+        // The same wording the allowlist refuses a fresh dial with, so a peer
+        // cut mid-session and one turned away at the door read alike.
+        let cut = {
+            let connection = connection.clone();
+            Arc::new(move || {
+                connection.close(VarInt::from_u32(CLOSE_REFUSED), b"not a paired peer");
+            })
+        };
         self.state
             .register(Session {
                 id,
                 peer: node_id.clone(),
                 tx: tx.clone(),
                 handles: handles.clone(),
+                cut,
             })
             .map_err(|e| {
                 connection.close(VarInt::from_u32(CLOSE_REFUSED), b"session cap");
@@ -2155,8 +2193,29 @@ mod tests {
             peer: peer.to_string(),
             tx,
             handles: Arc::new(SessionHandles::new()),
+            // No transport behind this one, which is the whole reason `cut`
+            // is a closure: the registry proofs need a session, not a socket.
+            cut: Arc::new(|| {}),
         };
         (session, rx)
+    }
+
+    /// A session whose cut is observable, for the proofs about revocation
+    /// rather than about the registry. The receiver goes back to the caller
+    /// so the channel stays open: a dropped one ends the session a different
+    /// way than the one under test.
+    fn cuttable_session(
+        id: u64,
+        peer: &str,
+    ) -> (Session, mpsc::Receiver<Frame>, Arc<AtomicBool>) {
+        let (session, rx) = session(id, peer);
+        let was_cut = Arc::new(AtomicBool::new(false));
+        let flag = was_cut.clone();
+        let session = Session {
+            cut: Arc::new(move || flag.store(true, Ordering::SeqCst)),
+            ..session
+        };
+        (session, rx, was_cut)
     }
 
     #[test]
@@ -2248,6 +2307,29 @@ mod tests {
         assert!(!grants.admit(&solo, Some(id(1)), true));
         assert!(!grants.admit(&shared, Some(id(1)), true), "the revoked peer loses the shared grant");
         assert!(grants.admit(&shared, Some(id(2)), true), "the other peer keeps it");
+    }
+
+    #[test]
+    fn revoking_a_peer_cuts_the_connection_it_was_already_holding() {
+        // Unregistering stops the fan-out and `serve` refuses the peer's next
+        // request, so nothing leaks either way. What was left standing is the
+        // CONNECTION: a client that is not asking for anything goes on
+        // believing it holds a session, and the unpair is silent on the wire
+        // exactly as it is in the peer file. The user made a decision and the
+        // machine it was about did not hear it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = state(&dir, RootSet::empty());
+        let (revoked, _revoked_rx, was_cut) = cuttable_session(1, "nodeA");
+        let (bystander, _bystander_rx, untouched) = cuttable_session(2, "nodeB");
+        st.register(revoked).unwrap();
+        st.register(bystander).unwrap();
+
+        st.drop_sessions_for("nodeA");
+
+        assert!(was_cut.load(Ordering::SeqCst), "the revoked peer's transport goes too");
+        assert!(!untouched.load(Ordering::SeqCst), "and nobody else's does");
+        assert_eq!(st.sessions().len(), 1, "one session survives, and it is the other peer's");
+        assert_eq!(st.sessions()[0].peer, "nodeB");
     }
 
     #[test]
