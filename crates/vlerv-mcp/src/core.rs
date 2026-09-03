@@ -54,6 +54,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// count, because a silently shortened list reads as "that is all of them".
 const MAX_RECEIVED: usize = 100;
 
+/// How many dead deliveries `server_status` lists, on the same rule and for
+/// the same reason. Smaller than `MAX_RECEIVED` because the spool it draws
+/// from is capped at `outbox::MAX_RECORDS` — a queue that is full cannot
+/// abandon more than sixty-four things at once.
+const MAX_ABANDONED: usize = 50;
+
 /// Shortest content-hash prefix `stop_beam` accepts for ONE link. Revoking
 /// the wrong link is recoverable (mint another); revoking by a one-character
 /// prefix by accident is just noise. Omitting the argument revokes them all,
@@ -363,6 +369,17 @@ pub struct ServerStatus {
     /// the one that moved the file aside: the alternative is a delivery that
     /// is reported once and then silently forgotten.
     pub queue_unreadable: Vec<String>,
+    /// Deliveries this server accepted and then gave up on, newest last,
+    /// capped at `MAX_ABANDONED`. Every one of them was reported to somebody
+    /// as queued, so its end has to be readable somewhere; it used to be
+    /// stderr and nothing else, and a record past its week simply stopped
+    /// being on the list above.
+    ///
+    /// This process only — see `McpCore::abandoned`.
+    pub abandoned: Vec<AbandonedDelivery>,
+    /// How many this server gave up on, which is higher than the list once
+    /// the cap has dropped the oldest.
+    pub abandoned_total: u64,
     /// Whether a drain pass owns this queue right now — true while any peer
     /// is being drained. A reader must be able to tell a queue that is moving
     /// from one that is merely stored: a count that is still 3 a minute later
@@ -387,6 +404,32 @@ pub struct ServerStatus {
 struct Received {
     items: Vec<ReceivedArtifact>,
     total: u64,
+}
+
+/// The same shape for deliveries that ENDED instead of arriving.
+#[derive(Default)]
+struct Abandoned {
+    items: Vec<AbandonedDelivery>,
+    total: u64,
+}
+
+/// A delivery this server accepted and will not make.
+///
+/// Every one of these was reported to somebody as queued, so the end of it is
+/// news. Until now it was written to stderr and nowhere else: a record past
+/// its seven-day expiry simply stopped being on the queue list, and the user
+/// who was told "it goes out when that device is reachable" had no surface
+/// that ever said otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbandonedDelivery {
+    pub id: String,
+    pub device: String,
+    pub name: String,
+    pub size: u64,
+    /// Why it ended, in the words the drain used at the time.
+    pub reason: String,
+    /// Unix seconds at which this server gave up on it.
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -542,6 +585,12 @@ pub struct McpCore {
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Received>>,
+    /// Deliveries this server promised and then ended. IN MEMORY, unlike the
+    /// queue itself: the record is gone by the time it lands here, so there
+    /// is nothing left on disk to hang it off, and a process that exits takes
+    /// its list with it. That is the honest limit of the surface — it says
+    /// what THIS server gave up on, not what every server ever did.
+    abandoned: Arc<Mutex<Abandoned>>,
     /// Sends accepted for a device that was asleep. Read off disk in `new`,
     /// beside the peer store and for the same reason: both are files this
     /// server must be able to REPORT before it is allowed to open a socket,
@@ -634,6 +683,7 @@ impl McpCore {
             loopback: Arc::new(Mutex::new(None)),
             wake,
             wake_rx: Mutex::new(Some(wake_rx)),
+            abandoned: Arc::new(Mutex::new(Abandoned::default())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             retry: Arc::new(Mutex::new(HashMap::new())),
             forced: Arc::new(Mutex::new(HashSet::new())),
@@ -1356,6 +1406,7 @@ impl McpCore {
             roots: self.roots.clone(),
             device: self.device.clone(),
             loopback: self.loopback.clone(),
+            abandoned: self.abandoned.clone(),
             inflight: self.inflight.clone(),
             retry: self.retry.clone(),
             forced: self.forced.clone(),
@@ -1555,6 +1606,10 @@ impl McpCore {
             let log = self.received.lock().unwrap_or_else(|p| p.into_inner());
             Received { items: log.items.clone(), total: log.total }
         };
+        let abandoned = {
+            let log = self.abandoned.lock().unwrap_or_else(|p| p.into_inner());
+            Abandoned { items: log.items.clone(), total: log.total }
+        };
         // ONE read of the spool for the three answers shown side by side. The
         // same argument the sum below makes: a pending list, an unaccounted
         // list and the spool's fault taken in three separate locks can
@@ -1596,6 +1651,8 @@ impl McpCore {
             // off the pending list, so a status that stayed silent would
             // report the delivery as simply gone.
             queue_unreadable: spool.unaccounted,
+            abandoned: abandoned.items,
+            abandoned_total: abandoned.total,
             draining: self.draining(),
             queue_blocked_reason: self.blocked_by(spool.fault),
             roots: self.roots.roots(),
@@ -1623,6 +1680,7 @@ struct Drainer {
     roots: RootSet,
     device: String,
     loopback: Arc<Mutex<Option<SocketAddr>>>,
+    abandoned: Arc<Mutex<Abandoned>>,
     inflight: Arc<Mutex<HashMap<String, bool>>>,
     retry: Arc<Mutex<HashMap<String, Backoff>>>,
     forced: Arc<Mutex<HashSet<String>>>,
@@ -1732,9 +1790,12 @@ impl Drainer {
     /// question the ladder was guessing at.
     async fn pass(&self, forced: Option<&str>) {
         // Expiry first, so a record past its week is not dialed for one more
-        // time on its way out. The copy of the user's file goes with it.
+        // time on its way out. The copy of the user's file goes with it, and
+        // so does the promise: somebody was told this file would arrive, and
+        // the end of it belongs on a surface rather than on stderr.
         for expired in self.outbox.take_expired(peers::now_unix()) {
             beam::unpin_outbox(&self.node, &expired.tag).await;
+            self.abandon(&expired, "it was not delivered within the seven-day limit");
         }
         // Grouped by peer, and that is the whole shape of this pass: a dial
         // to a suspended phone costs DIAL_TIMEOUT, so five records for one
@@ -2027,12 +2088,40 @@ impl Drainer {
     /// ending here.
     async fn give_up(&self, record: &Record, reason: &str) {
         match self.outbox.drop_record(&record.id, reason) {
-            Ok(Some(dropped)) => beam::unpin_outbox(&self.node, &dropped.tag).await,
+            Ok(Some(dropped)) => {
+                beam::unpin_outbox(&self.node, &dropped.tag).await;
+                self.abandon(&dropped, reason);
+            }
+            // Already gone, so somebody else has already accounted for it and
+            // a second entry would report one dead delivery as two.
             Ok(None) => {}
             Err(e) => eprintln!(
                 "vlerv-mcp: cannot drop the queued send of {:?} to {}: {e}",
                 record.name, record.device
             ),
+        }
+    }
+
+    /// Put one ended delivery where a person can read it.
+    ///
+    /// Written only where a record actually LEFT the spool, so the list and
+    /// the queue cannot both claim the same send.
+    fn abandon(&self, record: &Record, reason: &str) {
+        let mut log = self.abandoned.lock().unwrap_or_else(|p| p.into_inner());
+        log.total = log.total.saturating_add(1);
+        log.items.push(AbandonedDelivery {
+            id: record.id.clone(),
+            device: record.device.clone(),
+            name: record.name.clone(),
+            size: record.size,
+            reason: reason.to_string(),
+            at: peers::now_unix(),
+        });
+        // The same rule the arrivals log follows: keep the NEWEST, because
+        // those are the ones a caller is still deciding anything about, and
+        // let `abandoned_total` carry the count the list no longer can.
+        if log.items.len() > MAX_ABANDONED {
+            log.items.remove(0);
         }
     }
 
@@ -3799,6 +3888,55 @@ mod tests {
         // some other call had already removed.
         let again = core.forget_device("Val's iPhone").await.unwrap_err();
         assert!(again.contains("no devices are paired"), "{again}");
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_that_ran_out_of_time_says_so_instead_of_just_disappearing() {
+        // The record simply stopped being on the queue list, and the only
+        // account of it went to stderr — which no tool call reads. Somebody
+        // was told this file would arrive when their device came back, and
+        // the surface they would ask never said otherwise.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let phone = deaf_device(&phone_dir).await;
+        let core = core_paired_with(&state, &workspace, &phone).await;
+        let node = core.node().await.unwrap();
+        let phone_id = phone.endpoint.id().to_string();
+
+        let file = workspace.path().join("report.html");
+        std::fs::write(&file, "<h1>promised to a phone in a drawer</h1>").unwrap();
+        let id = queue_staged(&core, &node, &phone_id, &file).await;
+
+        // The week passing, written where the record itself keeps it. One
+        // field is patched rather than the document rewritten, so this proof
+        // does not have to know the record's shape.
+        let path = Dirs::new(state.path()).outbox().join(format!("{id}.json"));
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["record"]["expires_at"] = serde_json::json!(peers::now_unix() - 1);
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        core.outbox.reload();
+
+        core.drainer(&node).pass(None).await;
+
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 0, "the record is gone, which was always true");
+        assert_eq!(status.abandoned_total, 1, "and now it is gone SOMEWHERE a caller reads");
+        assert_eq!(status.abandoned[0].name, "report.html");
+        assert_eq!(status.abandoned[0].device, "Val's iPhone");
+        assert!(
+            status.abandoned[0].reason.contains("seven-day limit"),
+            "it says why: {:?}",
+            status.abandoned[0].reason
+        );
+        assert!(
+            node.store.tags().get(outbox::tag_name(&id)).await.unwrap().is_none(),
+            "and the copy of the user's file goes with the promise"
+        );
 
         phone.router.shutdown().await.ok();
     }
