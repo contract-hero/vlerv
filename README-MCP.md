@@ -130,6 +130,11 @@ here, when it was last seen, and presence.
 - `probe` — when true, dials each device once for live presence. Without it
   presence is `"unknown"` unless a session is already open.
 
+A probed device reads `"online"`, `"offline"` — it did not answer — or
+`"refused"`, which means it answered and turned this server away. A refused
+device is awake and on the network; what is wrong is its peer list, not its
+Wi-Fi. `forget_device` is how the two sides agree again.
+
 ### `send_to_device { path, device }`
 
 Sends the file straight to one paired device. No link, no tap: the file lands
@@ -192,6 +197,27 @@ Finishes or rejects a pending pairing.
   its grant, including narrowing it. Omitting `scope` names no grant, so an
   already-trusted device keeps the one it has.
 
+### `forget_device { device }`
+
+Unpairs one device and deletes everything this server was keeping for it.
+
+- `device` — the device name, or a prefix of its node id, exactly as
+  `send_to_device` matches it.
+
+It removes the pairing, so that device can no longer reach this server, and it
+**deletes the private copies** of any files still queued for it — those sends
+never arrive. Both are irreversible except by pairing again, and the result
+says which of them happened.
+
+The order matters and is fixed: the pairing goes first, so a cleanup that
+cannot finish leaves a device unpaired with its records still queued, never the
+other way round. Whatever is left is finished by the next drain pass.
+
+Use it when a device is no longer the user's, or when `list_devices` reports it
+as `"refused"` — that device already removed this server, and until now the
+only ways to agree again were editing `peers.json` by hand or waiting out the
+seven-day record expiry.
+
 ### `server_status {}`
 
 This server's node id, its identity directory, whether it has booted the
@@ -200,7 +226,11 @@ devices pushed to it during this session, and which sends are still queued for
 a device that has not answered. The pushed-file list holds the last 100
 arrivals; `received_total` reports how many arrived in all. The structured
 result carries every queued record, with the device it is for and the last
-error it hit. The summary text prints that list too — except when
+error it hit. It also carries `abandoned`: the sends this process accepted and
+then gave up on — expired, or dropped because the device was unpaired — each
+with the file, the device and the reason. That list is in memory only, because
+the record itself is gone by then, so it reports what **this** process ended.
+The summary prints it only when there is something on it. The summary text prints that list too — except when
 `queue_blocked_reason` is set, where it names the count and the reason and
 stops there, because a record-by-record list under a queue that can move
 nothing reads as progress.
