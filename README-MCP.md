@@ -146,7 +146,11 @@ shared content hash.
 **`queued`** means the device did not answer and the send was accepted anyway.
 The file is copied into this server's state directory as it stands at that
 moment, so later edits to it do not change what arrives, and it goes out on its
-own as soon as the device is reachable — usually the moment it dials in.
+own as soon as the device is reachable. The device dialling in is the fast
+path: that connection delivers the file at once. Failing that, this server
+retries on its own — it looks at the queue every 60 seconds, and each device
+waits out its own backoff first: 60 seconds after the first refused dial, then
+2 minutes, then 5, then 10 minutes for every attempt after that.
 
 **A queued send outlives the tool call, but not the process.** The bytes move
 only while a `vlerv-mcp` is running against that state directory, so a send
@@ -194,9 +198,12 @@ This server's node id, its identity directory, whether it has booted the
 network, its uptime, which beam links are still being served, which files other
 devices pushed to it during this session, and which sends are still queued for
 a device that has not answered. The pushed-file list holds the last 100
-arrivals; `received_total` reports how many arrived in all. Every queued record
-is listed, with the device it is for and the last error it hit;
-`queue_blocked_reason` says when this server can move none of them.
+arrivals; `received_total` reports how many arrived in all. The structured
+result carries every queued record, with the device it is for and the last
+error it hit. The summary text prints that list too — except when
+`queue_blocked_reason` is set, where it names the count and the reason and
+stops there, because a record-by-record list under a queue that can move
+nothing reads as progress.
 
 ## Pairing an iOS device, step by step
 
@@ -317,9 +324,13 @@ gets slower.
 session closed) or the TTL expired. Mint a new one.
 
 **A send came back "queued"** — the device did not answer, and the file is
-waiting here instead of failing. Open Vlervtifacts on that device: the dial it
-makes on the way up is what sends the file. `server_status` shows every waiting
-record with the last error it hit.
+waiting here instead of failing. Open Vlervcode on that device. A phone that
+has been paired once turns its own **Listen at launch** switch on, so opening
+the app both starts it listening and dials this server, and that dial is what
+sends the file. If the switch was turned off afterwards, the app opens without
+a socket, and the file waits until something on the phone opens its network —
+**Connect** in its peer settings, or opening a remote device from it.
+`server_status` shows every waiting record with the last error it hit.
 
 **"another Vlerv process is already using the blob store"** — one state
 directory serves one process at a time, and every Claude Code session starts

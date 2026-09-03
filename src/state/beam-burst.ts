@@ -11,10 +11,25 @@
  *  only a row in the Received list. */
 export const RECEIVE_BURST_MS = 5000;
 
+/** What one arrival decides. */
+export interface Burst {
+  /** Does this arrival open a tab? */
+  opens: boolean;
+  /** What the arrival after this one is judged against — the caller keeps
+   *  this and hands it back as `previous`. */
+  previous: number;
+}
+
 /**
- * Does this arrival open a tab?
+ * Fold one arrival into the burst rule: judge it, then remember it.
  *
- * `previousArrivalAt` is when the previous artifact landed, in `Date.now()`
+ * BOTH halves live here. Remembering only the arrivals that opened a tab
+ * leaves every case below passing while a drain of eight files opens a tab
+ * every `RECEIVE_BURST_MS`, so a caller that judged with one function and
+ * remembered on its own owned half of a rule it could not test. It holds
+ * `previous` and nothing else now.
+ *
+ * `previous` is when the previous artifact landed, in `Date.now()`
  * milliseconds, or null when nothing has landed yet — the first artifact
  * opens exactly like an accepted receive does.
  *
@@ -27,7 +42,9 @@ export const RECEIVE_BURST_MS = 5000;
  * evidence the sender asked for a second file, and counting it as one opens
  * the very tab this rule exists to prevent.
  */
-export function arrivalOpensTab(previousArrivalAt: number | null, arrivalAt: number): boolean {
-  if (previousArrivalAt === null) return true;
-  return arrivalAt - previousArrivalAt >= RECEIVE_BURST_MS;
+export function nextBurst(previous: number | null, arrivalAt: number): Burst {
+  const opens = previous === null || arrivalAt - previous >= RECEIVE_BURST_MS;
+  // Remembered whether it opened anything or not: an arrival judged to be
+  // part of a run is exactly what the arrival after it is measured from.
+  return { opens, previous: arrivalAt };
 }

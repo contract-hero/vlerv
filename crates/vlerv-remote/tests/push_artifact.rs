@@ -283,7 +283,10 @@ async fn a_staged_push_replays_from_the_store_without_reading_the_source_again()
 
     // The send is accepted while the phone is asleep: the bytes are copied
     // into the guest's own store and pinned under the record's tag.
-    let hash = beam::stage_outbox(&guest, &artifact, "1700000000001-0000")
+    // Both halves come off the staging call, the way `queue_send` builds the
+    // record: the size a replay announces describes the COPY, never whatever
+    // the source path holds by the time the phone wakes up.
+    let beam::StagedCopy { hash, size } = beam::stage_outbox(&guest, &artifact, "1700000000001-0000")
         .await
         .expect("stage");
 
@@ -296,7 +299,7 @@ async fn a_staged_push_replays_from_the_store_without_reading_the_source_again()
         .await
         .expect("a control peer gets a session");
     let pushed = session
-        .push_staged_via(&hash, "report.html", body.len() as u64, guest_addr)
+        .push_staged_via(&hash, "report.html", size, guest_addr)
         .await
         .expect("the replay lands");
     assert_eq!(pushed.hash, hash, "the address the record named is the one that travelled");

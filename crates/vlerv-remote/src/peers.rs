@@ -105,13 +105,17 @@ impl Scope {
     /// May this scope drive the host — open an artifact on its screen, or
     /// land bytes in its received/ folder with no human accepting a link?
     ///
-    /// The receiver's request filter above is one caller. The other is the
-    /// SENDER, which asks the same question before it stages a private copy
-    /// of a user file for a peer that is asleep: a device that never granted
-    /// control would otherwise accumulate full copies of the user's files for
-    /// the whole record TTL, and every one of them would be refused on
-    /// arrival. Two callers, one predicate, so the answer cannot drift
-    /// between the machine that enforces it and the machine that predicts it.
+    /// The receiver's request filter above is one caller. The others are on
+    /// the SENDER, which asks the same question three times through
+    /// `grants_control`: on the live handshake before an immediate push,
+    /// on the cached grant before it stages a private copy for a peer that is
+    /// asleep, and again on every drain pass, because a record can be days
+    /// old and the grant has had that long to narrow. Without the middle one
+    /// a device that never granted control would accumulate full copies of
+    /// the user's files for the whole record TTL, and every one of them would
+    /// be refused on arrival. One predicate for all four, so the answer
+    /// cannot drift between the machine that enforces it and the machine that
+    /// predicts it.
     pub fn may_land_artifacts(self) -> bool {
         self == Scope::Control
     }

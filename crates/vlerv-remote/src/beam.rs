@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bao_tree::io::BaoContentItem;
+use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::api::Tag;
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::provider::events::{
@@ -469,9 +470,25 @@ pub(crate) async fn delete_tags(store: &FsStore, tags: Vec<Tag>) {
 
 // ── The spool's bytes: staged at enqueue, pinned by name ───────────────────
 
+/// What one staging call captured: the content address of the copy, and how
+/// many bytes that copy is.
+///
+/// The two travel together because they must agree. A size measured anywhere
+/// but here describes the SOURCE at some earlier moment, while the hash names
+/// the bytes the receiver will actually be sent, and a record holding both
+/// halves of two different files is a delivery the receiver refuses. Plain
+/// `String` and `u64`: no iroh type crosses this signature (lib.rs invariant
+/// 3), the same rule `outbox::Record` keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedCopy {
+    pub hash: String,
+    pub size: u64,
+}
+
 /// Copy `path` into the store and pin it under `outbox/<id>`, in ONE await.
-/// Returns the content address of the bytes that were captured, or refuses if
-/// `outbox/<id>` already names bytes — see the guard below.
+/// Returns what the store now holds — the content address AND the length of
+/// the copy — or refuses if `outbox/<id>` already names bytes; see the guard
+/// below.
 ///
 /// The single await is the point. `add_path` on its own creates an `auto-<ts>`
 /// tag, and the two-step "add, then set the name, then delete the auto tag"
@@ -486,7 +503,7 @@ pub(crate) async fn delete_tags(store: &FsStore, tags: Vec<Tag>) {
 /// `ImportMode::Copy` makes the store's copy independent of the source, so a
 /// file the user keeps editing — or deletes — is still delivered as it stood
 /// at the moment they asked for it.
-pub async fn stage_outbox(node: &RemoteNode, path: &Path, id: &str) -> Result<String, String> {
+pub async fn stage_outbox(node: &RemoteNode, path: &Path, id: &str) -> Result<StagedCopy, String> {
     let tag = outbox::tag_name(id);
     // A NAME THIS STORE ALREADY HOLDS IS NOT THIS CALL'S TO TAKE.
     // `with_named_tag` overwrites, and what it would overwrite is the only
@@ -528,7 +545,25 @@ pub async fn stage_outbox(node: &RemoteNode, path: &Path, id: &str) -> Result<St
         .sync_db()
         .await
         .map_err(|e| format!("cannot commit the staged copy: {e}"))?;
-    Ok(staged.hash.to_string())
+    // The length of THIS COPY, read off the store that holds it. The caller's
+    // own `metadata` read happened before the copy — in `send_to_device`, a
+    // whole dial to a sleeping device earlier — and a file the user saved in
+    // that window leaves a record announcing a size the bytes behind it do not
+    // have. The receiver checks the announced size against the transfer cap
+    // before it starts the stream and the real cap on the stream itself, so a
+    // record that under-states its bytes is refused mid-transfer, once per
+    // pass, for the whole seven-day TTL.
+    let size = match node.store.blobs().status(staged.hash).await {
+        Ok(BlobStatus::Complete { size }) => size,
+        // These bytes were added and committed one await ago, so anything
+        // else is a store that cannot answer for what it just wrote. A record
+        // is never written on a size nothing measured.
+        Ok(incomplete) => {
+            return Err(format!("cannot measure the staged copy: the store reports {incomplete:?}"))
+        }
+        Err(e) => return Err(format!("cannot measure the staged copy: {e}")),
+    };
+    Ok(StagedCopy { hash: staged.hash.to_string(), size })
 }
 
 /// Release one spool pin, by the tag name the record stores. The record's own
@@ -1180,7 +1215,7 @@ mod tests {
 
         // Staging captures the bytes and names the pin in one await.
         let kept_id = "1700000000001-0000";
-        let hash = stage_outbox(&node, &queued, kept_id).await.expect("stage");
+        let hash = stage_outbox(&node, &queued, kept_id).await.expect("stage").hash;
         assert_eq!(
             hash,
             Hash::new(b"a file somebody was promised").to_string(),
@@ -1196,7 +1231,7 @@ mod tests {
         // A pin whose record never made it to disk — the crash the sweep
         // exists to clean up after.
         let orphan_id = "1700000000002-0000";
-        let orphan = stage_outbox(&node, &abandoned, orphan_id).await.expect("stage");
+        let orphan = stage_outbox(&node, &abandoned, orphan_id).await.expect("stage").hash;
 
         let swept = sweep_outbox_tags(&node, &[outbox::tag_name(kept_id)]).await;
         assert_eq!(swept, 1, "only the tag no record claims");
@@ -1254,7 +1289,7 @@ mod tests {
 
         // The id every process mints first when `now_millis` answers 0.
         let id = "0000000000000-0000";
-        let owed = stage_outbox(&node, &incumbent, id).await.expect("stage");
+        let owed = stage_outbox(&node, &incumbent, id).await.expect("stage").hash;
 
         let err = stage_outbox(&node, &intruder, id).await.expect_err("the name is taken");
         assert!(err.contains(&outbox::tag_name(id)), "the refusal names the pin, got: {err}");
@@ -1356,7 +1391,7 @@ mod tests {
             // What is under test — that `stage_outbox` returns only once the
             // copy is committed — does not depend on the collector at all.
             let node = endpoint::boot_with_gc(&dirs, None, |_| {}, None).await.expect("boot");
-            stage_outbox(&node, &queued, id).await.expect("stage")
+            stage_outbox(&node, &queued, id).await.expect("stage").hash
         };
 
         // The store closes on its own thread after the handle is dropped, and
@@ -1432,8 +1467,8 @@ mod tests {
 
         let delivered_id = "1700000000004-0000";
         let waiting_id = "1700000000005-0000";
-        let released = stage_outbox(&node, &delivered, delivered_id).await.expect("stage");
-        let kept = stage_outbox(&node, &waiting, waiting_id).await.expect("stage");
+        let released = stage_outbox(&node, &delivered, delivered_id).await.expect("stage").hash;
+        let kept = stage_outbox(&node, &waiting, waiting_id).await.expect("stage").hash;
 
         // The delivery landed: the record file goes first, then its pin.
         unpin_outbox(&node, &outbox::tag_name(delivered_id)).await;
@@ -1477,7 +1512,7 @@ mod tests {
                 String::from_utf8_lossy(staged.name.as_ref()).starts_with(AUTO_TAG_PREFIX),
                 "the tag this sweep collects is the one iroh-blobs names itself"
             );
-            let promised = stage_outbox(&node, &queued, id).await.expect("stage");
+            let promised = stage_outbox(&node, &queued, id).await.expect("stage").hash;
             // A session that ends properly, which is what this test is about:
             // the run is over and the next one opens the same store. Dropping
             // alone would leave it open — see `RemoteNode::shutdown`.

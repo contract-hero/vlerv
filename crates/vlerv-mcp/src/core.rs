@@ -886,7 +886,12 @@ impl McpCore {
     /// that device is merely asleep, copy the file now and promise it.
     ///
     /// Every CALLER error is still a hard error: an unsendable path, an
-    /// unknown device, a device that has not granted control. Only "the other
+    /// unknown device, a device whose grant is KNOWN to be narrower than
+    /// control — either from the handshake this call just completed, or from
+    /// the scope the last completed one reported. A device this server has
+    /// never handshaken with is the other case: nothing has refused anything
+    /// yet, so a send that device does not answer is queued like any other,
+    /// and the answer says its control grant is unverified. Only "the other
     /// machine did not answer" becomes a queued send, because that is the only
     /// cause a later attempt can change.
     pub async fn send_to_device(&self, raw_path: &str, device: &str) -> Result<Delivery, String> {
@@ -1019,9 +1024,14 @@ impl McpCore {
     /// Accept a send for a device that did not answer: copy the bytes, write
     /// the record, and report exactly what was promised.
     ///
-    /// Everything that can refuse runs BEFORE the copy is taken. A refusal
-    /// that arrives after it has already cost the user a private duplicate of
-    /// their file inside this server's state directory.
+    /// Everything that can refuse runs BEFORE the copy is taken, with one
+    /// exception: `Outbox::enqueue` writes the record after `stage_outbox`
+    /// has staged the bytes, and it can still refuse — a record id it cannot
+    /// claim, a cap, a directory that will not take the write. The `Err` arm
+    /// below unpins the tag that staging minted, so that refusal leaves
+    /// nothing lasting either. A refusal that kept the pin would cost the
+    /// user a private duplicate of their file inside this server's state
+    /// directory for the life of the install.
     async fn queue_send(
         &self,
         node: &Arc<endpoint::RemoteNode>,
@@ -1073,27 +1083,37 @@ impl McpCore {
         // grants on every push, so an unpinned queued file would lose its
         // bytes an hour after it was accepted.
         let id = self.outbox.next_id();
-        let hash = beam::stage_outbox(node, &cand.canonical, &id).await?;
+        // BOTH halves of what the record announces come back from here, and
+        // neither is taken from `cand`. `cand.size` is a `std::fs::metadata`
+        // read taken before the dial this send has already spent — up to
+        // `DIAL_TIMEOUT` earlier — so a file the user saved in between leaves
+        // a record whose size names the file that was read and whose hash
+        // names the copy that was taken. The receiver checks the announced
+        // size against the transfer cap before it opens the stream and the
+        // real cap on the stream itself, so an under-stated record is refused
+        // mid-transfer; the drain HOLDS a refusal, so that record retries once
+        // a pass for the whole seven-day TTL and can never land.
+        let staged = beam::stage_outbox(node, &cand.canonical, &id).await?;
 
         // DEDUPE on (peer, content). The store is content-addressed, so
         // re-staging the same file costs a read and a hash pass, never a
         // second copy on disk. A model retries a call that looked like it
         // failed, and without this one user intent becomes several records.
-        if let Some(pending) = self.outbox.find_pending(&peer.node_id, &hash) {
+        if let Some(pending) = self.outbox.find_pending(&peer.node_id, &staged.hash) {
             beam::unpin_outbox(node, &outbox::tag_name(&id)).await;
             return Ok(self.queued(&peer, pending, why));
         }
 
-        let staged = Staged {
+        let item = Staged {
             id: id.clone(),
             peer: peer.node_id.clone(),
             device: peer.device.clone(),
             source: cand.canonical.clone(),
             name: cand.name.clone(),
-            size: cand.size,
-            hash,
+            size: staged.size,
+            hash: staged.hash,
         };
-        match self.outbox.enqueue(staged) {
+        match self.outbox.enqueue(item) {
             Ok(record) => Ok(self.queued(&peer, record, why)),
             Err(e) => {
                 // The record never reached disk, so nothing will ever name
@@ -1156,23 +1176,28 @@ impl McpCore {
 
     /// Why this server can neither accept nor move a queued send, or `None`.
     ///
-    /// Two causes, and each one stops the WHOLE queue rather than one send:
+    /// Three causes, and each one stops the WHOLE queue rather than one send:
     /// another process holds the blob-store claim, so nothing may be copied
-    /// in or replayed out; or the spool directory did not read, so a record
-    /// would be a promise this process could never find again. One producer,
-    /// read by the send path and by `server_status`, so a refusal and the
-    /// status that explains it cannot tell two different stories.
+    /// in or replayed out; the peer list did not read, so no record can be
+    /// told from a revoked one; or the spool itself is unusable — it did not
+    /// read, so a record would be a promise this process could never find
+    /// again, or it will not take a write, so a delivery attempt cannot even
+    /// be noted. One producer, read by the send path and by `server_status`,
+    /// so a refusal and the status that explains it cannot tell two different
+    /// stories.
     fn queue_blocked_reason(&self) -> Option<String> {
-        self.blocked_by(self.outbox.load_error())
+        self.blocked_by(self.outbox.fault())
     }
 
     /// The half of the answer above that does not touch the spool, for a
-    /// caller that already holds `load_error` from a wider read. It exists so
-    /// `server_status` can take the spool ONCE and still route the answer
-    /// through the one producer, rather than spelling the `or` out a second
-    /// time and letting the two orders drift.
-    fn blocked_by(&self, load_error: Option<String>) -> Option<String> {
-        self.last_boot_error().or(load_error)
+    /// caller that already holds the spool's fault from a wider read. It
+    /// exists so `server_status` can take the spool ONCE and still route the
+    /// answer through the one producer, rather than spelling the `or` out a
+    /// second time and letting the two orders drift.
+    fn blocked_by(&self, spool_fault: Option<String>) -> Option<String> {
+        self.last_boot_error()
+            .or_else(|| self.peers.load_error().map(peer_list_blocked))
+            .or(spool_fault)
     }
 
     /// Test seam: how many peer sessions this server is holding. A session
@@ -1360,9 +1385,9 @@ impl McpCore {
         };
         // ONE read of the spool for the three answers shown side by side. The
         // same argument the sum below makes: a pending list, an unaccounted
-        // list and a load error taken in three separate locks can straddle a
-        // `reload`, and then the status names one delivery on two lists, or
-        // reports an empty queue beside no reason for it.
+        // list and the spool's fault taken in three separate locks can
+        // straddle a `reload`, and then the status names one delivery on two
+        // lists, or reports an empty queue beside no reason for it.
         let spool = self.outbox.report();
         let queued: Vec<QueuedDelivery> =
             spool.records.into_iter().map(QueuedDelivery::from).collect();
@@ -1400,7 +1425,7 @@ impl McpCore {
             // report the delivery as simply gone.
             queue_unreadable: spool.unaccounted,
             draining: self.draining(),
-            queue_blocked_reason: self.blocked_by(spool.load_error),
+            queue_blocked_reason: self.blocked_by(spool.fault),
             roots: self.roots.roots(),
         })
     }
@@ -1598,6 +1623,19 @@ impl Drainer {
         if records.is_empty() {
             return;
         }
+        // A peer list that did not load answers `None` for every device on
+        // this machine, and the revocation branch below would read that as an
+        // unpairing: every record for every peer removed, every staged copy
+        // unpinned, and the collector free to take the bytes within the
+        // minute. One EACCES on peers.json — or one file written by a newer
+        // build — would empty the whole queue with nothing on any surface
+        // saying so. The same rule `live_tags` states for the spool and
+        // `save_list` states for the peer file itself: what this build cannot
+        // read is HIDDEN, not gone.
+        if let Some(reason) = self.peers.load_error() {
+            self.hold_peer(peer_id, &records, peer_list_blocked(reason));
+            return;
+        }
         // The device was unpaired since the send was accepted. Revocation
         // stays immediate: the bytes go now, not at the TTL.
         let Some(peer) = self.peers.get(peer_id) else {
@@ -1751,6 +1789,11 @@ impl Drainer {
     /// `server_status` shows a human: a record that is not moving has a
     /// reason, and a surface that shows the count without it is the silent
     /// failure this queue exists to remove.
+    ///
+    /// A write that does not land keeps that promise too, and not through
+    /// this log line: the spool holds the reason and reports it as its own
+    /// fault, so the status names the unwritable queue instead of showing a
+    /// record that reads "not tried yet" after every pass has tried it.
     fn note(&self, record: &Record, why: String) {
         if let Err(e) = self.outbox.record_attempt(&record.id, Some(why)) {
             eprintln!("vlerv-mcp: cannot record an attempt on {}: {e}", record.id);
@@ -1899,6 +1942,24 @@ fn needs_control(peer: &Peer, scope: &str, this_device: &str) -> String {
          pushing a file needs \"control\". On that device, open its Vlervtifacts peer \
          settings, find \"{this_device}\", and set its scope to \"control\".",
         label(peer)
+    )
+}
+
+/// What every record owned by a peer this server cannot look up is told, and
+/// what `server_status` reports as the reason the whole queue is stopped.
+///
+/// One producer for both, because they describe one condition. A `PeerStore`
+/// that did not load holds NO peers, so `get` answers `None` for every device
+/// on the machine and nothing downstream can tell a device that was unpaired
+/// from one that is merely hidden behind an unreadable file. The queue is HELD
+/// on that answer: the peer list is the authority for revocation, and reading
+/// its absence as a revocation deletes the records and unpins the copies of
+/// the user's files behind them.
+fn peer_list_blocked(reason: &str) -> String {
+    format!(
+        "held, not sent: this server cannot read its own peer list ({reason}), so it cannot \
+         tell a device that was unpaired from one it simply cannot see. Repair that file or \
+         move it aside; queued sends wait until it reads."
     )
 }
 
@@ -2406,16 +2467,17 @@ mod tests {
         // canonical too, so an uncanonicalized source would be held here for
         // a reason the drain never meant.
         let source = file.canonicalize().unwrap();
-        let hash = beam::stage_outbox(node, &source, &id).await.expect("staged bytes");
+        let staged = beam::stage_outbox(node, &source, &id).await.expect("staged bytes");
         core.outbox
             .enqueue(Staged {
                 id: id.clone(),
                 peer: peer.to_string(),
                 device: "Val's iPhone".to_string(),
                 name: source.file_name().unwrap().to_string_lossy().into_owned(),
-                size: std::fs::metadata(&source).unwrap().len(),
+                // Measured off the copy, exactly as `queue_send` does it.
+                size: staged.size,
+                hash: staged.hash,
                 source,
-                hash,
             })
             .expect("the record is written");
         id
@@ -2549,6 +2611,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn two_drain_passes_for_one_peer_deliver_each_file_exactly_once() {
+        // The in-flight-plus-redrive guard on `drain_peer`, held to what it
+        // promises. Both passes read the same record list before either has
+        // completed a record, so without the guard both push every file on
+        // it: the receiver keeps the second copy under the Beam collision
+        // rule, and the user gets a `report-2.html` nobody sent. A device
+        // that dials in while the 60 s tick is already draining it puts two
+        // triggers in the same moment, which is the case this covers.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        let mut queued: Vec<String> = Vec::new();
+        for name in ["report.html", "notes.html"] {
+            let file = workspace.path().join(name);
+            std::fs::write(&file, format!("<h1>{name}</h1>")).unwrap();
+            queue_staged(&core, &node, &phone_id, &file).await;
+            queued.push(name.to_string());
+        }
+
+        // One drainer, two passes at once — the same handles the supervisor
+        // and a wake would use, so the guard under test is the real one.
+        let drainer = core.drainer(&node);
+        tokio::join!(drainer.drain_peer(&phone_id), drainer.drain_peer(&phone_id));
+
+        let mut landed = received(&signals);
+        landed.sort();
+        queued.sort();
+        assert_eq!(landed, queued, "each queued file lands once, under the name it was sent with");
+        assert_eq!(
+            core.server_status().await.unwrap().queued_total,
+            0,
+            "and the spool is empty, so nothing is left for a later pass to send again"
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_reachable_peer_whose_records_are_all_held_still_steps_the_retry_ladder() {
         // The ladder used to be stepped only by a failed dial, a scope that
         // is too narrow or a dead session. A peer that ANSWERS, grants
@@ -2630,7 +2734,10 @@ mod tests {
         assert_eq!(status.queued_total, 1);
         assert_eq!(status.queued_bytes, body.len() as u64);
         assert_eq!(status.retained_bytes, body.len() as u64, "the copy is real and is counted");
-        assert!(!status.draining, "nothing drains in this build, and the status says so");
+        // The drain IS running — `send_to_device` booted it — and it owns no
+        // peer at this instant: each queued send stepped this device's retry
+        // ladder, so the pass its wake started found nothing due.
+        assert!(!status.draining, "no pass owns this peer, so the status must not claim one does");
         assert_eq!(status.queue_blocked_reason, None);
         assert!(status.queue_unreadable.is_empty());
         let queued = &status.queued[0];
@@ -2710,6 +2817,73 @@ mod tests {
             body.len() as u64,
             "and the refused replay cost the user no second copy"
         );
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_measures_the_copy_it_took_and_not_the_file_it_read() {
+        // The gate reads the file's length with `std::fs::metadata`, and the
+        // copy is taken later — after a whole dial to a device that does not
+        // answer, which costs up to DIAL_TIMEOUT. A user who saves the file in
+        // that window used to get a record whose size named the file that was
+        // READ and whose hash named the bytes that were COPIED.
+        //
+        // Two things then go wrong with one record. The status reports a size
+        // for bytes that are not those bytes; and the receiver checks the
+        // ANNOUNCED size against the transfer cap before it opens the stream
+        // and the real cap on the stream itself, so a record that under-states
+        // a file which grew past that cap is refused mid-transfer — and the
+        // drain HOLDS a refusal, so it retries once a pass for the whole
+        // seven-day TTL and can never land.
+        //
+        // The two steps are driven directly here rather than raced against a
+        // real dial: `send_to_device` runs exactly this pair, in this order,
+        // and the window between them is the dial it has already spent.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        let as_read = "<h1>the file as the gate measured it</h1>";
+        std::fs::write(&artifact, as_read).unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+        let node = core.node().await.unwrap();
+        let peer = core.peer_store().get(&asleep.endpoint.id().to_string()).unwrap();
+
+        let cand = core.gate_arg_path(artifact.to_str().unwrap()).expect("inside the roots");
+        assert_eq!(cand.size, as_read.len() as u64, "the candidate carries the file it read");
+
+        // The save the user makes while the send is still waiting on the dial.
+        let as_copied = "<h1>the file as it stood when the copy was actually taken, longer</h1>";
+        assert_ne!(as_read.len(), as_copied.len(), "the proof needs the two lengths to differ");
+        std::fs::write(&artifact, as_copied).unwrap();
+
+        let accepted = core
+            .queue_send(&node, &peer, &cand, "peer offline".to_string())
+            .await
+            .expect("a device that did not answer is queued");
+        let Delivery::Queued { size, hash, .. } = accepted else {
+            panic!("a device that did not answer must be queued, never delivered: {accepted:?}");
+        };
+        assert_eq!(size, as_copied.len() as u64, "the record announces the copy it took");
+
+        // And the size and the hash describe the SAME bytes, which is the
+        // whole invariant. The store is content-addressed, so staging those
+        // bytes a second time is what names them independently.
+        let twin = workspace.path().join("same-bytes.html");
+        std::fs::write(&twin, as_copied).unwrap();
+        let proof = beam::stage_outbox(&node, &twin.canonicalize().unwrap(), &core.outbox.next_id())
+            .await
+            .expect("staged bytes");
+        assert_eq!(hash, proof.hash, "the address the record carries is the copy's own");
+        assert_eq!(proof.size, size, "and the length beside it is that copy's length");
+
+        // The surface a human reads says the same, because it reads the record.
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_bytes, as_copied.len() as u64);
+        assert_eq!(status.queued[0].size, as_copied.len() as u64);
 
         asleep.router.shutdown().await.ok();
     }
@@ -2835,6 +3009,186 @@ mod tests {
         );
 
         asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_list_that_did_not_load_holds_the_queue_instead_of_destroying_it() {
+        // `PeerStore::load` answers a parse failure, a newer `PEERS_SCHEMA`
+        // and any I/O error that is not NotFound the same way: an EMPTY list
+        // plus a `load_error`. `get` never consults that error, so after one
+        // EACCES on peers.json every device on this machine looks unpaired —
+        // and the drain read that as a revocation, removed every record and
+        // unpinned every staged copy, which the collector then took within
+        // the minute. `server_status` reported an empty queue with no reason
+        // beside it.
+        //
+        // The rest of this stack already holds instead: `live_tags` answers
+        // `None` on a spool that did not load so no sweep runs, and
+        // `save_list` refuses to write over a peer file it could not read.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let dirs = Dirs::new(state.path());
+        std::fs::create_dir_all(dirs.remote()).unwrap();
+        std::fs::write(dirs.remote().join("peers.json"), "{not json").unwrap();
+
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        let node = core.node().await.expect("an unreadable peer list still boots an endpoint");
+        let artifact = workspace.path().join("report.html");
+        let body = "<h1>owed to a device this build cannot look up</h1>";
+        std::fs::write(&artifact, body).unwrap();
+        // The peer is named by the record alone, which is the situation: the
+        // file that would confirm the pairing is the one that will not read.
+        let phone_id = "ab".repeat(32);
+        let id = queue_staged(&core, &node, &phone_id, &artifact).await;
+
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        // All three halves of the promise survive the pass.
+        let record = dirs.outbox().join(format!("{id}.json"));
+        assert!(record.is_file(), "the record file is still there: {record:?}");
+        assert!(
+            node.store.tags().get(outbox::tag_name(&id)).await.unwrap().is_some(),
+            "and so is the pin, which is the only thing keeping the copy off the collector"
+        );
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 1, "the delivery is hidden, not gone");
+        assert_eq!(status.retained_bytes, body.len() as u64);
+        assert!(beam::outbox_bytes_present(&node, &status.queued[0].hash).await);
+
+        // And the human is told, on the record and on the server, that the
+        // peer list is what stopped it — a queue that only stopped moving is
+        // the silent failure this whole surface exists to remove.
+        let blocked = status.queue_blocked_reason.as_deref().unwrap_or_default();
+        assert!(blocked.contains("peer list"), "the status names the cause, got: {blocked:?}");
+        let held = status.queued[0].last_error.as_deref().unwrap_or_default();
+        assert!(held.contains("peer list"), "and so does the record, got: {held:?}");
+    }
+
+    /// Unix only: the proof is a directory mode, and it is the shape the
+    /// failure takes in the wild — a state directory on a read-only mount, or
+    /// one whose owner changed after a restore from backup.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spool_that_cannot_be_written_says_so_instead_of_reporting_an_untried_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `record_attempt` saves the file before it updates the record in
+        // memory, so a spool this process cannot write keeps handing back a
+        // record that has never been attempted — after every pass has
+        // attempted it. Only stderr knew, and the status surface showed a
+        // count beside "not tried yet", which is what a queue that is about
+        // to move looks like.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let phone = deaf_device(&phone_dir).await;
+        let core = core_paired_with(&state, &workspace, &phone).await;
+        let node = core.node().await.unwrap();
+        let phone_id = phone.endpoint.id().to_string();
+
+        let artifact = workspace.path().join("report.html");
+        std::fs::write(&artifact, "<h1>owed to a device that does not answer</h1>").unwrap();
+        queue_staged(&core, &node, &phone_id, &artifact).await;
+
+        // Read-only after the record is on disk: the pending list still reads,
+        // and no attempt can be written beside it. Restored before the
+        // assertions, so a failing one cannot leave a directory the temp dir
+        // is unable to clean up.
+        let outbox_dir = Dirs::new(state.path()).outbox();
+        let writable = std::fs::metadata(&outbox_dir).unwrap().permissions();
+        std::fs::set_permissions(&outbox_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        core.drainer(&node).drain_peer(&phone_id).await;
+        let stuck = core.server_status().await.unwrap();
+        std::fs::set_permissions(&outbox_dir, writable).unwrap();
+
+        assert_eq!(stuck.queued_total, 1, "the delivery is still owed");
+        assert_eq!(stuck.queued[0].attempts, 0, "the pass had nowhere to write what it found");
+        assert_eq!(stuck.queued[0].last_error, None, "so the record itself still reads untried");
+        // Which is why the reason has to be on the server: the record cannot
+        // carry it, and a status that stayed silent would report a queue
+        // failing every pass as one waiting for a phone to wake up.
+        let blocked = stuck.queue_blocked_reason.as_deref().unwrap_or_default();
+        assert!(
+            blocked.contains("send queue could not be written"),
+            "the status names the write failure, got: {blocked:?}"
+        );
+        assert!(
+            blocked.contains("Permission denied"),
+            "and quotes what the filesystem said, got: {blocked:?}"
+        );
+
+        // The other half, and the reason this is not a latch: the fault ends
+        // at the next write that lands. A reason kept after the volume came
+        // back would refuse every later send over a failure that is over.
+        core.drainer(&node).drain_peer(&phone_id).await;
+        let healed = core.server_status().await.unwrap();
+        assert_eq!(healed.queue_blocked_reason, None, "a spool that takes a write is not blocked");
+        assert_eq!(healed.queued[0].attempts, 1, "and the attempt is on disk this time");
+        assert!(
+            healed.queued[0].last_error.is_some(),
+            "with the reason the pass found: {:?}",
+            healed.queued[0]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpairing_a_device_releases_the_copies_it_was_owed_instead_of_keeping_them_to_the_ttl()
+    {
+        // The other side of the rule above, and the reason it has to be a
+        // hold rather than a skip: a peer list that DID read and no longer
+        // names the device is a revocation, and a revocation takes effect
+        // now. Every record for that device is a private full copy of a user
+        // file inside this server's state directory, and keeping one for a
+        // week after the human unpaired the device it was for is the outcome
+        // this queue must never produce.
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let core = McpCore::new(
+            state.path().to_path_buf(),
+            vec![workspace.path().to_path_buf()],
+            workspace.path().to_path_buf(),
+            None,
+        );
+        // No device is stood up: a pass for a peer the store no longer names
+        // never dials, which is exactly what makes the revocation immediate.
+        let phone_id = "cd".repeat(32);
+        core.peer_store().seed(&phone_id, "Val's iPhone", Scope::Control).unwrap();
+        let node = core.node().await.unwrap();
+
+        let mut ids = Vec::new();
+        let mut owed = 0u64;
+        for n in 0..2 {
+            let artifact = workspace.path().join(format!("report-{n}.html"));
+            let body = format!("<h1>accepted while the device was still paired: {n}</h1>");
+            std::fs::write(&artifact, &body).unwrap();
+            owed += body.len() as u64;
+            ids.push(queue_staged(&core, &node, &phone_id, &artifact).await);
+        }
+        let before = core.server_status().await.unwrap();
+        assert_eq!(before.queued_total, 2);
+        assert_eq!(before.retained_bytes, owed, "two copies, on this disk, right now");
+
+        assert!(core.peer_store().remove(&phone_id).unwrap(), "the human unpairs the device");
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 0, "nothing is owed to a device that is not paired");
+        assert_eq!(status.retained_bytes, 0, "and nothing is kept on this disk for it");
+        for id in &ids {
+            assert!(
+                !Dirs::new(state.path()).outbox().join(format!("{id}.json")).exists(),
+                "the record file goes, or the next boot brings the delivery back"
+            );
+            assert!(
+                node.store.tags().get(outbox::tag_name(id)).await.unwrap().is_none(),
+                "and its pin goes with it, or the copy stays on disk for the life of the install"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

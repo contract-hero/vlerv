@@ -196,7 +196,7 @@ export default function BeamDialog(): React.ReactElement | null {
  * (fetch counts, expiry, Stop) plus recent received files (fetched lazily
  * on open — the popover is the only place the list renders). */
 export function BeamIndicator(): React.ReactElement | null {
-  const { offers, received, stopError } = useBeamState();
+  const { offers, received, stopError, receivedError } = useBeamState();
   const { stopOffer, openReceived, refreshReceived } = useBeamActions();
   const [open, setOpen] = React.useState(false);
   React.useEffect(() => {
@@ -228,6 +228,9 @@ export function BeamIndicator(): React.ReactElement | null {
           <div className="beam-popover" role="menu">
             {stopError ? (
               <p className="beam-error" role="alert">{stopError}</p>
+            ) : null}
+            {receivedError ? (
+              <p className="beam-error" role="alert">{receivedError}</p>
             ) : null}
             <div className="beam-popover-title">Beaming</div>
             {offers.map((o) => (
