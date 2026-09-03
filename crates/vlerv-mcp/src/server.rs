@@ -365,7 +365,7 @@ fn status_summary(status: &ServerStatus) -> String {
     };
     format!(
         "{} — node {}\nidentity: {}\nnetwork booted: {}\nuptime: {}s\npaired devices: \
-         {}\nactive beam links: {}\nreceived this session: {}{}\n{}",
+         {}\nactive beam links: {}\nreceived this session: {}{}\n{}{}",
         status.device,
         status.node_id_short,
         status.identity_dir.display(),
@@ -375,7 +375,40 @@ fn status_summary(status: &ServerStatus) -> String {
         status.active_offers.len(),
         status.received_total,
         listed,
-        queue_line(status)
+        queue_line(status),
+        abandoned_line(status)
+    )
+}
+
+/// Deliveries that ENDED, and nothing at all when there are none.
+///
+/// Empty is the normal state, and a line saying "0 abandoned" on every status
+/// call would be noise a reader learns to skip — which is the wrong habit for
+/// the one line that reports a file somebody was promised and will not get.
+/// Each entry names the file, the device and the reason, because "1 delivery
+/// was abandoned" sends the reader looking for which one.
+fn abandoned_line(status: &ServerStatus) -> String {
+    if status.abandoned.is_empty() {
+        return String::new();
+    }
+    let listed: Vec<String> = status
+        .abandoned
+        .iter()
+        .map(|a| format!("- {} to {} ({}) — {}", a.name, a.device, human_bytes(a.size), a.reason))
+        .collect();
+    // The same claim `received_total` makes: a shortened list must say it is
+    // shortened, or it reads as the whole account.
+    let shortened = if status.abandoned_total as usize > status.abandoned.len() {
+        format!(" (listing the last {})", status.abandoned.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "\nGIVEN UP ON in this session: {}{} — these files did NOT arrive and are no longer \
+         queued. Tell the user:\n{}",
+        status.abandoned_total,
+        shortened,
+        listed.join("\n")
     )
 }
 
@@ -588,6 +621,8 @@ mod tests {
             queued_bytes: 0,
             retained_bytes: 0,
             queue_unreadable: Vec::new(),
+            abandoned: Vec::new(),
+            abandoned_total: 0,
             draining: false,
             queue_blocked_reason: None,
             roots: Vec::new(),
@@ -635,6 +670,38 @@ mod tests {
         // The boundary: exactly at the cap, nothing was dropped.
         let at_cap = status_summary(&status_with(100, 100));
         assert!(!at_cap.contains("listing"), "{at_cap}");
+    }
+
+    #[test]
+    fn a_delivery_that_was_given_up_on_is_named_and_a_quiet_session_says_nothing() {
+        // A count on its own would send the reader looking for which file,
+        // and "0 abandoned" on every call is noise a reader learns to skip —
+        // the wrong habit for the one line that reports a promise this server
+        // broke.
+        let quiet = status_summary(&status_with(0, 0));
+        assert!(!quiet.contains("GIVEN UP ON"), "nothing died, so nothing is said: {quiet}");
+
+        let mut status = status_with(0, 0);
+        status.abandoned = vec![crate::core::AbandonedDelivery {
+            id: "1700000000001-0000".to_string(),
+            device: "Val's iPhone".to_string(),
+            name: "report.html".to_string(),
+            size: 2048,
+            reason: "it was not delivered within the seven-day limit".to_string(),
+            at: 1_700_000_000,
+        }];
+        status.abandoned_total = 1;
+        let told = status_summary(&status);
+        assert!(told.contains("GIVEN UP ON in this session: 1"), "{told}");
+        assert!(told.contains("report.html to Val's iPhone (2 KiB)"), "{told}");
+        assert!(told.contains("seven-day limit"), "{told}");
+        assert!(told.contains("did NOT arrive"), "the reader is told what it means: {told}");
+        assert!(!told.contains("listing the last"), "nothing was dropped: {told}");
+
+        // Same claim `received_total` makes: a shortened list must say so, or
+        // it reads as the whole account of what was lost.
+        status.abandoned_total = 60;
+        assert!(status_summary(&status).contains("(listing the last 1)"));
     }
 
     #[test]
