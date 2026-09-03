@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::api::Tag;
@@ -75,6 +75,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// QUIC close code for a refused session. The value is arbitrary; the peer
 /// only needs to see that it was refused, not why.
 const CLOSE_REFUSED: u32 = 1;
+
+/// Display cap on a close reason a peer wrote. Every reason this crate sends
+/// is three or four words; the bound is here because the bytes belong to
+/// another machine, and they end up in a sentence a human reads.
+const MAX_CLOSE_REASON_CHARS: usize = 100;
 
 /// Subject of every failed dial this module makes — a session, a pairing
 /// handshake, a cache fetch. `endpoint::dial` appends the cause, and a
@@ -1189,6 +1194,43 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
+/// What the peer SAID when it closed, when it closed on purpose.
+///
+/// `ScopeServer::accept` turns a dial from a device that has unpaired this
+/// node away by closing with `CLOSE_REFUSED` and the reason
+/// `not a paired peer` — before `accept_bi`, so no application frame is ever
+/// written and `classify_ack` never sees the `Res::Denied` that would carry
+/// it. The close bytes DO arrive here. Without this, every stream call on the
+/// dead connection reports only `connection lost`, and the sentence built
+/// from that sends the user to check a network that is working, about a
+/// device that is awake and refusing this node on purpose.
+///
+/// The text is written by another machine, so it passes the crate's one strip
+/// set before it reaches a human, exactly like a device name. Nothing
+/// branches on it: it is DISPLAYED, never matched. A refusal is already known
+/// to be a refusal from the variant, which is decided here rather than read
+/// back out of the string.
+fn stated_refusal(connection: &Connection) -> Option<String> {
+    // Every other variant is the transport's own account of a connection that
+    // died, which `read_frame` already renders as well as this could. Only an
+    // application close carries a sentence some peer chose to write.
+    let ConnectionError::ApplicationClosed(close) = connection.close_reason()? else {
+        return None;
+    };
+    let said = proto::strip_spoofing_chars(
+        &String::from_utf8_lossy(&close.reason),
+        MAX_CLOSE_REASON_CHARS,
+    );
+    let said = said.trim();
+    (!said.is_empty()).then(|| said.to_string())
+}
+
+/// One post-dial failure, told in the peer's own words when it left any and
+/// in the transport's when it did not.
+fn refusal(connection: &Connection, transport: String) -> ConnectError {
+    ConnectError::Refused(stated_refusal(connection).unwrap_or(transport))
+}
+
 /// Why a push did not land, split the same way and for the same reason.
 ///
 /// `Local` and `Denied` are answers about THIS request and repeating them
@@ -1281,24 +1323,33 @@ impl ClientSession {
         // Everything from here on happens on a connection the peer accepted,
         // so it is a refusal even when it reads like a network fault. Calling
         // any of it unreachable would let a broken stream look like a nap.
+        //
+        // Each of the three asks the connection for a stated reason first: a
+        // peer that closed on purpose left one, and it is the only text on
+        // this path that says WHY. The transport's own wording is the
+        // fallback, so a connection that merely broke reads as it always did.
         let (mut send, mut recv) = connection
             .open_bi()
             .await
-            .map_err(|e| ConnectError::Refused(format!("cannot open the session stream: {e}")))?;
+            .map_err(|e| refusal(&connection, format!("cannot open the session stream: {e}")))?;
 
         write_frame(
             &mut send,
             &Req::Hello { proto: proto::PROTO_VERSION, device },
         )
         .await
-        .map_err(ConnectError::Refused)?;
+        .map_err(|e| refusal(&connection, e))?;
 
+        // The timeout arm stays UNREACHABLE and asks nothing: a peer that
+        // took the connection and then said nothing has closed nothing, so
+        // there is no reason to read, and it is the one shape here that
+        // really does mean asleep.
         let ack = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame::<Frame>(&mut recv))
             .await
             .map_err(|_| {
                 ConnectError::Unreachable("the peer did not answer the handshake".to_string())
             })?
-            .map_err(ConnectError::Refused)?;
+            .map_err(|e| refusal(&connection, e))?;
         let (host_device, scope) = classify_ack(ack)?;
 
         let (req_tx, mut req_rx) = mpsc::channel::<(Req, oneshot::Sender<Res>)>(32);
@@ -2430,6 +2481,76 @@ mod tests {
             PushFailure::Denied("not permitted for this peer".to_string()).to_string(),
             "not permitted for this peer"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_unpaired_this_node_says_so_instead_of_reading_as_a_dead_link() {
+        // The proof that gives this fix its whole reason: a REAL dial at a
+        // real host that does not list the dialer. The test above drives
+        // `classify_ack` with a synthetic `Res::Denied`, which this path
+        // never produces — `accept` closes the connection before `accept_bi`,
+        // so no application frame is ever written and the only account of the
+        // refusal is the QUIC close reason. Before this, every call on the
+        // dead connection answered `stream ended: connection lost`, and the
+        // user was told to check a device that was awake and refusing on
+        // purpose.
+        let host_dir = tempfile::TempDir::new().unwrap();
+        let dialer_dir = tempfile::TempDir::new().unwrap();
+        // An EMPTY peer store is the unpair: `accept` looks the dialer up,
+        // misses, and refuses. Seeding nothing is the same state the device
+        // is in a moment after its owner removes this server.
+        let host = endpoint::boot(
+            &Dirs::new(host_dir.path()),
+            Some(state(&host_dir, RootSet::empty())),
+            |_| {},
+        )
+        .await
+        .expect("the host is up");
+        let dialer = endpoint::boot(&Dirs::new(dialer_dir.path()), None, |_| {})
+            .await
+            .expect("the dialer is up");
+
+        // Loopback, so the proof depends on no relay and no discovery.
+        let addr = endpoint::addr_at(
+            &host.endpoint.id().to_string(),
+            endpoint::loopback_socket(&host).await.expect("the host bound a port"),
+        )
+        .unwrap();
+        let failed = ClientSession::connect(
+            &dialer,
+            addr,
+            "Claude Code".to_string(),
+            |_| {},
+            || {},
+        )
+        .await
+        .expect_err("a host that does not list this node refuses it");
+
+        assert_eq!(
+            failed,
+            ConnectError::Refused("not a paired peer".to_string()),
+            "the receiver's own word for it, recovered from the close it already sent"
+        );
+        // The variant matters as much as the text: `Unreachable` is the queue
+        // door, and staging a private copy of the user's file for a device
+        // that is refusing this server is what that door must never open for.
+        assert!(matches!(failed, ConnectError::Refused(_)), "and it is not read as a nap");
+
+        host.router.shutdown().await.ok();
+        dialer.router.shutdown().await.ok();
+    }
+
+    #[test]
+    fn a_close_reason_from_another_machine_is_bounded_before_a_human_reads_it() {
+        // `stated_refusal` needs a live connection, so the treatment its text
+        // gets is pinned on the function that applies it. The reason is
+        // written by the peer, and it lands in a sentence a human reads: the
+        // same strip set a device name goes through, and a cap, because
+        // neither the length nor the characters are this machine's to trust.
+        let spoof = format!("not a paired peer\u{202E}{}", "x".repeat(500));
+        let shown = proto::strip_spoofing_chars(&spoof, MAX_CLOSE_REASON_CHARS);
+        assert!(!shown.contains('\u{202E}'), "no bidi override survives into the message");
+        assert_eq!(shown.chars().count(), MAX_CLOSE_REASON_CHARS, "and the length is bounded");
     }
 
     #[test]
