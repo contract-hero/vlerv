@@ -330,8 +330,8 @@ delivery must be an atomic <code>remove_file</code> that cannot lose an unrelate
 document must poison one delivery rather than the whole spool.</p>
 
 <pre><code>pub struct Record {
-    pub id: String,          // "{unix_millis:013}-{seq:04}-{hash[..8]}"
-    pub peer: String,        // 64-hex NodeId, the peers.json key
+    pub id: String,          // "{unix_millis:013}-{seq:04}"
+    pub peer: String,        // 64-hex EndpointId, the peers.json key
     pub device: String,      // display only, as it stood at enqueue
     pub source: PathBuf,     // the canonical path the gate resolved
     pub name: String,
@@ -348,6 +348,12 @@ document must poison one delivery rather than the whole spool.</p>
 <p>The record holds no <code>BlobTicket</code> and no grant. Both are minted per attempt: a stored ticket names
 addresses this process no longer has, and grants are in-memory with a one-hour lifetime.</p>
 
+<p>The id carries no content suffix, and it cannot: the tag name has to exist before the single staging await
+that both copies the bytes and pins them, while the content address only exists once that await has returned.
+So the counter is the whole of what makes an id unique, and it is seeded past every sequence number the
+directory already holds rather than restarted at 0 — a machine whose clock reports a time before 1970 stamps
+every id <code>0000000000000</code>, and a restart would then mint an id an earlier run already used.</p>
+
 <h3>Caps</h3>
 <table>
 <thead><tr><th>Constant</th><th>Value</th><th>Behaviour at the limit</th></tr></thead>
@@ -356,7 +362,7 @@ addresses this process no longer has, and grants are in-memory with a one-hour l
 <tr><td><code>MAX_SPOOL_BYTES</code></td><td>1 GiB</td><td>refuse the send</td></tr>
 <tr><td><code>RECORD_TTL_SECS</code></td><td>7 days</td><td>expire, unpin, report in <code>server_status</code></td></tr>
 <tr><td><code>DRAIN_TICK</code></td><td>60 s</td><td>timer branch, skipped while the spool is empty</td></tr>
-<tr><td><code>MAX_PER_PASS</code></td><td>8</td><td>records per peer per pass, in id order</td></tr>
+<tr><td><code>MAX_PER_PASS</code></td><td>8</td><td>pushes per peer per pass, walking the records in id order</td></tr>
 </tbody>
 </table>
 
@@ -371,15 +377,31 @@ so the store's copy is independent of the source. Staging is one await —
 automatic one, whose crash window leaks an <code>auto-*</code> tag that an <code>outbox/</code> prefix sweep can
 never collect.</p>
 
-<h3>Corruption policy, split by cause</h3>
+<h3>Corruption policy: three causes, one list</h3>
+
+<p>Every stem the spool could not put on the record list lands on the same <code>unaccounted</code> vector, and
+every one of them stays in the tag keep-set — bytes this build cannot account for are the last thing it should
+delete. One list rather than three, because all three consumers want exactly that union: the keep-set, the id
+counter and the status surface. Split, a fourth cause would reach only the lists somebody remembered to widen,
+and a stem missing from the keep-set unpins a pending send with no error anywhere. What the cause decides is
+what happens to the file:</p>
+
 <ul>
-<li>A record this build cannot parse is renamed to <code>&lt;id&gt;.json.broken.&lt;unix&gt;</code>, counted, never replayed. Its stem stays in the tag keep-set.</li>
-<li>A record with a newer schema version is left byte for byte alone, counted, and its stem stays in the keep-set.</li>
-<li>If the outbox directory itself cannot be read, <code>enqueue</code> refuses and the tag sweep does not run.</li>
+<li>A record this build cannot parse is renamed to <code>&lt;id&gt;.json.broken.&lt;unix&gt;</code> and never replayed. No later boot changes that answer.</li>
+<li>A record written by a newer schema version is left byte for byte alone, for the build that can read it.</li>
+<li>A record whose bytes would not read at all — EACCES after a permissions repair, a changed owner after a restore, EIO on a bad sector — is left alone too. The record behind it may be perfectly valid, and quarantining it would rename a promised delivery and abandon it over a condition that passes on its own.</li>
 </ul>
 
+<p>The list is surfaced by NAME on <code>server_status.queue_unreadable</code>, never as a count: each entry is a
+delivery that is quietly not happening. A quarantined stem stays on it at every later boot, not only the boot
+that moved the file aside, because the alternative is a delivery reported once and then silently forgotten.</p>
+
+<p>The outbox DIRECTORY failing to read is a wider failure than any of the three, and it is handled apart:
+<code>enqueue</code> refuses, the tag sweep does not run, and <code>queue_blocked_reason</code> carries the
+cause.</p>
+
 <aside class="error">
-<p><strong>The data-loss path this guards.</strong> Without both guards, one unreadable spool makes the live set
+<p><strong>The data-loss path these guards close.</strong> Without them, one unreadable spool makes the live set
 empty, the sweep unpins every staged copy, and the pending files are gone with no error.</p>
 </aside>
 
@@ -392,11 +414,20 @@ unpin a queued file an hour after enqueue and the drain would push a hash with n
 grants are still removed from the map and still refused by <code>admit</code> — only the tag collection is
 conditional.</p>
 
-<aside class="warning">
-<p><strong>Deleting a tag frees no disk today.</strong> <code>Blobs::delete</code> is <code>pub(crate)</code> and
-<code>FsStore::load</code> sets <code>gc: None</code>. Until step 8 ships, every queued item is a permanent
-private copy inside the state directory. <code>server_status</code> must report the retained bytes and
-<code>README-MCP.md</code> must say so plainly.</p>
+<p>The hour is kept PER PEER, in a map from <code>EndpointId</code> to expiry, because unrelated callers share
+one hash. A queued send re-grants the same bytes to its own device on every attempt that reaches a push, and
+one grant-wide clock would let that repetition renew a browse capability some other peer earned once. So
+<code>take_expired</code> drops the lapsed peers first and takes the entry — and its tag — only when the LAST
+peer lapses: dropping the whole entry on the first lapse would free bytes a peer still inside its hour is
+allowed to fetch. <code>revoke_peer</code> splits the same way for unpairing.</p>
+
+<aside class="success">
+<p><strong>Deleting a tag frees disk.</strong> Step 8 shipped, so this is no longer a caveat.
+<code>endpoint::boot</code> opens the store through <code>FsStore::load_with_opts</code> with a
+<code>GcConfig</code> on a 60-second interval, and the collector roots on persistent tags plus an import's temp
+tags. A pin released by a delivered record, a revoked link or an expired grant is reclaimed at the next
+collection. <code>server_status.retained_bytes</code> still reports what the queue is holding, and it is now a
+floor by about a minute rather than for the life of the install.</p>
 </aside>
 </section>
 
@@ -418,6 +449,12 @@ possible relay traversal, so each avoided dial is one less third-party observati
 
 <p>Records are grouped by peer before dialing. A dial to a suspended peer costs the full 30-second timeout, so
 five records for one sleeping phone must cost one dial, not five.</p>
+
+<p>The peers then run TOGETHER, not one after another: the pass collects every due peer and drives them under
+one <code>join_all</code> on the supervisor's own task, the way <code>list_devices { probe: true }</code> probes.
+Serial peers would make one sleeping phone hold up a delivery to a phone that is awake, and a fleet with three
+sleepers would pay three dial timeouts before the fourth device is tried. It is still one task, so two passes
+cannot overlap; the per-peer in-flight guard is what stops anything else pushing a record twice.</p>
 </section>
 
 <section id="plan">
@@ -445,9 +482,13 @@ after the read loop breaks, so the error can be observed while both flags still 
 <p><code>Grant.tag</code> becomes <code>Option&lt;Tag&gt;</code>; <code>take_expired</code> and
 <code>revoke_peer</code> keep their predicates and only collect <code>Some</code> tags. Add
 <code>Grants::grant_pinned</code>. Add <code>push_staged</code>, <code>push_staged_at</code> and
-<code>push_staged_via</code> beside the existing push trio: they take a hash instead of a path, guard
-<code>hash_hex.len() == 64</code> before <code>Hash::from_str</code>, re-grant per attempt, and mint a fresh
-<code>BlobTicket</code> on the current endpoint address. The no-argument form carries the bounded 10-second
+<code>push_staged_via</code> beside the existing push trio: they take a hash instead of a path, parse it
+through <code>beam::parse_hash</code>, re-grant per attempt, and mint a fresh <code>BlobTicket</code> on the
+current endpoint address. The length guard lives in <code>parse_hash</code> rather than at this call site,
+and four call sites share it. That is the whole reason the helper exists: <code>Hash::from_str</code> reads
+any string that is not 64 characters as base32 and can PANIC on malformed input, and every one of those
+callers hands it a string this process did not mint — an offer id off IPC, a content address off the wire,
+one read back out of a hand-editable record file. The no-argument form carries the bounded 10-second
 <code>endpoint.online()</code> wait; omitting it would mint a ticket with no relay address, which delivers on
 the same LAN and fails everywhere else.</p>
 </details>
@@ -459,7 +500,12 @@ the same LAN and fails everywhere else.</p>
 <code>every_path_derives_from_the_one_base</code>. The new module carries <code>Record</code>,
 <code>Outbox</code>, the five constants and the load / enqueue / complete / expire surface. Persistence copies
 the shape of <code>peers.rs:351-377</code>: disk before memory, tmp plus rename, 0600, the mutex never held
-across an await. The id is claimed with <code>create_new</code> so a backwards clock jump fails loudly instead
+across an await. The tmp-plus-rename is not copied twice, though — it is lifted into one writer,
+<code>paths::write_private_atomic</code>, and <code>PeerStore::save_list</code> now calls the same function.
+A second private writer is how one of these capability documents silently loses its 0600, and the staging
+name is load-bearing for the spool: it appends <code>.tmp</code> rather than replacing the extension, because
+the record reader keys off the last extension and would read a <code>&lt;id&gt;.json</code> leftover back as a
+record. The id is claimed with <code>create_new</code> so a backwards clock jump fails loudly instead
 of overwriting an accepted send. No iroh type appears in any signature, per the <code>lib.rs</code> invariant.</p>
 </details>
 
@@ -485,12 +531,19 @@ contract the tests already assert: a registered but unused server still binds no
 then drop records whose bytes are gone, then the guarded orphan-tag sweep, then the supervisor, which runs one
 pass immediately. The supervisor is a single <code>select!</code> over the wake channel and the tick, so two
 passes cannot overlap by construction.</p>
-<p>Per pass: expire, group by peer, one task per peer. Per peer: unpaired means drop and unpin; unreachable
-records the attempt and ends the pass; a scope below control writes today's actionable instruction as
+<p>Per pass: expire, group by peer, then drive every due peer at once under one <code>join_all</code> on that
+same supervisor task. Per peer: unpaired means drop and unpin; unreachable records the attempt and ends the
+pass; a scope below control writes today's actionable instruction as
 <code>last_error</code>. Per record: a lexical roots check (not a fresh <code>canonicalize</code>, so a snapshot
 stays deliverable after the source is deleted), a bytes-present check, then the push. On success, delete the
 record file first and unpin second, so a crash between the two leaks a tag the next boot sweep collects rather
 than leaving a record whose bytes are gone.</p>
+<p><code>MAX_PER_PASS</code> is COUNTED over the pushes, never sliced off the front of the list. Only a record
+that reaches <code>push_staged</code> spends the session; a held or byte-less one costs a string compare.
+Spending the budget on skipped records starves the deliverable records behind them — the state directory is
+shared by every Claude Code session while <code>VLERV_MCP_ROOTS</code> is per project, so eight records another
+project queued for the same phone sit at the head of that peer's list as a matter of course, and the ninth
+would wait out the whole seven-day TTL behind them.</p>
 </details>
 
 <details>
@@ -508,18 +561,31 @@ and every variant costs both consumers an arm. The app's sink logs and returns; 
 <span class="step-files">app.rs · remote.rs · state/remote.tsx · Settings.tsx</span></summary>
 <p><strong>Without this step the fix is inert on a default install.</strong>
 <code>preferences.remote_listen</code> defaults to false and <code>listen_at_launch</code> returns before it
-spawns anything when the flag is off, so the phone boots no endpoint and the sender's dial can never connect.
-On iOS, boot whenever the peer store is non-empty, independent of the preference — the lazy-boot promise still
-holds for a fresh install with zero peers — and hide the toggle on iOS, because the phone is the receiver.</p>
+spawns anything when the flag is off, so the phone boots no endpoint and the sender's dial can never connect.</p>
+<p>What shipped is a one-way MIGRATION rather than a platform test in the predicate. The first launch of a
+receiver build that already trusts somebody writes <code>remote_listen: true</code> and a
+<code>remote_listen_adopted</code> marker, and <code>listens_at_launch</code> goes on reading the preference on
+both platforms. A platform test there would have made an off switch a lie: <code>state.json</code> would say the
+app listens to nobody while it binds a socket at every launch. The marker is what makes it one-way — a user who
+turns the switch back off stays off, because every later launch reads the marker and leaves the preference
+alone — and an unpaired install is left untouched, so the lazy-boot promise still holds for a fresh one.</p>
+<p>The Settings toggle therefore stays VISIBLE on iOS. The migration writes the value the backend reads, and
+hiding the row would leave a stored preference the user can neither see nor undo.</p>
 </details>
 
 <details>
-<summary>Step 8 — Real byte reclamation <span class="badge later">later</span>
+<summary>Step 8 — Real byte reclamation <span class="badge core">core</span>
 <span class="step-files">endpoint.rs · beam.rs · core.rs · README-MCP.md · STATUS.md</span></summary>
-<p>Switch <code>endpoint::boot</code> to <code>FsStore::load_with_opts</code> with a garbage-collection config,
-and sweep orphan <code>auto-*</code> tags at boot through the existing <code>beam::delete_tags</code>. The sweep
-is safe by construction because <code>StoreLock</code> means one process owns the store. Until this lands, the
-documentation must state that a queued send keeps a private copy inside the state directory.</p>
+<p>Both halves landed with the rest, so this is no longer deferred. <code>endpoint::boot</code> opens the store
+through <code>FsStore::load_with_opts</code> with a <code>GcConfig</code> on <code>GC_INTERVAL</code>, 60
+seconds — the same cadence the queue drains at — and sweeps orphan <code>auto-*</code> tags at boot through
+<code>beam::sweep_auto_tags</code>. The sweep is safe by construction because <code>StoreLock</code> means one
+process owns the store: an <code>auto-…</code>
+tag present at boot was written by a process that is gone, and both registries the request gate consults live
+in memory only, so no offer and no grant can name its hash again. <code>outbox/…</code> tags are deliberately
+left out of that sweep — they name a promise that DOES survive a restart, and the spool sweeps its own prefix
+behind its own guard. The collector sleeps one interval before its first run, which is why the boot sweep runs
+first: a session shorter than a minute frees nothing and leaves the work to the next boot.</p>
 </details>
 </section>
 
@@ -553,14 +619,17 @@ blob store", which reads like a queue bug and is not one.</p>
 </ul>
 
 <h3>Manual gates — there is no CI</h3>
-<pre><code>cargo test --workspace          # 215 today, all must stay green
-pnpm test                       # 148
+<pre><code>cargo test --workspace          # 289 with this branch, all must stay green
+pnpm test                       # 159
 npx tsc -p tsconfig.json
 cargo clippy --workspace --all-targets</code></pre>
 
+<p>The two counts were 215 and 148 on the commit this branch was cut from. Both numbers move with every step,
+so read them as "nothing may go red", not as a target.</p>
+
 <aside class="error">
 <p><strong>Do not run <code>cargo fmt</code>.</strong> There is no <code>rustfmt.toml</code>, and default rustfmt
-rewrites all 30 Rust files across 302 hunks.</p>
+rewrites 31 of the 37 Rust files across 386 hunks.</p>
 </aside>
 </section>
 
@@ -578,7 +647,6 @@ rewrites all 30 Rust files across 302 hunks.</p>
 <tr><td>Roots differ between projects</td><td>A record whose source path is outside the current roots is held, not delivered and not dropped. Visible in <code>server_status</code>; nothing tells the user which session can serve it.</td></tr>
 <tr><td>No cancel surface</td><td>A queued send is withdrawn only by deleting the record file. A tool was left out because every tool is a permanent model-facing surface.</td></tr>
 <tr><td>Wall-clock dependence</td><td>Backoff and expiry both use wall-clock time. A backwards jump delays retries; a forwards jump can expire a record early.</td></tr>
-<tr><td>Old installs stay broken until step 7</td><td>An iOS install that already persisted <code>remote_listen: false</code> accepts sends forever and drains none of them.</td></tr>
 </tbody>
 </table>
 </section>
@@ -605,8 +673,10 @@ rewrites all 30 Rust files across 302 hunks.</p>
 <p>Produced from a 12-agent design run: five readers mapped the sender, host, persistence, app and test layers
 with file-and-line evidence; three competing designs were judged on correctness, privacy and fit; the winner
 was synthesized with the losing proposals' best parts grafted in and every fatal flaw the judges named fixed.</p>
-<p>Repository: <code>/Users/valrov/workspace/vlerv</code> · line references are against the working tree at
-commit <code>5f98190</code>.</p>
+<p>Every file-and-line reference above names the tree as it stood at commit <code>5f98190</code>, the tip of
+<code>main</code> this branch was cut from — the state the design run read, before any of the code below it
+existed. The shipped files have moved those lines since. Read a reference as a pointer to the item it names,
+not to a line number in the file you have open.</p>
 </footer>
 
 </body>

@@ -91,12 +91,16 @@ struct Grant {
     /// artifact through a scoped session.
     ///
     /// The clock is per peer because unrelated callers share one hash. A
-    /// queued send re-grants the same bytes to the receiving device on every
-    /// delivery attempt, once a minute for as long as that device sleeps,
-    /// while another peer may hold a browse grant on the same file. One
-    /// grant-wide clock lets that retry loop renew the browse capability for
-    /// a week, so bytes a peer asked for once stay fetchable long after the
-    /// hour it was given.
+    /// queued send re-grants the same bytes to its receiving device once per
+    /// attempt that reaches a push: `grant_pinned` runs inside
+    /// `push_staged_via`, so a device that is asleep re-grants nothing — its
+    /// `dial_session` fails first — while a device that answers and then
+    /// refuses the bytes re-grants at the drain's own cadence, the retry
+    /// ladder from 60 s up to 10 min, for as long as that record lives.
+    /// Another peer may hold a browse grant on the same file the whole time.
+    /// One grant-wide clock lets those re-grants renew the browse capability
+    /// for the record's week, so bytes a peer asked for once stay fetchable
+    /// long after the hour it was given.
     peers: HashMap<EndpointId, u64>,
     /// The staging tag this grant OWNS, or `None` when the bytes are pinned
     /// by somebody with a longer memory than a grant has. `None` means
@@ -213,9 +217,10 @@ impl Grants {
     /// the send was reported as accepted.
     ///
     /// `admit` touches ONE peer's clock, which is what makes this safe to
-    /// call on a retry loop: the record for a sleeping device re-grants the
-    /// same hash every minute for up to a week, and it must not carry a
-    /// browse capability another peer earned along with it.
+    /// call on a retry loop: a record whose device answers the dial and then
+    /// refuses the bytes re-grants the same hash once per drain pass for up
+    /// to a week, and it must not carry a browse capability another peer
+    /// earned along with it.
     fn grant_pinned(&self, hash: Hash, peer: EndpointId) {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match map.get_mut(&hash) {
@@ -2290,7 +2295,7 @@ mod tests {
             .expect("boot");
 
         let record_id = "1700000000001-0000";
-        let hash = crate::beam::stage_outbox(&node, &queued, record_id).await.expect("stage");
+        let hash = crate::beam::stage_outbox(&node, &queued, record_id).await.expect("stage").hash;
         let staged: Hash = hash.parse().unwrap();
         node.grants.grant_pinned(staged, id(1));
 
@@ -2342,7 +2347,7 @@ mod tests {
             .expect("boot");
 
         let record_id = "1700000000003-0000";
-        let hash = crate::beam::stage_outbox(&node, &sent, record_id).await.expect("stage");
+        let hash = crate::beam::stage_outbox(&node, &sent, record_id).await.expect("stage").hash;
         let staged: Hash = hash.parse().unwrap();
         node.grants.grant_pinned(staged, id(1));
         // The push landed, so `complete` releases the record's pin.

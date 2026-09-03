@@ -692,8 +692,12 @@ async fn spool(core: &McpCore) -> usize {
     core.server_status().await.unwrap().queued_total
 }
 
-/// Poll a condition for up to five seconds. The eviction runs on the session's
-/// own reader task, so a test cannot observe it synchronously.
+/// Poll a condition for up to five seconds, for the three things this file
+/// asks about that no call here can settle: a session eviction, which runs on
+/// the session's own reader task; a drain pass, which runs on the supervisor
+/// task the boot spawned; and a store handover, which waits for a dropped
+/// process to release the blob-store claim. None of them is observable
+/// synchronously, and a fixed sleep would either be flaky or slow.
 async fn wait_until<F, Fut>(mut cond: F) -> bool
 where
     F: FnMut() -> Fut,

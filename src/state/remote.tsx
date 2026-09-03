@@ -139,9 +139,11 @@ export function RemoteProvider({
   // Mount: ONE peer fetch feeds both the list and the launch-time reconnect.
   React.useEffect(() => {
     reconnectAll("launch");
-    // Mount-only: the reconnect is one-time, not a live setting toggle —
-    // flipping the preference mid-session doesn't retroactively dial peers
-    // it missed.
+    // This EFFECT is mount-only, which is not the same as the reconnect
+    // being one-time: the `resumed` arm calls `reconnectAll` again on every
+    // iOS foreground hop. What stays one-time is reading the preference —
+    // flipping it mid-session doesn't retroactively dial the peers this
+    // launch missed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ipc]);
 

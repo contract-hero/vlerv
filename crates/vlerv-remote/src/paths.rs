@@ -23,7 +23,7 @@ pub const DEFAULT_IGNORED: &[&str] = &[
     ".venv",
 ];
 
-/// The base-directory seam. One state directory in, five derived paths out.
+/// The base-directory seam. One state directory in, six derived paths out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dirs {
     base: PathBuf,
@@ -106,9 +106,10 @@ pub fn mtime_secs(meta: &Metadata) -> u64 {
 }
 
 /// Write `bytes` to `path` with 0600 permissions, truncating an existing file.
-/// The one private-file writer in the crate: the identity key and the peer
-/// store are both "this file IS a capability" documents, and a second writer
-/// is how one of them silently loses its mode.
+/// The one private-file writer in the crate: the identity key, the peer store
+/// and every outbox record — which reaches this through
+/// `write_private_atomic` — are all "this file IS a capability" documents, and
+/// a second writer is how one of them silently loses its mode.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     write_private_inner(path, bytes, false)
 }

@@ -161,6 +161,22 @@ struct Spool {
     /// stands, `enqueue` refuses (so a caller reports a hard error instead of
     /// a false promise) and `live_tags` answers `None` (so no sweep runs).
     load_error: Option<String>,
+    /// Why the last write to this directory did not land, when it did not.
+    ///
+    /// `record_attempt` updates the in-memory record only after the file is
+    /// saved, so a spool on a read-only volume fails every pass while the
+    /// record it failed on still reads "not tried yet". The reason is kept
+    /// here instead of only on stderr, and `fault` hands it to the status
+    /// surface beside the load error: a queue that stopped moving with no
+    /// reason anywhere is the silent failure this spool exists to remove.
+    ///
+    /// Cleared by the next write that lands — a saved record or a removed
+    /// one. It blocks new sends while it stands, so a reason left behind
+    /// after the disk recovered would refuse every later send over a failure
+    /// that is already over. A `reload` starts clean for the same reason: a
+    /// directory read proves nothing about writing, and the next failed write
+    /// says so again on the pass right after it.
+    write_error: Option<String>,
     /// Every stem this build could not put on the record list above: parsed
     /// and quarantined to `.broken.<unix>`, written by a schema this build
     /// does not read, or not readable at all this time round.
@@ -179,15 +195,19 @@ struct Spool {
 }
 
 /// One consistent read of the spool: what is pending, what could not be
-/// accounted for, and why the directory did not load. `Outbox::report` is the
+/// accounted for, and why the spool stops the queue. `Outbox::report` is the
 /// only producer, and the three fields leave the lock together.
 pub struct Report {
     /// Every pending record, in id order. Same list `Outbox::list` returns.
     pub records: Vec<Record>,
     /// Same list `Outbox::unaccounted` returns.
     pub unaccounted: Vec<String>,
-    /// Same value `Outbox::load_error` returns.
-    pub load_error: Option<String>,
+    /// Same value `Outbox::fault` returns: the directory did not read, or the
+    /// last write did not land. One field rather than two, because every
+    /// caller wants the union — both stop the whole queue, and a caller that
+    /// took only the first would report a spool that fails every pass as a
+    /// healthy one.
+    pub fault: Option<String>,
 }
 
 /// Why one record file did not become a live record. All three answers keep
@@ -269,6 +289,13 @@ impl Outbox {
         self.guard().load_error.clone()
     }
 
+    /// Why this spool stops the whole queue, or `None`: the directory did not
+    /// read, or the last write to it did not land. For a caller that needs
+    /// the one answer without the record list `report` clones.
+    pub fn fault(&self) -> Option<String> {
+        self.guard().fault()
+    }
+
     /// Stems this build could not account for: moved aside as
     /// `<id>.json.broken.<unix>`, written by a newer schema and left
     /// byte-for-byte alone, or unreadable this time and also left alone so a
@@ -291,7 +318,7 @@ impl Outbox {
     /// lock.
     ///
     /// The three answers are shown side by side, so they must come from one
-    /// picture of the directory: `list`, `unaccounted` and `load_error` taken
+    /// picture of the directory: `list`, `unaccounted` and `fault` taken
     /// in turn each re-lock, and a `reload` between two of them lets a status
     /// name a record on the pending list AND on the unaccounted list, or
     /// report an empty queue beside no reason for it. It is the same argument
@@ -302,7 +329,7 @@ impl Outbox {
         Report {
             records: spool.records.values().cloned().collect(),
             unaccounted: spool.unaccounted.clone(),
-            load_error: spool.load_error.clone(),
+            fault: spool.fault(),
         }
     }
 
@@ -425,6 +452,8 @@ impl Outbox {
             let _ = std::fs::remove_file(&final_path);
             return Err(e);
         }
+        // This directory takes a write, whatever the last attempt note found.
+        spool.write_error = None;
         spool.records.insert(record.id.clone(), record.clone());
         Ok(record)
     }
@@ -517,7 +546,24 @@ impl Outbox {
         next.attempts = next.attempts.saturating_add(1);
         next.last_attempt_at = now_unix();
         next.last_error = error;
-        self.save_record(&next)?;
+        if let Err(e) = self.save_record(&next) {
+            // Disk before memory, so the record the caller can still see says
+            // "not tried yet" — and it will say that after every pass, on a
+            // volume this process cannot write. The reason is kept on the
+            // spool so `fault` can carry it to the status surface: a count
+            // beside an untried record is exactly the picture of a live retry
+            // loop that this queue exists to stop drawing.
+            let reason = format!(
+                "the send queue could not be written: {e}. The attempt on {id} is not on \
+                 disk, so that record still reads as never tried and every pass fails the \
+                 same way."
+            );
+            spool.write_error = Some(reason.clone());
+            return Err(reason);
+        }
+        // A write landed, so the fault above is over — left standing, it
+        // would refuse every later send over a failure that has passed.
+        spool.write_error = None;
         spool.records.insert(next.id.clone(), next);
         Ok(())
     }
@@ -566,6 +612,11 @@ impl Outbox {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot remove {path:?}: {e}")),
         }
+        // An unlink that lands is a write to this directory, so a delivery
+        // that completes ends the write fault as much as a saved record does.
+        // Without this, a spool that filled the disk once would keep refusing
+        // sends after the delivery that freed the space.
+        spool.write_error = None;
         Ok(spool.records.remove(id))
     }
 
@@ -607,6 +658,19 @@ fn room_in(spool: &Spool, device: &str, size: u64) -> Result<(), String> {
 }
 
 impl Spool {
+    /// The one reason this spool stops the queue, out of the two it can
+    /// carry. The load error comes first because it hides records, which is
+    /// the wider failure: a directory that will not read tells a reader
+    /// nothing about what is owed, while a write that will not land at least
+    /// leaves the pending list true.
+    ///
+    /// The order lives here alone. `Outbox::fault` and `Outbox::report` both
+    /// call it, so a send refused at one door and the status that explains
+    /// the refusal cannot name two different causes.
+    fn fault(&self) -> Option<String> {
+        self.load_error.clone().or_else(|| self.write_error.clone())
+    }
+
     /// One directory read. A missing directory is a fresh install, not a
     /// failure; a directory that cannot be READ is, because the difference
     /// between "nothing is queued" and "the queue is unreadable" decides
@@ -714,10 +778,19 @@ struct VersionOnly {
     v: u32,
 }
 
-/// Parse one record file. The id must match the file stem: `complete` derives
-/// the path it deletes from the id, so a record whose two names disagree
-/// would either delete a sibling's file or fail forever — and a hand edit is
-/// exactly how they come to disagree.
+/// Parse one record file. Both names it carries are checked against the file
+/// stem, and a hand edit is exactly how either comes to disagree.
+///
+/// The id must match: `complete` derives the path it deletes from the id, so a
+/// record whose two names disagree would either delete a sibling's file or
+/// fail forever.
+///
+/// The tag must be this stem's own `outbox/<id>`, because nothing downstream
+/// re-derives it. `live_tags` builds the sweep keep-set from the STORED tag
+/// and `complete` hands the STORED tag to `unpin_outbox`, so a record for A
+/// naming B's pin keeps B alive while the boot sweep unpins A's own bytes, and
+/// delivering A then releases the pin holding B's file while B is still
+/// pending.
 fn read_record(path: &Path, stem: &str) -> Result<Record, Fault> {
     // AN I/O ERROR IS NOT CORRUPTION. A record this build never managed to
     // read may be a perfectly good delivery behind a condition that passes —
@@ -742,6 +815,13 @@ fn read_record(path: &Path, stem: &str) -> Result<Record, Fault> {
         return Err(Fault::Unreadable(format!(
             "it calls itself {:?} but its file is named {stem:?}",
             doc.record.id
+        )));
+    }
+    if doc.record.tag != tag_name(stem) {
+        return Err(Fault::Unreadable(format!(
+            "it names the pin {:?}, and the only pin {stem:?} may name is {:?}",
+            doc.record.tag,
+            tag_name(stem)
         )));
     }
     Ok(doc.record)
@@ -1193,6 +1273,30 @@ mod tests {
     }
 
     #[test]
+    fn a_staging_file_a_crash_left_behind_is_never_read_back_as_a_record() {
+        // `write_private_atomic` writes `<id>.json.tmp` and renames it, so a
+        // process that dies mid-write leaves that name in this directory.
+        // Both readings of it are wrong: as a RECORD it would replay a
+        // half-written send whose bytes may never have been staged, and as an
+        // UNACCOUNTED stem it would enter the keep-set and hold a pin nothing
+        // ever releases — no delivery and no expiry can complete a record
+        // that does not exist.
+        let dir = tempfile::TempDir::new().unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        std::fs::create_dir_all(&outbox_dir).unwrap();
+        std::fs::write(
+            outbox_dir.join("0000000000003-0000.json.tmp"),
+            r#"{"v":1,"record":{"id":"0000000000003-0000","peer":"#,
+        )
+        .unwrap();
+
+        let out = spool(&dir);
+        assert!(out.is_empty(), "a half-written staging file is no queued send");
+        assert!(out.unaccounted().is_empty(), "and it names no record whose bytes must be kept");
+        assert_eq!(out.live_tags(), Some(Vec::new()), "so the sweep keeps nothing for it");
+    }
+
+    #[test]
     fn a_newer_schema_record_is_left_byte_for_byte_alone() {
         let dir = tempfile::TempDir::new().unwrap();
         let outbox_dir = dir.path().join("outbox");
@@ -1261,6 +1365,50 @@ mod tests {
         let reloaded = spool(&dir);
         assert!(reloaded.is_empty());
         assert_eq!(reloaded.unaccounted(), vec![id]);
+    }
+
+    #[test]
+    fn a_record_that_names_another_records_pin_is_quarantined_instead_of_trusted() {
+        // The stem check above cannot see this one: the id and the file name
+        // agree, and it is the TAG that names somebody else. Nothing
+        // downstream re-derives that tag — `live_tags` builds the sweep
+        // keep-set from the stored string and `complete` hands the stored
+        // string to `unpin_outbox` — so a record for A carrying B's tag keeps
+        // B's pin alive while the boot sweep unpins A's own bytes, and
+        // delivering A releases the pin holding B's file while B is still
+        // owed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = spool(&dir);
+        let victim = out.next_id();
+        out.enqueue(staged(&victim, "nodeA", "iPhone", 10)).unwrap();
+        let tampered = out.next_id();
+        out.enqueue(staged(&tampered, "nodeB", "iPad", 20)).unwrap();
+
+        // Only the tag is edited. `outbox/<id>` appears in the tag field and
+        // nowhere else, so the record still calls itself by its own id and
+        // still sits in the file that id names.
+        let path = dir.path().join("outbox").join(format!("{tampered}.json"));
+        let raw = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&tag_name(&tampered), &tag_name(&victim));
+        assert!(raw.contains(&format!("\"id\": \"{tampered}\"")), "the id half stands: {raw}");
+        std::fs::write(&path, &raw).unwrap();
+
+        let reloaded = spool(&dir);
+        assert_eq!(reloaded.list().len(), 1, "a record that names another pin is not a delivery");
+        assert_eq!(reloaded.list()[0].id, victim, "and the record it pointed at is untouched");
+        assert_eq!(reloaded.unaccounted(), vec![tampered.clone()]);
+        assert!(!path.exists(), "moved aside, the way every record this build cannot use is");
+
+        // Each stem keeps its OWN pin and no stem keeps another's: the victim
+        // through its record, the quarantined one through the unaccounted
+        // list, which is what stops the sweep taking bytes nobody can account
+        // for.
+        let mut keep = reloaded.live_tags().expect("a clean load answers");
+        keep.sort();
+        let mut expected = vec![tag_name(&victim), tag_name(&tampered)];
+        expected.sort();
+        assert_eq!(keep, expected);
     }
 
     #[test]

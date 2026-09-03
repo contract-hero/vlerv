@@ -17,7 +17,7 @@ import * as React from "react";
 import type { BeamOffer, BeamReceivedEntry, IpcSurface } from "../ipc";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { basename } from "../utils/path";
-import { arrivalOpensTab } from "./beam-burst";
+import { nextBurst } from "./beam-burst";
 import { useTabsDispatch } from "./TabsProvider";
 
 /** Payload of `vlerv://beam-send-request` (CLI / deep-link initiated). */
@@ -82,6 +82,10 @@ export interface BeamStateValue {
   receive: BeamReceiveState | null;
   /** Set when a revocation failed — the offer may still be served. */
   stopError: string | null;
+  /** Set when the Received list could not be refreshed. An arrival inside a
+   *  delivery run opens no tab, so the list is its only visible sign: a
+   *  refresh that fails silently loses the whole arrival. */
+  receivedError: string | null;
 }
 
 export interface BeamActionsValue {
@@ -128,6 +132,7 @@ export function BeamProvider({
   const [send, setSend] = React.useState<BeamSendState | null>(null);
   const [receive, setReceive] = React.useState<BeamReceiveState | null>(null);
   const [stopError, setStopError] = React.useState<string | null>(null);
+  const [receivedError, setReceivedError] = React.useState<string | null>(null);
 
   // Latest dialog state for the stable action callbacks — reading it via a
   // ref keeps the actions context identity-stable across progress events.
@@ -174,12 +179,27 @@ export function BeamProvider({
     setOffers(list);
   });
 
+  // The one path to the Received list, so an arrival and the popover that
+  // lists it cannot report the refresh differently.
+  const refreshReceived = React.useCallback(() => {
+    ipc.beamListReceived?.()
+      .then((list) => {
+        setReceived(list);
+        setReceivedError(null);
+      })
+      .catch((e: unknown) => {
+        console.error("vlerv: beam received list failed", e);
+        setReceivedError("Could not list what has arrived — a file landed and is not shown.");
+      });
+  }, [ipc]);
+
   // When the previous artifact landed, or null while none has. A sender that
   // queued files while this device was unreachable delivers them in one run
   // as soon as it can reach it, so arrivals come in bursts and one tab each
   // would bury whatever the user is reading under a stack they never asked
-  // for. `arrivalOpensTab` holds the whole rule, and beam-burst.test.ts holds
-  // its cases.
+  // for. This ref is all the provider holds: `nextBurst` judges the arrival
+  // AND says what to remember, so no half of the rule lives here, and
+  // beam-burst.test.ts holds its cases.
   const lastReceivedAtRef = React.useRef<number | null>(null);
 
   // A pushed artifact arrives already on disk and already verified — there is
@@ -188,13 +208,15 @@ export function BeamProvider({
   // The rest of a burst only refresh the Received list, which is where a run
   // of files belongs.
   useTauriEvent<BeamReceivedPayload>("vlerv://beam-received", (file) => {
-    const at = Date.now();
-    const opens = arrivalOpensTab(lastReceivedAtRef.current, at);
-    lastReceivedAtRef.current = at;
-    if (opens) {
+    const burst = nextBurst(lastReceivedAtRef.current, Date.now());
+    lastReceivedAtRef.current = burst.previous;
+    if (burst.opens) {
       dispatch({ type: "FOCUS_OR_OPEN", path: file.path, external: true });
     }
-    ipc.beamListReceived?.().then(setReceived).catch(() => {});
+    // Surfaced, not swallowed: for every arrival of a run after the first
+    // this list is the ONLY place the artifact shows up, so a refresh that
+    // fails leaves a file that landed on this disk invisible everywhere.
+    refreshReceived();
   });
 
   const runOffer = React.useCallback(
@@ -235,10 +257,6 @@ export function BeamProvider({
   }, [runOffer]);
 
   const closeSend = React.useCallback(() => setSend(null), []);
-
-  const refreshReceived = React.useCallback(() => {
-    ipc.beamListReceived?.().then(setReceived).catch(() => {});
-  }, [ipc]);
 
   const acceptReceive = React.useCallback(() => {
     const r = receiveRef.current;
@@ -300,8 +318,8 @@ export function BeamProvider({
   );
 
   const stateValue = React.useMemo(
-    (): BeamStateValue => ({ offers, received, send, receive, stopError }),
-    [offers, received, send, receive, stopError],
+    (): BeamStateValue => ({ offers, received, send, receive, stopError, receivedError }),
+    [offers, received, send, receive, stopError, receivedError],
   );
 
   const actionsValue = React.useMemo(

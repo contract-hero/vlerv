@@ -98,6 +98,55 @@ pub struct RemoteState {
     /// generation is what tells the late callback that it speaks for a
     /// session the app no longer has.
     session_generation: AtomicU64,
+    /// Whether a foreground fan-out is running, and whether a resume arrived
+    /// while it did. See `ResumeFlight`.
+    resume: std::sync::Mutex<ResumeFlight>,
+}
+
+/// The in-flight state of the foreground fan-out: is a round running, and did
+/// another resume arrive while it ran?
+///
+/// iOS raises `Resumed` on every foreground transition, and each round dials
+/// every paired peer. A dial to a device that is asleep costs the whole
+/// connect timeout, so a few hops in a minute stack a few dials on one peer's
+/// gate — and `tokio::sync::Mutex` is fair, so the `remote_subscribe` the user
+/// starts by opening a drawer waits behind every one of them. Any number of
+/// resumes that arrive during one round therefore become exactly ONE more
+/// round, which is the in-flight-plus-redrive shape `Drainer::drain_peer`
+/// already uses for the send queue.
+///
+/// Redo rather than drop, because a resume carries information: the sessions
+/// this app holds went stale again while the round was dialing, and the round
+/// that is running cleared the ones it knew about before that happened.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ResumeFlight {
+    running: bool,
+    redo: bool,
+}
+
+impl ResumeFlight {
+    /// A resume arrived. `true` = this caller owns the fan-out and runs it;
+    /// `false` = a round is already running and will run one more.
+    fn arrive(&mut self) -> bool {
+        if self.running {
+            self.redo = true;
+            return false;
+        }
+        self.running = true;
+        self.redo = false;
+        true
+    }
+
+    /// A round finished. `true` = a resume arrived while it ran, so run one
+    /// more; `false` = the fan-out is over and the next resume owns it.
+    fn finish(&mut self) -> bool {
+        if self.redo {
+            self.redo = false;
+            return true;
+        }
+        self.running = false;
+        false
+    }
 }
 
 impl RemoteState {
@@ -113,6 +162,7 @@ impl RemoteState {
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             dials: tokio::sync::Mutex::new(HashMap::new()),
             session_generation: AtomicU64::new(0),
+            resume: std::sync::Mutex::new(ResumeFlight::default()),
         }
     }
 
@@ -162,6 +212,21 @@ impl RemoteState {
             .entry(peer.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// The session this app holds for `peer`, read only once any dial in
+    /// flight for that peer has landed.
+    ///
+    /// The gate is what makes this different from reading the map, and it is
+    /// what a caller that acts on a peer's session needs. A dial takes up to
+    /// the connect timeout, the drawer that started it can be closed inside
+    /// that window, and a plain map read in that window answers `None` for a
+    /// peer this app is about to hold a live session with. Waiting here costs
+    /// the rest of one dial and gives the caller the session that dial made.
+    async fn settled_session(&self, peer: &str) -> Option<Arc<scope::ClientSession>> {
+        let gate = self.dial_gate(peer).await;
+        let _dialing = gate.lock().await;
+        self.sessions.lock().await.get(peer).cloned()
     }
 }
 
@@ -598,8 +663,14 @@ pub async fn remote_unsubscribe(
     state: tauri::State<'_, RemoteState>,
     peer: String,
 ) -> Result<(), String> {
-    let existing = state.sessions.lock().await.get(&peer).cloned();
-    match existing {
+    // Behind this peer's dial gate, so an unsubscribe that arrives while the
+    // subscribe it undoes is still dialing waits for that dial. The user can
+    // close the drawer inside the dial window, and a map read in that window
+    // finds nothing, returns Ok, and leaves the landed session subscribed —
+    // the host then re-hashes every changed file and pushes `FileChanged` for
+    // a drawer nobody is looking at, which is the cost this command exists to
+    // prevent.
+    match state.settled_session(&peer).await {
         Some(session) if !session.is_closed() => session.unsubscribe().await,
         // Nothing open ⇒ nothing to unsubscribe. Dialing the peer to say
         // "stop" would boot sockets to achieve nothing.
@@ -1038,19 +1109,44 @@ fn adopts_listen_pref(receiver: bool, paired: bool, adopted: bool) -> bool {
     receiver && paired && !adopted
 }
 
-/// Persist the adoption: the switch the launch decision reads, then the
-/// marker that stops it happening a second time. The switch goes first
-/// because a marker that lands without it would leave the phone not
-/// listening, with nothing left that would ever turn it on again.
+/// The switch the launch decision reads, and the marker that stops the
+/// adoption happening a second time. Named here because the ORDER they are
+/// written in is the whole rule (`adopt_listen_pref_with`).
+const LISTEN_KEY: &str = "preferences.remote_listen";
+const ADOPTED_KEY: &str = "preferences.remote_listen_adopted";
+
+/// Persist the adoption.
 ///
 /// `set_state_field` moves the in-memory document at once and debounces the
 /// disk write, like every other settings write, so the Settings row this
 /// launch renders already shows the switch on.
 fn adopt_listen_pref() {
-    for key in ["preferences.remote_listen", "preferences.remote_listen_adopted"] {
-        if let Err(e) = crate::state_store::set_state_field(key, serde_json::Value::Bool(true)) {
-            eprintln!("vlerv: remote: cannot record that this device listens for its peers: {e}");
-        }
+    adopt_listen_pref_with(|key| {
+        crate::state_store::set_state_field(key, serde_json::Value::Bool(true))
+    });
+}
+
+/// The switch first, then the marker, and the marker only if the switch
+/// landed. A marker that lands alone is read by every later launch and is
+/// one-way, so it would leave the phone not listening with nothing left that
+/// would ever turn it on again — and every send another machine accepts for
+/// it then waits in that machine's queue until it expires.
+///
+/// `write` is a parameter so a test can fail the first call and watch the
+/// second one never happen; `adopt_listen_pref` passes the state store.
+fn adopt_listen_pref_with(mut write: impl FnMut(&str) -> Result<(), String>) {
+    if let Err(e) = write(LISTEN_KEY) {
+        eprintln!(
+            "vlerv: remote: cannot turn listening on for this device's peers: {e} — the \
+             next launch tries again"
+        );
+        return;
+    }
+    if let Err(e) = write(ADOPTED_KEY) {
+        eprintln!(
+            "vlerv: remote: this device listens for its peers, but recording that failed: \
+             {e} — the next launch turns the switch on once more"
+        );
     }
 }
 
@@ -1095,53 +1191,71 @@ pub fn listen_at_launch(app: &tauri::AppHandle) {
 /// which is mobile-only. macOS never suspends the process, so there is no
 /// stale session to drop there and nothing calls this.
 pub fn on_foreground(app: &tauri::AppHandle) {
+    let state = app.state::<RemoteState>();
     // No peers ⇒ nobody may dial this app and it has nobody to dial, so
     // resuming is not a reason to bind a socket.
-    if app.state::<RemoteState>().peers.is_empty() {
+    if state.peers.is_empty() {
+        return;
+    }
+    // Answered before anything is spawned: a resume that arrives while a
+    // round is running adds a redo flag, never a second fan-out. See
+    // `ResumeFlight`.
+    if !state.resume.lock().unwrap_or_else(|p| p.into_inner()).arrive() {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<RemoteState>();
-        // Dropped FIRST, before the event and before any re-dial: `session()`
-        // returns a cached session whenever `is_closed()` reads false, so one
-        // left in the map is handed to the reconnect this very event
-        // triggers, and the reconnect then rides the dead connection.
-        {
-            let mut sessions = state.sessions.lock().await;
-            sessions.clear();
-            // Under the same lock, so the bump and the clear are one act to
-            // every dial. What it silences is explained on the field.
-            //
-            // ADD, never assign: a counter that came back around would let a
-            // session dropped two resumes ago pass the equality check in
-            // `on_closed` and report a peer this app is actively talking to
-            // as offline. Two suspensions in a row is the ordinary iOS case.
-            state.session_generation.fetch_add(1, Ordering::Release);
-        }
-        let _ = app.emit("vlerv://remote-event", RemoteEvent::Resumed);
-        // Re-dialing every paired peer is what makes the phone reachable
-        // again: the dial boots the endpoint if the launch did not, and
-        // `session()` emits the presence transitions itself, so the drawer
-        // header reports the truth for devices whose `on_closed` never fired
-        // because the reader task was frozen with the rest of the app.
-        //
-        // TOGETHER, not one after another. A dial to a device that is itself
-        // asleep costs the whole connect timeout, so dialed in turn, four
-        // paired devices with two asleep make one foreground hop take about a
-        // minute — and every `remote_subscribe` the user starts in that
-        // minute waits behind the same dials. Foregrounding is the most
-        // frequent lifecycle event iOS has. `session()` gates per peer, so
-        // the fan-out still dials each peer exactly once.
-        let peers = state.peers.list();
-        let (handle, remote) = (&app, &state);
-        join_all(peers.iter().map(|peer| async move {
-            if let Err(e) = session(handle, remote, &peer.node_id).await {
-                eprintln!("vlerv: remote: {} is not reachable after resume: {e}", peer.device);
+        loop {
+            resume_round(&app, &state).await;
+            if !state.resume.lock().unwrap_or_else(|p| p.into_inner()).finish() {
+                return;
             }
-        }))
-        .await;
+        }
     });
+}
+
+/// One foreground round: drop every session this app holds, tell the webview,
+/// then re-dial every paired peer at once. Split out from `on_foreground` so
+/// the in-flight guard has exactly one body to repeat.
+async fn resume_round(app: &tauri::AppHandle, state: &tauri::State<'_, RemoteState>) {
+    // Dropped FIRST, before the event and before any re-dial: `session()`
+    // returns a cached session whenever `is_closed()` reads false, so one
+    // left in the map is handed to the reconnect this very event triggers,
+    // and the reconnect then rides the dead connection.
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.clear();
+        // Under the same lock, so the bump and the clear are one act to
+        // every dial. What it silences is explained on the field.
+        //
+        // ADD, never assign: a counter that came back around would let a
+        // session dropped two resumes ago pass the equality check in
+        // `on_closed` and report a peer this app is actively talking to
+        // as offline. Two suspensions in a row is the ordinary iOS case.
+        state.session_generation.fetch_add(1, Ordering::Release);
+    }
+    let _ = app.emit("vlerv://remote-event", RemoteEvent::Resumed);
+    // Re-dialing every paired peer is what makes the phone reachable
+    // again: the dial boots the endpoint if the launch did not, and
+    // `session()` emits the presence transitions itself, so the drawer
+    // header reports the truth for devices whose `on_closed` never fired
+    // because the reader task was frozen with the rest of the app.
+    //
+    // TOGETHER, not one after another. A dial to a device that is itself
+    // asleep costs the whole connect timeout, so dialed in turn, four
+    // paired devices with two asleep make one foreground hop take about a
+    // minute — and every `remote_subscribe` the user starts in that
+    // minute waits behind the same dials. Foregrounding is the most
+    // frequent lifecycle event iOS has. `session()` gates per peer, so
+    // the fan-out still dials each peer exactly once.
+    let peers = state.peers.list();
+    join_all(peers.iter().map(|peer| async move {
+        if let Err(e) = session(app, state, &peer.node_id).await {
+            eprintln!("vlerv: remote: {} is not reachable after resume: {e}", peer.device);
+        }
+    }))
+    .await;
 }
 
 #[cfg(test)]
@@ -1217,5 +1331,114 @@ mod tests {
             serde_json::to_value(RemoteEvent::Resumed).expect("serialize"),
             serde_json::json!({ "kind": "resumed" })
         );
+    }
+
+    #[test]
+    fn a_switch_write_that_fails_never_lets_the_adopted_marker_land() {
+        // The marker is one-way: every later launch reads it and leaves the
+        // preference alone. Landing it after a failed switch write is the one
+        // outcome nothing recovers from — the phone listens to nobody, the
+        // adoption never runs again, and every send another machine accepts
+        // for it sits in that machine's queue until it expires.
+        let mut attempted: Vec<String> = Vec::new();
+        adopt_listen_pref_with(|key| {
+            attempted.push(key.to_string());
+            Err("state.json is read-only".to_string())
+        });
+        assert_eq!(attempted, vec![LISTEN_KEY], "the marker is not even attempted");
+
+        // And in the order the doc states when both writes take.
+        let mut written: Vec<String> = Vec::new();
+        adopt_listen_pref_with(|key| {
+            written.push(key.to_string());
+            Ok(())
+        });
+        assert_eq!(written, vec![LISTEN_KEY, ADOPTED_KEY], "the switch, then the marker");
+    }
+
+    #[test]
+    fn a_resume_during_a_fan_out_adds_one_more_round_and_never_a_second_fan_out() {
+        let mut flight = ResumeFlight::default();
+        // The first resume owns the fan-out and runs it.
+        assert!(flight.arrive());
+        // Three more foreground hops while that round dials. Each one used to
+        // spawn its own fan-out over every paired peer, and an unreachable
+        // peer costs a whole connect timeout per dial — stacked on one fair
+        // mutex, the user's own subscribe waits behind all of them.
+        assert!(!flight.arrive());
+        assert!(!flight.arrive());
+        assert!(!flight.arrive());
+        assert!(flight.finish(), "the running round redoes for the resumes it did not see");
+        assert!(!flight.finish(), "and ONE redo answers for all three");
+        // The fan-out is over, so the next resume owns a fresh one.
+        assert!(flight.arrive());
+        assert!(!flight.finish());
+    }
+
+    #[tokio::test]
+    async fn one_peers_dial_gate_never_blocks_a_dial_to_another_device() {
+        crate::state_store::ensure_shared_test_state_dir();
+        let state = RemoteState::new(RootSet::empty());
+
+        // One device, one gate — two dials to the same peer must serialize,
+        // or each misses the sessions map, makes its own session, and every
+        // loser's `on_closed` reports a live peer offline.
+        let phone = state.dial_gate("device-a").await;
+        let phone_again = state.dial_gate("device-a").await;
+        assert!(Arc::ptr_eq(&phone, &phone_again), "the same peer id names the same gate");
+
+        let laptop = state.dial_gate("device-b").await;
+        assert!(!Arc::ptr_eq(&phone, &laptop), "another device gets its own gate");
+
+        // The reason the gate is per peer: a dial to a device that is asleep
+        // costs the whole connect timeout, and the fan-out after a resume
+        // dials every paired device at once. One process-wide lock would make
+        // a sleeping phone hold every other dial for that timeout.
+        let dialing_phone = phone.lock().await;
+        assert!(laptop.try_lock().is_ok(), "the laptop is dialed while the phone is dialing");
+        assert!(phone.try_lock().is_err(), "and the phone is still dialed once");
+        drop(dialing_phone);
+    }
+
+    #[tokio::test]
+    async fn an_unsubscribe_arriving_during_a_dial_waits_for_that_dial_instead_of_finding_nothing()
+    {
+        // `remote_unsubscribe` reads the sessions map, and the session it has
+        // to find is inserted at the END of a dial that takes up to the
+        // connect timeout. The user closes the drawer inside that window, so
+        // a read that does not wait answers "nothing open", returns Ok, and
+        // leaves the landed session subscribed — the host then re-hashes
+        // every changed file and pushes `FileChanged` for a drawer nobody is
+        // looking at.
+        crate::state_store::ensure_shared_test_state_dir();
+        let state = Arc::new(RemoteState::new(RootSet::empty()));
+        let peer = "device-being-dialed";
+
+        // Stands in for the dial in flight: `session()` holds this exact gate
+        // from before it reads the map until after it inserts.
+        let gate = state.dial_gate(peer).await;
+        let dialing = gate.lock().await;
+
+        let unsubscribing = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state.settled_session(peer).await;
+            }
+        });
+
+        let mut pending = unsubscribing;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut pending)
+                .await
+                .is_err(),
+            "the unsubscribe has to wait for the dial, not read the map behind it"
+        );
+
+        // The dial lands, and the caller gets the map the dial left.
+        drop(dialing);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("the unsubscribe stops waiting as soon as the dial is done")
+            .expect("the waiting task did not panic");
     }
 }

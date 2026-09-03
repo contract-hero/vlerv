@@ -148,10 +148,12 @@ impl VlervMcp {
                        sure of the name. A device that is asleep or off the network does not \
                        fail the call: the file is COPIED as it is now and queued, the result \
                        says status \"queued\" instead of \"delivered\", and it goes out when \
-                       that device comes back while this server is running. Read the status \
-                       field and tell the user which of the two happened — a queued file is not \
-                       on their device yet. This only works when the target device granted this \
-                       server the \"control\" scope; the error text says so when it has not."
+                       that device comes back — in this session if it is still running, \
+                       otherwise at the first network-touching tool call of a later session \
+                       over the same state directory. Read the status field and tell the user \
+                       which of the two happened — a queued file is not on their device yet. \
+                       This only works when the target device granted this server the \
+                       \"control\" scope; the error text says so when it has not."
     )]
     async fn send_to_device(
         &self,
@@ -336,6 +338,11 @@ fn status_summary(status: &ServerStatus) -> String {
 /// and would report the first while looking at the second. So the reason
 /// comes first whenever there is one, and the devices are named — the person
 /// asking already knows which one they were waiting for.
+///
+/// Three states stop the queue, and this line has to separate them: a stated
+/// blocking reason, a record this build cannot read, and a server that has
+/// not opened its network — where the records are real, the attempt counts
+/// are real, and nothing at all is trying to deliver them.
 fn queue_line(status: &ServerStatus) -> String {
     // A record this build cannot read is a promise nobody is keeping, so it
     // is named wherever the queue is named — including next to a count of 0,
@@ -367,6 +374,27 @@ fn queue_line(status: &ServerStatus) -> String {
             None => format!("- {} to {} (not tried yet)", q.name, q.device),
         })
         .collect();
+    // The third blocking state, and the one a reader is least able to guess.
+    // `server_status` never boots — it opens no socket, by design — so a
+    // session that has called nothing else prints records with an attempt
+    // count from a previous process. That reads as a retry loop that is
+    // running right now, when this server has no socket, no drain and no way
+    // to hear the device dial in. "network booted: false" ten lines up is not
+    // the same sentence, and a reader who is waiting for a file will not read
+    // it as one.
+    if !status.booted {
+        return format!(
+            "queued deliveries: {} holding {} — none of them is moving: this server has not \
+             opened its network yet, so there is no delivery pass and no device can dial in. \
+             Any attempt count below was written by an earlier session. The first tool call \
+             that needs the network — send_to_device, beam_artifact, pair_device, or \
+             list_devices with probe — opens it and starts the queue; server_status never \
+             does. Waiting:\n{}{unreadable}",
+            status.queued_total,
+            human_bytes(status.queued_bytes),
+            waiting.join("\n")
+        );
+    }
     format!(
         "queued deliveries: {} holding {}, NOT delivered yet{}:\n{}{unreadable}",
         status.queued_total,
@@ -401,8 +429,10 @@ impl ServerHandler for VlervMcp {
                  \"queued\" means the device was asleep, the file was copied as it stood and is \
                  waiting here — it is NOT on that device, and saying it is would be wrong. Say \
                  which one happened, and use server_status to report what is still waiting.\n\n\
-                 Links from beam_artifact stay fetchable only while this server process runs, \
-                 and so does the queue: nothing is delivered after this server exits.",
+                 Links from beam_artifact stay fetchable only while this server process runs. \
+                 The queue outlives it: a queued send is written to the state directory, and \
+                 it goes out at the first network-touching tool call of a later session over \
+                 that same state directory.",
             )
     }
 }
@@ -648,6 +678,39 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_on_a_server_that_never_opened_its_network_says_nothing_is_moving() {
+        // The state a fresh session is in: `server_status` reads the spool off
+        // disk and boots nothing, so it prints records another process queued,
+        // with that process's attempt counts. "attempt 3: peer offline" beside
+        // a count reads as a retry loop that is running now — there is no
+        // socket, no drain and no way for the device to dial in, and the only
+        // other clue is "network booted: false" ten lines up.
+        let mut cold = status_with_queue(Some("peer offline — could not reach it"));
+        cold.booted = false;
+        let text = status_summary(&cold);
+        assert!(text.contains("none of them is moving"), "{text}");
+        assert!(text.contains("has not opened its network"), "{text}");
+        // And what to call to start it, since this tool never will.
+        assert!(text.contains("send_to_device"), "{text}");
+        assert!(text.contains("server_status never does"), "{text}");
+        // The records stay named: the reader is still owed which file, to
+        // which device, and what the last session was told.
+        assert!(text.contains("report.html to Val's iPhone"), "{text}");
+        assert!(text.contains("attempt 2: peer offline"), "{text}");
+        assert!(
+            !text.contains("a drain pass is running"),
+            "a server with no network cannot be draining: {text}"
+        );
+
+        // The same server with an empty spool says one plain line: there is
+        // nothing to be wrong about, and a warning there would be noise on
+        // every fresh session.
+        let mut empty = status_with(0, 0);
+        empty.booted = false;
+        assert_eq!(status_summary(&empty).lines().last(), Some("queued deliveries: 0"));
+    }
+
+    #[test]
     fn every_documented_tool_is_registered_exactly_once() {
         let tools = router().list_all();
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -729,6 +792,35 @@ mod tests {
         assert!(instructions.contains("control"), "{instructions}");
         assert_eq!(info.server_info.name, "vlerv-mcp");
         assert!(info.capabilities.tools.is_some(), "the server must advertise tools");
+    }
+
+    #[test]
+    fn the_model_facing_text_never_says_a_queued_send_dies_with_this_process() {
+        // Both strings said the queue ends when the process does, and
+        // `a_spooled_delivery_survives_the_process_that_accepted_it` proves
+        // the opposite: the record is on disk, and a later session over the
+        // same state directory delivers it. A model reading the old sentence
+        // tells the user a file that is still coming is lost.
+        let core = McpCore::new("/tmp/vlerv-mcp-test".into(), vec![], "/tmp".into(), None);
+        let info = VlervMcp::new(Arc::new(core)).get_info();
+        let instructions = info.instructions.unwrap_or_default();
+        assert!(instructions.contains("The queue outlives it"), "{instructions}");
+        assert!(
+            instructions.contains("later session over that same state directory"),
+            "{instructions}"
+        );
+
+        let tools = router().list_all();
+        let send = tools.iter().find(|t| t.name == "send_to_device").expect("send_to_device");
+        let described = send.description.as_deref().unwrap_or_default();
+        assert!(
+            described.contains("first network-touching tool call of a later session"),
+            "{described}"
+        );
+        assert!(
+            !described.contains("while this server is running"),
+            "a queued send does not need this process to survive: {described}"
+        );
     }
 
     #[test]
