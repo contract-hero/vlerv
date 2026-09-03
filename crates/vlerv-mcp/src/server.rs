@@ -1,4 +1,4 @@
-// The MCP surface: eight tools over `McpCore`, described for a language model
+// The MCP surface: nine tools over `McpCore`, described for a language model
 // rather than for a person reading a manual.
 //
 // Every handler is the same three steps — validate, call the core, render —
@@ -27,9 +27,10 @@ use serde::Serialize;
 use vlerv_remote::beam::human_bytes;
 
 use crate::args::{
-    BeamArtifactArgs, ConfirmPairingArgs, ListDevicesArgs, SendToDeviceArgs, StopBeamArgs,
+    BeamArtifactArgs, ConfirmPairingArgs, ForgetDeviceArgs, ListDevicesArgs, SendToDeviceArgs,
+    StopBeamArgs,
 };
-use crate::core::{Delivery, McpCore, ServerStatus};
+use crate::core::{Delivery, Forgotten, McpCore, ServerStatus};
 
 /// The rmcp handler. Holds the core behind an `Arc` because rmcp clones the
 /// service per connection.
@@ -263,6 +264,25 @@ impl VlervMcp {
     }
 
     #[tool(
+        name = "forget_device",
+        description = "Unpair one device from this server and delete everything the server was \
+                       keeping for it. Use it when the user says a device is no longer theirs, \
+                       when list_devices reports a device as \"refused\" (that device already \
+                       removed this server, and this is how the two sides agree again), or when \
+                       a queued send should simply stop being kept. It removes the pairing, so \
+                       that device can no longer reach this server, and it DELETES the private \
+                       copies of any files queued for it — those sends never arrive. Say both \
+                       things to the user, and prefer asking before calling it: nothing here can \
+                       be undone except by pairing again."
+    )]
+    async fn forget_device(
+        &self,
+        Parameters(args): Parameters<ForgetDeviceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        render(self.core.forget_device(&args.device).await, forget_summary)
+    }
+
+    #[tool(
         name = "server_status",
         description = "Report this MCP server's own identity and state: its node id, where its \
                        identity and peer list live on disk, whether it has opened a network \
@@ -275,6 +295,32 @@ impl VlervMcp {
     async fn server_status(&self) -> Result<CallToolResult, ErrorData> {
         render(self.core.server_status().await, status_summary)
     }
+}
+
+/// The sentence `forget_device` returns. Both halves are stated because both
+/// are irreversible and only one of them is the thing the user asked for: the
+/// unpairing was requested, and the deleted copies are what it cost. A
+/// summary that reported only the unpairing would let a model tell the user
+/// their queued file is still on its way.
+fn forget_summary(forgotten: &Forgotten) -> String {
+    let mut summary = format!(
+        "{} ({}) is no longer paired with this server. It can no longer reach this server, and \
+         this server can no longer send to it.",
+        forgotten.device, forgotten.node_id_short
+    );
+    if forgotten.dropped > 0 {
+        summary.push_str(&format!(
+            " {} queued send(s) were deleted with it, freeing {} — those files will NOT arrive on \
+             that device. Tell the user.",
+            forgotten.dropped,
+            human_bytes(forgotten.dropped_bytes)
+        ));
+    }
+    for note in &forgotten.notes {
+        summary.push('\n');
+        summary.push_str(note);
+    }
+    summary
 }
 
 /// The sentence `send_to_device` returns, one per outcome. A free function
@@ -422,7 +468,9 @@ impl ServerHandler for VlervMcp {
                  - a named device (\"send it to my phone\") -> send_to_device;\n\
                  - a shareable link, or an unpaired recipient -> beam_artifact;\n\
                  - \"which devices\" -> list_devices;\n\
-                 - a new device -> pair_device, then pair_status, then confirm_pairing.\n\n\
+                 - a new device -> pair_device, then pair_status, then confirm_pairing;\n\
+                 - a device that is no longer theirs, or that list_devices reports as \
+                 \"refused\" -> forget_device.\n\n\
                  Two rules that need a human:\n\
                  1. pairing is only safe when the person compares the six fingerprint words on \
                  both screens — always show them and wait;\n\
@@ -723,6 +771,7 @@ mod tests {
             [
                 "beam_artifact",
                 "confirm_pairing",
+                "forget_device",
                 "list_devices",
                 "pair_device",
                 "pair_status",

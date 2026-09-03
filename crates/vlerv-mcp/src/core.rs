@@ -106,6 +106,29 @@ pub struct DeviceInfo {
     pub presence: &'static str,
 }
 
+/// What forgetting a device actually did.
+///
+/// The BYTES are named, not just the records: the point of the tool is that a
+/// device this server no longer trusts stops having private copies of the
+/// user's files here, and a caller that reported only "unpaired" would leave
+/// the half that matters unsaid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Forgotten {
+    pub device: String,
+    pub node_id: String,
+    pub node_id_short: String,
+    /// Queued sends deleted with the pairing.
+    pub dropped: usize,
+    /// What those deletions took off this disk, counted once per distinct
+    /// file — the store is content-addressed, so two records naming one file
+    /// were always one copy.
+    pub dropped_bytes: u64,
+    /// Anything that did not happen. Empty is the normal answer, and a
+    /// non-empty list is the caller's to pass on: the pairing is gone in
+    /// either case, and only the cleanup can be left owing.
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BeamLink {
     /// The `vlerv://receive?…` link to hand to a person.
@@ -1362,15 +1385,6 @@ impl McpCore {
         !self.inflight.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
     }
 
-    /// A live session with a paired peer, with the dial's answer flattened
-    /// into the one sentence every read-only caller wants. Dial failures are
-    /// reported as the device being offline, which is what they almost always
-    /// are.
-    async fn session(&self, peer: &Peer) -> Result<Arc<ClientSession>, String> {
-        let node = self.node().await?;
-        self.drainer(&node).dial_session(peer).await.map_err(|e| dial_failed(peer, &e))
-    }
-
     // ── pair_device / pair_status / confirm_pairing ────────────────────────
 
     /// Open pairing: mint a one-time token and the `vlerv://pair?ticket=…`
@@ -1452,6 +1466,76 @@ impl McpCore {
             device: peer.device,
             node_id: peer.node_id,
             scope: Some(peer.scope.as_str().to_string()),
+        })
+    }
+
+    // ── forget_device ──────────────────────────────────────────────────────
+
+    /// Drop one device's pairing, and everything this server was keeping on
+    /// its behalf.
+    ///
+    /// The EXIT, and until now there was none: a device could be unpaired
+    /// from its own side while this server kept full trust and a private copy
+    /// of every file queued for it, and the only ways out were hand-editing
+    /// `peers.json` or waiting the seven-day TTL. That is the wrong shape for
+    /// a security action — the user's own move to reduce what a machine holds
+    /// made it hold more.
+    ///
+    /// The ORDER is the part to keep. The pairing goes first, because that is
+    /// the act the user asked for and the one that must land even if
+    /// everything after it fails; then the cached session, so nothing reuses
+    /// a handle to a device this server no longer trusts; then the queued
+    /// copies. A cleanup that ran first and then failed to remove the peer
+    /// would destroy sends for a device that is still paired.
+    ///
+    /// Nothing after the removal can fail this call. `peer_pass` already
+    /// drops every record of an unknown peer and unpins its bytes, so a
+    /// cleanup that could not finish here is finished by the next pass rather
+    /// than left to the TTL — and what did not happen is reported instead of
+    /// being implied.
+    pub async fn forget_device(&self, device: &str) -> Result<Forgotten, String> {
+        let query = args::validate_device_query(device)?;
+        let peer = devices::resolve_device(&self.peers.list(), query).map_err(|e| e.to_string())?;
+        let owed = self.outbox.for_peer(&peer.node_id);
+
+        self.peers.remove(&peer.node_id)?;
+        forget_session(&self.sessions, &peer.node_id).await;
+
+        let mut notes = Vec::new();
+        let mut dropped = Vec::new();
+        if !owed.is_empty() {
+            // The store is opened only when there is something in it to
+            // unpin, so forgetting a device this server owes nothing costs no
+            // socket — the same rule `server_status` follows.
+            match self.node().await {
+                Ok(node) => {
+                    let drainer = self.drainer(&node);
+                    for record in &owed {
+                        drainer.give_up(record, "the device was forgotten on this server").await;
+                        dropped.push(record.clone());
+                    }
+                }
+                Err(e) => notes.push(format!(
+                    "{} queued send(s) for this device could not be deleted now ({e}). The \
+                     pairing IS gone; the next drain pass deletes the records and the copies \
+                     with them.",
+                    owed.len()
+                )),
+            }
+        }
+        // Counted off the CONTENT, like `server_status`: one blob backs every
+        // record naming it, so a file queued for two devices is one copy on
+        // this disk and reporting it twice overstates what was reclaimed.
+        let mut counted: BTreeSet<&str> = BTreeSet::new();
+        let dropped_bytes =
+            dropped.iter().filter(|r| counted.insert(&r.hash)).map(|r| r.size).sum();
+        Ok(Forgotten {
+            node_id_short: short_id(&peer.node_id),
+            device: peer.device,
+            node_id: peer.node_id,
+            dropped: dropped.len(),
+            dropped_bytes,
+            notes,
         })
     }
 
@@ -3658,6 +3742,65 @@ mod tests {
                 "and its pin goes with it, or the copy stays on disk for the life of the install"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_device_takes_its_pairing_and_the_copies_kept_for_it() {
+        // The exit, which this server did not have. A device could unpair
+        // this server from its own side while this side kept full trust and a
+        // private plaintext copy of every file queued for it, and the only
+        // ways out were hand-editing peers.json or waiting the seven-day TTL.
+        // The user's own security move made this machine hold MORE, for
+        // longer, which is the wrong shape for a security action.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let phone = deaf_device(&phone_dir).await;
+        let core = core_paired_with(&state, &workspace, &phone).await;
+        let node = core.node().await.unwrap();
+        let phone_id = phone.endpoint.id().to_string();
+
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let file = workspace.path().join(format!("owed-{n}.html"));
+            // Distinct bytes per file: the store is content-addressed, so two
+            // identical files would be ONE copy and this would prove nothing
+            // about the second record's pin.
+            std::fs::write(&file, vec![b'a' + n as u8; 4096]).unwrap();
+            ids.push(queue_staged(&core, &node, &phone_id, &file).await);
+        }
+        assert_eq!(core.server_status().await.unwrap().retained_bytes, 8192);
+
+        let forgotten = core.forget_device("Val's iPhone").await.expect("the device is forgotten");
+        assert_eq!(forgotten.node_id, phone_id);
+        assert_eq!(forgotten.dropped, 2, "both queued sends go with the pairing");
+        assert_eq!(forgotten.dropped_bytes, 8192, "and the caller is told what that freed");
+        assert!(forgotten.notes.is_empty(), "nothing was left owing: {:?}", forgotten.notes);
+
+        // All three at once, with no drain pass in between: the pairing, the
+        // records, and the bytes the records pinned. Leaving any of them for
+        // the next pass would mean the user asked for this and could not be
+        // told it had happened.
+        assert!(core.list_devices(false).await.unwrap().is_empty(), "the pairing is gone");
+        let status = core.server_status().await.unwrap();
+        assert_eq!(status.queued_total, 0);
+        assert_eq!(status.retained_bytes, 0, "no copy of the user's files is kept for it");
+        for id in &ids {
+            assert!(
+                node.store.tags().get(outbox::tag_name(id)).await.unwrap().is_none(),
+                "the pin goes too, or the bytes stay for the life of the install"
+            );
+        }
+
+        // Forgetting it twice is an error that names what IS paired rather
+        // than a silent success: the second call cannot mean what the first
+        // one did, and a model told "done" would report a device removed that
+        // some other call had already removed.
+        let again = core.forget_device("Val's iPhone").await.unwrap_err();
+        assert!(again.contains("no devices are paired"), "{again}");
+
+        phone.router.shutdown().await.ok();
     }
 
     #[tokio::test(flavor = "multi_thread")]
