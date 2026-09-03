@@ -18,7 +18,7 @@
 // knows that MCP exists, which is what lets the integration test drive the
 // same code path a tool call drives.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -564,6 +564,17 @@ pub struct McpCore {
     /// its queued sends. Empty at startup, which is what makes a restart
     /// retry at once.
     retry: Arc<Mutex<HashMap<String, Backoff>>>,
+    /// Peers a wake named that have not spent that wake yet. A device dialing
+    /// in has answered the question both ladders were guessing at, so its
+    /// pass ignores the per-record schedule as well as the per-peer one.
+    ///
+    /// A SET rather than an argument threaded through `drain_peer`, because
+    /// the redrive path is where the credit would otherwise be lost: a
+    /// `Wake::Peer` arriving while a tick pass is already running for that
+    /// device sets the redrive flag and returns, and the loop's next
+    /// iteration has to be the forced one. `peer_pass` takes the credit, so
+    /// it is spent exactly once however it was granted.
+    forced: Arc<Mutex<HashSet<String>>>,
     /// The size a staged copy may not pass, which is `beam::HARD_CAP_BYTES`
     /// in production and nothing else. It is a field only so a test can lower
     /// it — see `cap_staged_at`.
@@ -596,6 +607,7 @@ impl McpCore {
             wake_rx: Mutex::new(Some(wake_rx)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             retry: Arc::new(Mutex::new(HashMap::new())),
+            forced: Arc::new(Mutex::new(HashSet::new())),
             staged_cap: Mutex::new(beam::HARD_CAP_BYTES),
         }
     }
@@ -1303,6 +1315,7 @@ impl McpCore {
             loopback: self.loopback.clone(),
             inflight: self.inflight.clone(),
             retry: self.retry.clone(),
+            forced: self.forced.clone(),
         }
     }
 
@@ -1508,6 +1521,7 @@ struct Drainer {
     loopback: Arc<Mutex<Option<SocketAddr>>>,
     inflight: Arc<Mutex<HashMap<String, bool>>>,
     retry: Arc<Mutex<HashMap<String, Backoff>>>,
+    forced: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Drainer {
@@ -1623,6 +1637,11 @@ impl Drainer {
         // device must cost one dial, not five. The peers then run together,
         // the way `list_devices { probe: true }` probes, so one sleeping
         // device does not hold up a delivery to an awake one.
+        // The credit is granted here and spent in `peer_pass`, so it survives
+        // the redrive path that would drop an argument threaded down.
+        if let Some(peer) = forced {
+            self.forced.lock().unwrap_or_else(|p| p.into_inner()).insert(peer.to_string());
+        }
         let due: Vec<String> = self
             .outbox
             .pending_peers()
@@ -1674,6 +1693,10 @@ impl Drainer {
     /// enqueue time: a record can be days old, and the pairing, the grant and
     /// the root set have all had that long to change.
     async fn peer_pass(&self, peer_id: &str) {
+        // Taken FIRST, before the early returns below, so a credit cannot
+        // outlive the pass it was granted for and make some later tick behave
+        // as though the device had just dialed in.
+        let forced = self.forced.lock().unwrap_or_else(|p| p.into_inner()).remove(peer_id);
         let records = self.outbox.for_peer(peer_id);
         if records.is_empty() {
             return;
@@ -1732,6 +1755,11 @@ impl Drainer {
         // seven days the records live.
         let own = self.own_loopback().await;
         let listed = listed_roots(&self.roots);
+        // One clock reading for the whole pass: two records compared against
+        // two different "now"s could order themselves differently inside one
+        // visit, and nothing here runs long enough for a second reading to
+        // say anything new.
+        let now = peers::now_unix();
         // Pushes made, and it is COUNTED rather than taken off the front of
         // the list. `MAX_PER_PASS` exists to stop one peer holding a session
         // for minutes, and only a record that reaches `push_staged` costs
@@ -1765,8 +1793,27 @@ impl Drainer {
                 continue;
             }
             // Past both skips, so this record is about to spend a session
-            // round trip. That — not the loop iteration — is what the bound
-            // counts.
+            // round trip — and this is where its OWN ladder is read, after
+            // the two arms that spend nothing and before the bound that
+            // meters what it is about to spend.
+            //
+            // Three outcomes take a record off the head of this queue: it
+            // lands, it is held, or it is dropped. A denial does not: the
+            // record stays, in the same id order, every pass. Eight of those
+            // spent the whole per-pass bound forever and every record behind
+            // them waited out its seven-day expiry. The bound is right — a
+            // denied push IS a session round trip, which is exactly what it
+            // meters — so the ordering is what changes here: a record that
+            // was refused steps aside on its own schedule, and the record
+            // behind it is due immediately.
+            //
+            // A device that just dialed in has answered the question the
+            // schedule was guessing at, so a forced pass tries everything.
+            // Without that, a phone that woke up would wait ten minutes for a
+            // record that would land now.
+            if !forced && !record_due(record, now) {
+                continue;
+            }
             pushes += 1;
             // The STAGED bytes, named by content address: nothing re-reads
             // the source, which by now may have been rewritten or deleted.
@@ -1809,8 +1856,9 @@ impl Drainer {
                 }
                 // This side refused these bytes, or the host did. Both are
                 // answers about ONE record, so the next record still gets its
-                // turn on this session.
-                Err(refused) => self.note(record, refused.to_string()),
+                // turn on this session — and this record steps back on its
+                // own ladder, so the next pass reaches the ones behind it.
+                Err(refused) => self.deny(record, refused.to_string()),
             }
         }
         if landed {
@@ -1852,6 +1900,21 @@ impl Drainer {
     fn note(&self, record: &Record, why: String) {
         if let Err(e) = self.outbox.record_attempt(&record.id, Some(why)) {
             eprintln!("vlerv-mcp: cannot record an attempt on {}: {e}", record.id);
+        }
+    }
+
+    /// Write what happened to a record the device REFUSED, which is `note`
+    /// plus the one thing that separates the two: this attempt always counts,
+    /// so `record_due` reads a schedule that moves.
+    ///
+    /// A write that does not land leaves the record where it was, so the next
+    /// pass pushes it again — the starvation this fix removes, for as long as
+    /// the state directory cannot be written. That is the right way round: an
+    /// unwritable spool must not be answered by silently giving a record
+    /// longer turns nothing recorded, and `server_status` names the fault.
+    fn deny(&self, record: &Record, why: String) {
+        if let Err(e) = self.outbox.record_denial(&record.id, why) {
+            eprintln!("vlerv-mcp: cannot record a refusal of {}: {e}", record.id);
         }
     }
 
@@ -1926,6 +1989,23 @@ async fn supervise(drainer: Drainer, mut wake: mpsc::Receiver<Wake>) {
 fn retry_delay(failures: u32) -> Duration {
     let rung = (failures.max(1) as usize - 1).min(RETRY_LADDER.len() - 1);
     Duration::from_secs(RETRY_LADDER[rung])
+}
+
+/// May this record be pushed on this pass, or has it earned a rest?
+///
+/// The SAME ladder the peer uses, on the record's own two persisted numbers —
+/// `attempts` and `last_attempt_at` — so nothing new is stored and the
+/// schedule survives a restart, which an in-memory cursor could not.
+///
+/// A record nothing has attempted is always due, which is what makes an
+/// accepted send go out on the next pass instead of after a minute. A record
+/// whose only attempt was a HOLD carries `attempts == 1` and so a sixty
+/// second rest, and that costs nothing: `hold_peer` steps the PEER's ladder
+/// at the same moment, and its floor is the same sixty seconds, so the record
+/// is due again before its device is.
+fn record_due(record: &Record, now: u64) -> bool {
+    record.attempts == 0
+        || now >= record.last_attempt_at.saturating_add(retry_delay(record.attempts).as_secs())
 }
 
 /// Drop a cached session so the next call re-handshakes. A free function over
@@ -2612,6 +2692,152 @@ mod tests {
         );
 
         phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_head_of_queue_never_starves_the_record_behind_it() {
+        // The held case above has a twin the same fix does not cover. A
+        // record the device REFUSES is not skipped — it is pushed, so it
+        // spends the budget it should — but it also stays at the head, in the
+        // same id order, every pass. Eight of them owned the whole per-pass
+        // bound until their seven-day expiry, and the ninth record waited out
+        // that week behind them.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        // One more than the bound, so a queue that gives every head record a
+        // turn on every pass runs out of budget before it runs out of queue.
+        // The refusal is written straight onto the records rather than raced
+        // out of a real device: what the drain reads back is the record, and
+        // `peer_pass` cannot tell a reason it wrote a moment ago from one it
+        // wrote last week.
+        for n in 0..=outbox::MAX_PER_PASS {
+            let file = workspace.path().join(format!("refused-{n}.html"));
+            std::fs::write(&file, format!("<h1>the device will not take this: {n}</h1>")).unwrap();
+            let id = queue_staged(&core, &node, &phone_id, &file).await;
+            core.outbox.record_denial(&id, "not permitted for this peer".to_string()).unwrap();
+        }
+        // And the record behind every one of them, which this device WILL
+        // take.
+        let mine = workspace.path().join("report.html");
+        std::fs::write(&mine, "<h1>queued behind eight refusals</h1>").unwrap();
+        let deliverable = queue_staged(&core, &node, &phone_id, &mine).await;
+
+        core.drainer(&node).drain_peer(&phone_id).await;
+
+        assert_eq!(
+            received(&signals),
+            vec!["report.html".to_string()],
+            "the deliverable record goes out in a SINGLE pass, whatever was refused ahead of it"
+        );
+        let status = core.server_status().await.unwrap();
+        assert!(
+            !status.queued.iter().any(|q| q.id == deliverable),
+            "and it leaves the spool, or the next pass sends it twice"
+        );
+        assert_eq!(
+            status.queued_total,
+            outbox::MAX_PER_PASS + 1,
+            "the refused records are not sent and not dropped either"
+        );
+        assert!(
+            status.queued.iter().all(|q| q.attempts == 1),
+            "and none of them was pushed again on this pass: {:?}",
+            status.queued
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_dials_in_gets_every_record_tried_whatever_its_rest_says() {
+        // The guard the schedule ships with. A `Wake::Peer` pass is the phone
+        // appearing, which answers the question the ladder was guessing at,
+        // so the rest a record earned from an earlier refusal must not hold
+        // it. Without this a device that woke up would wait ten minutes for a
+        // record that would land now, and the queue draining the moment the
+        // phone appears is the feature's best property.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        // Every record resting, and fewer than the bound so the pass is not
+        // metered by anything but the schedule under test.
+        let mut queued = Vec::new();
+        for n in 0..3 {
+            let file = workspace.path().join(format!("waiting-{n}.html"));
+            std::fs::write(&file, format!("<h1>refused a moment ago: {n}</h1>")).unwrap();
+            let id = queue_staged(&core, &node, &phone_id, &file).await;
+            core.outbox.record_denial(&id, "not permitted for this peer".to_string()).unwrap();
+            queued.push(format!("waiting-{n}.html"));
+        }
+        // An unforced pass now would skip all three: each was refused a
+        // moment ago and owes the ladder its first minute.
+        assert!(
+            core.outbox
+                .for_peer(&phone_id)
+                .iter()
+                .all(|r| !record_due(r, peers::now_unix())),
+            "the layout only proves anything while every record is resting"
+        );
+
+        core.drainer(&node).pass(Some(&phone_id)).await;
+
+        assert_eq!(received(&signals), queued, "a wake tries every one of them");
+        assert_eq!(core.server_status().await.unwrap().queued_total, 0, "and the queue empties");
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[test]
+    fn a_refused_record_rests_on_the_same_ladder_its_device_does() {
+        // The schedule is the record's own two persisted numbers and the
+        // peer's ladder, so there is no second set of constants to drift and
+        // nothing new on disk.
+        let dir = tempfile::TempDir::new().unwrap();
+        let spool = Outbox::load(&Dirs::new(dir.path()).outbox());
+        let id = spool.next_id();
+        spool
+            .enqueue(Staged {
+                id: id.clone(),
+                peer: "nodeA".to_string(),
+                device: "Val's iPhone".to_string(),
+                source: dir.path().join("report.html"),
+                name: "report.html".to_string(),
+                size: 10,
+                hash: "ab".repeat(32),
+            })
+            .unwrap();
+
+        let fresh = spool.for_peer("nodeA").remove(0);
+        assert_eq!(fresh.attempts, 0);
+        assert!(record_due(&fresh, 0), "a record nothing has tried goes out on the next pass");
+
+        // Each refusal counts, and each count is a longer rest — the rungs
+        // the peer ladder already names, on the record itself.
+        for (refusals, rest) in [(1u32, 60u64), (2, 120), (3, 300), (4, 600), (5, 600)] {
+            spool.record_denial(&id, "not permitted for this peer".to_string()).unwrap();
+            let record = spool.for_peer("nodeA").remove(0);
+            assert_eq!(record.attempts, refusals, "a repeated refusal is still a round trip");
+            let at = record.last_attempt_at;
+            assert!(!record_due(&record, at + rest - 1), "it rests the whole rung");
+            assert!(record_due(&record, at + rest), "and it is due when the rung is up");
+        }
+
+        // The rest is REMEMBERED across a restart, which is the reason it is
+        // derived from the record instead of a cursor in memory: this build
+        // has no idea what the last process did, and reads it off the file.
+        let rebuilt = Outbox::load(&Dirs::new(dir.path()).outbox());
+        let record = rebuilt.for_peer("nodeA").remove(0);
+        assert_eq!(record.attempts, 5, "the rung survives the process that earned it");
+        assert!(!record_due(&record, record.last_attempt_at + 599));
     }
 
     #[tokio::test(flavor = "multi_thread")]

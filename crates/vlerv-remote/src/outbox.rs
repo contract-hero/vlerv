@@ -534,12 +534,49 @@ impl Outbox {
     /// counting each visit rewrote a 0600 file per pass and made
     /// `server_status` report "attempt 1440" after a day: 1440 delivery
     /// attempts a reader would look for in a log and never find.
+    ///
+    /// A VISIT is what that rule is about. An attempt that actually reached
+    /// the device takes `record_denial` instead, which always counts.
     pub fn record_attempt(&self, id: &str, error: Option<String>) -> Result<(), String> {
+        self.write_attempt(id, error, false)
+    }
+
+    /// Note a push that reached the device and came back refused, and step
+    /// this record's own retry schedule by counting it.
+    ///
+    /// The difference from `record_attempt` is the repeated-reason early
+    /// return, and it is the difference between a visit and a ROUND TRIP. A
+    /// held record is looked at and a string is compared; a denied record was
+    /// pushed — a ticket minted, `Req::PushArtifact` written, `Res::Denied`
+    /// awaited — down a session every other record for that peer is waiting
+    /// on. So a repeated denial always counts, which is what gives the drain
+    /// a per-record ladder to read back: `attempts` and `last_attempt_at`
+    /// already persist, and together they say when this record earned its
+    /// next turn.
+    ///
+    /// The write that costs is bounded by the ladder it just lengthened
+    /// rather than by the pass rate — a record at the top rung is written
+    /// once per ten minutes, not once per minute — and every count it leaves
+    /// behind names a delivery attempt that really happened, which is the
+    /// property the rule above exists to protect.
+    pub fn record_denial(&self, id: &str, error: String) -> Result<(), String> {
+        self.write_attempt(id, Some(error), true)
+    }
+
+    /// The one writer both arms share. `round_trip` is the caller's answer to
+    /// "did this cost the device anything", and it is the only thing that
+    /// decides whether a repeated reason is written again.
+    fn write_attempt(
+        &self,
+        id: &str,
+        error: Option<String>,
+        round_trip: bool,
+    ) -> Result<(), String> {
         let mut spool = self.guard();
         let Some(record) = spool.records.get(id) else {
             return Ok(());
         };
-        if record.last_error == error {
+        if !round_trip && record.last_error == error {
             return Ok(());
         }
         let mut next = record.clone();
@@ -1020,6 +1057,34 @@ mod tests {
         out.record_attempt(&id, Some("the peer did not answer the handshake".to_string()))
             .unwrap();
         assert_eq!(spool(&dir).list()[0].attempts, 2);
+    }
+
+    #[test]
+    fn a_refusal_that_repeats_is_still_counted_because_it_cost_a_round_trip() {
+        // The other side of the rule above, and the line between them is what
+        // the device paid. A held record was LOOKED AT; a refused one was
+        // pushed down the session every other record for that peer is
+        // waiting on. Not counting the second one left it at the head of the
+        // queue with the same schedule forever, and the drain has no other
+        // number to tell it that record has had its turn.
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = spool(&dir);
+        let id = out.next_id();
+        out.enqueue(staged(&id, "nodeA", "iPhone", 10)).unwrap();
+        let why = "not permitted for this peer".to_string();
+
+        for expected in 1..=3 {
+            out.record_denial(&id, why.clone()).unwrap();
+            let record = spool(&dir).list()[0].clone();
+            assert_eq!(record.attempts, expected, "every refusal is an attempt that happened");
+            assert_eq!(record.last_error.as_deref(), Some(why.as_str()));
+        }
+
+        // The same reason through the VISIT door still changes nothing, so
+        // the rule the held records rely on is untouched.
+        let counted = spool(&dir).list()[0].clone();
+        out.record_attempt(&id, Some(why.clone())).unwrap();
+        assert_eq!(out.list()[0], counted, "a visit that repeats itself is still not an attempt");
     }
 
     #[test]
