@@ -634,8 +634,8 @@ impl McpCore {
     /// disk rather than the 256 MiB the production cap would need. Production
     /// never calls it, and the value it would pass is the one `new` already
     /// installs.
-    #[doc(hidden)]
-    pub fn cap_staged_at(&self, bytes: u64) {
+    #[cfg(test)]
+    fn cap_staged_at(&self, bytes: u64) {
         *self.staged_cap.lock().unwrap_or_else(|p| p.into_inner()) = bytes;
     }
 
@@ -1045,14 +1045,16 @@ impl McpCore {
     /// Accept a send for a device that did not answer: copy the bytes, write
     /// the record, and report exactly what was promised.
     ///
-    /// Everything that can refuse runs BEFORE the copy is taken, with two
-    /// exceptions, and both of them answer for the COPY rather than the file:
+    /// Everything that can refuse runs before the copy is taken, with two
+    /// exceptions, and both of them answer for the copy rather than the file:
     /// the hard size cap, which only the staged length can be measured
     /// against, and `Outbox::enqueue`, which writes the record after
     /// `stage_outbox` has staged the bytes and can still refuse — a record id
     /// it cannot claim, a cap, a directory that will not take the write.
-    /// Each of the two unpins the tag that staging minted, so neither refusal
-    /// leaves anything lasting. A refusal that kept the pin would cost the
+    /// Both of those unpin the tag that staging minted. A `stage_outbox` that
+    /// fails after writing its own pin is the one refusal that cannot, and the
+    /// boot sweep collects that tag instead. A refusal that kept the pin would
+    /// cost the
     /// user a private duplicate of their file inside this server's state
     /// directory for the life of the install.
     async fn queue_send(
@@ -2943,18 +2945,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_copy_that_grew_past_the_cap_is_refused_at_once_instead_of_queued_to_be_denied() {
-        // The gate measures the FILE with `std::fs::metadata` and the copy is
+        // The gate measures the file with `std::fs::metadata` and the copy is
         // taken later, after a whole dial to a device that does not answer.
         // A file that grows past the hard cap in that window used to become a
-        // record nothing can ever deliver: the receiver enforces the same cap
-        // on the actual stream, answers `PushFailure::Denied`, and the drain
-        // HOLDS a denial rather than dropping it. The record then retries once
+        // record nothing can ever deliver: the receiver refuses the announced
+        // size against the same cap before it opens the stream, answers
+        // `PushFailure::Denied`, and the drain holds a denial rather than
+        // dropping it. The record then retries once
         // a pass for the whole seven-day TTL and holds one of that peer's
         // eight per-pass push slots, so the records behind it starve too.
         //
         // The cap is lowered for this proof — see `cap_staged_at`. The real
         // one is 256 MiB, and a file that size on disk is not what this claim
-        // is about; the claim is that the STAGED length is what the cap is
+        // is about; the claim is that the staged length is what the cap is
         // asked of. The two steps are driven directly rather than raced
         // against a real dial: `send_to_device` runs exactly this pair, in
         // this order, and the window between them is the dial it has spent.
@@ -2969,6 +2972,11 @@ mod tests {
         let core = core_paired_with(&state, &workspace, &asleep).await;
         let node = core.node().await.unwrap();
         let peer = core.peer_store().get(&asleep.endpoint.id().to_string()).unwrap();
+        assert_eq!(
+            core.staged_cap(),
+            beam::HARD_CAP_BYTES,
+            "production measures the staged copy against the real cap"
+        );
         core.cap_staged_at(4096);
 
         let cand = core.gate_arg_path(artifact.to_str().unwrap()).expect("inside the roots");
@@ -2996,7 +3004,7 @@ mod tests {
             "a refused send leaves no record"
         );
 
-        // And nothing was KEPT, which is the half a size check on its own
+        // And nothing was kept, which is the half a size check on its own
         // cannot cover: the copy is taken before the cap is asked, so a
         // refusal that skipped the unpin would leave a private duplicate of
         // the user's file pinned in this server's store for the life of the
@@ -3009,7 +3017,7 @@ mod tests {
         );
 
         // The other side of the boundary: a copy of exactly the cap still
-        // goes, because the receiving stream aborts only what is OVER it, and
+        // goes, because the receiver refuses only what is over the cap, and
         // a sender that refused one byte earlier would lose a deliverable
         // send. Same file, same bytes, one number moved.
         core.cap_staged_at(as_copied.len() as u64);
