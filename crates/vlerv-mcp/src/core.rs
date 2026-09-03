@@ -564,6 +564,10 @@ pub struct McpCore {
     /// its queued sends. Empty at startup, which is what makes a restart
     /// retry at once.
     retry: Arc<Mutex<HashMap<String, Backoff>>>,
+    /// The size a staged copy may not pass, which is `beam::HARD_CAP_BYTES`
+    /// in production and nothing else. It is a field only so a test can lower
+    /// it — see `cap_staged_at`.
+    staged_cap: Mutex<u64>,
 }
 
 impl McpCore {
@@ -592,6 +596,7 @@ impl McpCore {
             wake_rx: Mutex::new(Some(wake_rx)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             retry: Arc::new(Mutex::new(HashMap::new())),
+            staged_cap: Mutex::new(beam::HARD_CAP_BYTES),
         }
     }
 
@@ -621,6 +626,22 @@ impl McpCore {
     /// `String`s — to look at one `Mutex`, on every send.
     fn loopback(&self) -> Option<SocketAddr> {
         *self.loopback.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Refuse a staged copy over `bytes` instead of over the real
+    /// `beam::HARD_CAP_BYTES`. The unit test's seam, so the proof that an
+    /// oversized copy is refused — and unpinned — costs a few kilobytes on
+    /// disk rather than the 256 MiB the production cap would need. Production
+    /// never calls it, and the value it would pass is the one `new` already
+    /// installs.
+    #[doc(hidden)]
+    pub fn cap_staged_at(&self, bytes: u64) {
+        *self.staged_cap.lock().unwrap_or_else(|p| p.into_inner()) = bytes;
+    }
+
+    /// The cap a staged copy is measured against, read through the seam.
+    fn staged_cap(&self) -> u64 {
+        *self.staged_cap.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn device(&self) -> &str {
@@ -1024,12 +1045,14 @@ impl McpCore {
     /// Accept a send for a device that did not answer: copy the bytes, write
     /// the record, and report exactly what was promised.
     ///
-    /// Everything that can refuse runs BEFORE the copy is taken, with one
-    /// exception: `Outbox::enqueue` writes the record after `stage_outbox`
-    /// has staged the bytes, and it can still refuse — a record id it cannot
-    /// claim, a cap, a directory that will not take the write. The `Err` arm
-    /// below unpins the tag that staging minted, so that refusal leaves
-    /// nothing lasting either. A refusal that kept the pin would cost the
+    /// Everything that can refuse runs BEFORE the copy is taken, with two
+    /// exceptions, and both of them answer for the COPY rather than the file:
+    /// the hard size cap, which only the staged length can be measured
+    /// against, and `Outbox::enqueue`, which writes the record after
+    /// `stage_outbox` has staged the bytes and can still refuse — a record id
+    /// it cannot claim, a cap, a directory that will not take the write.
+    /// Each of the two unpins the tag that staging minted, so neither refusal
+    /// leaves anything lasting. A refusal that kept the pin would cost the
     /// user a private duplicate of their file inside this server's state
     /// directory for the life of the install.
     async fn queue_send(
@@ -1091,9 +1114,39 @@ impl McpCore {
         // names the copy that was taken. The receiver checks the announced
         // size against the transfer cap before it opens the stream and the
         // real cap on the stream itself, so an under-stated record is refused
-        // mid-transfer; the drain HOLDS a refusal, so that record retries once
+        // mid-transfer; the drain holds a refusal, so that record retries once
         // a pass for the whole seven-day TTL and can never land.
         let staged = beam::stage_outbox(node, &cand.canonical, &id).await?;
+
+        // The cap is asked again, of the copy this time: the gate asked it of
+        // the file. `beam::resolve_offerable` reads the length with
+        // `std::fs::metadata`, and the copy is taken here — after a whole dial
+        // to a device that does not answer. A file that grew past the cap in
+        // that window used to become a record the receiver can never take. It
+        // answers `PushFailure::Denied`, the drain holds a denial rather than
+        // dropping it, and that record then retries once a pass for the whole
+        // seven-day TTL while holding one of this peer's `MAX_PER_PASS` push
+        // slots — starving the records behind it. Refusing now costs the user
+        // one answer; queuing it costs them a week of a queue that cannot move.
+        //
+        // One read of the cap, so the number this refusal enforces and the
+        // number it prints cannot drift apart.
+        let cap = self.staged_cap();
+        if staged.size > cap {
+            // Same cleanup the enqueue-failure arm below performs, and safe
+            // for the same reason: `stage_outbox` refuses a tag the store
+            // already holds, so this pin is this call's own.
+            beam::unpin_outbox(node, &outbox::tag_name(&id)).await;
+            return Err(format!(
+                "{} is {} — beam v1 caps at {}, so the send to {} was not queued. The file \
+                 was under the cap when it was read and over it when it was copied, so \
+                 nothing was kept here.",
+                cand.name,
+                beam::human_bytes(staged.size),
+                beam::human_bytes(cap),
+                label(&peer)
+            ));
+        }
 
         // DEDUPE on (peer, content). The store is content-addressed, so
         // re-staging the same file costs a read and a hash pass, never a
@@ -2884,6 +2937,91 @@ mod tests {
         let status = core.server_status().await.unwrap();
         assert_eq!(status.queued_bytes, as_copied.len() as u64);
         assert_eq!(status.queued[0].size, as_copied.len() as u64);
+
+        asleep.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_that_grew_past_the_cap_is_refused_at_once_instead_of_queued_to_be_denied() {
+        // The gate measures the FILE with `std::fs::metadata` and the copy is
+        // taken later, after a whole dial to a device that does not answer.
+        // A file that grows past the hard cap in that window used to become a
+        // record nothing can ever deliver: the receiver enforces the same cap
+        // on the actual stream, answers `PushFailure::Denied`, and the drain
+        // HOLDS a denial rather than dropping it. The record then retries once
+        // a pass for the whole seven-day TTL and holds one of that peer's
+        // eight per-pass push slots, so the records behind it starve too.
+        //
+        // The cap is lowered for this proof — see `cap_staged_at`. The real
+        // one is 256 MiB, and a file that size on disk is not what this claim
+        // is about; the claim is that the STAGED length is what the cap is
+        // asked of. The two steps are driven directly rather than raced
+        // against a real dial: `send_to_device` runs exactly this pair, in
+        // this order, and the window between them is the dial it has spent.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let artifact = workspace.path().join("report.html");
+        let as_read = "<h1>small enough when the gate read it</h1>";
+        std::fs::write(&artifact, as_read).unwrap();
+
+        let asleep = deaf_device(&phone).await;
+        let core = core_paired_with(&state, &workspace, &asleep).await;
+        let node = core.node().await.unwrap();
+        let peer = core.peer_store().get(&asleep.endpoint.id().to_string()).unwrap();
+        core.cap_staged_at(4096);
+
+        let cand = core.gate_arg_path(artifact.to_str().unwrap()).expect("inside the roots");
+        assert_eq!(cand.size, as_read.len() as u64, "the candidate carries the file it read");
+
+        // The save the user makes while the send is still waiting on the dial.
+        // Eight KiB against a four KiB cap, so the two numbers in the refusal
+        // are distinguishable once `human_bytes` has rounded them.
+        let as_copied = vec![b'x'; 8192];
+        std::fs::write(&artifact, &as_copied).unwrap();
+
+        let err = core
+            .queue_send(&node, &peer, &cand, "peer offline".to_string())
+            .await
+            .expect_err("a copy over the cap can never be delivered, so it is not accepted");
+        assert!(err.contains("report.html"), "the refusal names the file: {err}");
+        assert!(err.contains("is 8 KiB"), "and the size it actually measured: {err}");
+        assert!(err.contains("caps at 4 KiB"), "and the cap it measured against: {err}");
+        assert!(err.contains("was not queued"), "{err}");
+
+        // Nothing was promised, so nothing is owed.
+        assert_eq!(
+            core.server_status().await.unwrap().queued_total,
+            0,
+            "a refused send leaves no record"
+        );
+
+        // And nothing was KEPT, which is the half a size check on its own
+        // cannot cover: the copy is taken before the cap is asked, so a
+        // refusal that skipped the unpin would leave a private duplicate of
+        // the user's file pinned in this server's store for the life of the
+        // install. The empty keep-set is the true keep-set here, because the
+        // spool holds no record at all.
+        assert_eq!(
+            beam::sweep_outbox_tags(&node, &[]).await,
+            0,
+            "the refusal released the pin its own staging minted"
+        );
+
+        // The other side of the boundary: a copy of exactly the cap still
+        // goes, because the receiving stream aborts only what is OVER it, and
+        // a sender that refused one byte earlier would lose a deliverable
+        // send. Same file, same bytes, one number moved.
+        core.cap_staged_at(as_copied.len() as u64);
+        let accepted = core
+            .queue_send(&node, &peer, &cand, "peer offline".to_string())
+            .await
+            .expect("a copy that is exactly the cap is deliverable");
+        let Delivery::Queued { size, .. } = accepted else {
+            panic!("a device that did not answer must be queued, never delivered: {accepted:?}");
+        };
+        assert_eq!(size, as_copied.len() as u64, "the record announces the copy it took");
+        assert_eq!(core.server_status().await.unwrap().queued_total, 1);
 
         asleep.router.shutdown().await.ok();
     }
