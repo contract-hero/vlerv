@@ -55,6 +55,12 @@ pub struct SendToDeviceArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ForgetDeviceArgs {
+    /// Which paired device to forget: its name, or a prefix of its node id.
+    pub device: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ConfirmPairingArgs {
     /// True completes the pairing, false discards it. A discarded pairing
     /// writes nothing to disk.
