@@ -1002,7 +1002,7 @@ impl McpCore {
         let mut session = match self.drainer(node).dial_session(peer).await {
             Ok(session) => session,
             Err(ConnectError::Unreachable(why)) => return Ok(Attempt::Asleep(why)),
-            Err(refused) => return Err(not_reachable(peer, &refused)),
+            Err(refused) => return Err(dial_failed(peer, &refused)),
         };
         // The scope in the handshake is what the DEVICE granted this server.
         // Checking it here turns the host's one deliberately vague refusal
@@ -1019,7 +1019,7 @@ impl McpCore {
             session = match self.drainer(node).dial_session(peer).await {
                 Ok(session) => session,
                 Err(ConnectError::Unreachable(why)) => return Ok(Attempt::Asleep(why)),
-                Err(refused) => return Err(not_reachable(peer, &refused)),
+                Err(refused) => return Err(dial_failed(peer, &refused)),
             };
         }
         if !grants_control(&session.scope).unwrap_or(false) {
@@ -1335,7 +1335,7 @@ impl McpCore {
     /// are.
     async fn session(&self, peer: &Peer) -> Result<Arc<ClientSession>, String> {
         let node = self.node().await?;
-        self.drainer(&node).dial_session(peer).await.map_err(|e| not_reachable(peer, &e))
+        self.drainer(&node).dial_session(peer).await.map_err(|e| dial_failed(peer, &e))
     }
 
     // ── pair_device / pair_status / confirm_pairing ────────────────────────
@@ -1706,7 +1706,7 @@ impl Drainer {
             // say why on every record and try the whole peer again later.
             // Only the wording differs, and it is the dial's own.
             Err(cause) => {
-                self.hold_peer(peer_id, &records, not_reachable(&peer, &cause));
+                self.hold_peer(peer_id, &records, dial_failed(&peer, &cause));
                 return;
             }
         };
@@ -2021,12 +2021,29 @@ fn peer_list_blocked(reason: &str) -> String {
 /// The sentence a peer that would not talk produces, wherever the send path
 /// gives up on reaching it. `ConnectError` prints its own cause verbatim, so
 /// this wraps it without touching a word of it.
-fn not_reachable(peer: &Peer, cause: &ConnectError) -> String {
-    format!(
-        "{} is not reachable: {cause}. Check that the device is awake, on a network, \
-         and that Vlervtifacts is running on it.",
-        label(peer)
-    )
+///
+/// The ADVICE is what the variant decides, and it has to: a device that
+/// answered and refused this server is awake, on a network, and running
+/// Vlervtifacts, so telling its owner to go and check those three things
+/// sends them to fix what is already working while the real cause — this
+/// server is not on that device's peer list any more — goes unsaid. The
+/// variant is the authority here, never a match on the cause text, which a
+/// refusing peer writes.
+fn dial_failed(peer: &Peer, cause: &ConnectError) -> String {
+    match cause {
+        ConnectError::Unreachable(_) => format!(
+            "{} is not reachable: {cause}. Check that the device is awake, on a network, \
+             and that Vlervtifacts is running on it.",
+            label(peer)
+        ),
+        ConnectError::Refused(_) => format!(
+            "{} answered and refused this server: {cause}. It is awake and on the network, \
+             so retrying changes nothing. If it no longer lists \"{}\" among its paired \
+             peers, pair the two again from that device.",
+            label(peer),
+            device_name()
+        ),
+    }
 }
 
 /// The name this server announces in every handshake and pairing ticket.
@@ -3109,6 +3126,40 @@ mod tests {
         assert_eq!(status.queued_total, 2, "both devices are still owed the file");
         assert_eq!(status.queued_bytes, 8192, "and that is what is owed, added up");
         assert_eq!(status.retained_bytes, 4096, "but one copy is what it costs this disk");
+    }
+
+    #[test]
+    fn a_device_that_refuses_this_server_is_never_told_to_check_its_network() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let peers = PeerStore::load(dir.path());
+        let node_id = "ab".repeat(32);
+        peers.seed(&node_id, "Val's iPhone", Scope::Control).unwrap();
+        let peer = peers.get(&node_id).expect("the peer this server dialled");
+
+        // A device that is genuinely asleep keeps the sentence it always had:
+        // the three things it names are the three that are actually wrong.
+        let asleep = dial_failed(
+            &peer,
+            &ConnectError::Unreachable("peer offline — could not reach it (timed out)".to_string()),
+        );
+        assert!(asleep.contains("is not reachable"), "{asleep}");
+        assert!(asleep.contains("Check that the device is awake"), "{asleep}");
+
+        // A device that ANSWERED and refused gets the opposite sentence. It
+        // is awake, on a network, and running Vlervtifacts — telling its
+        // owner to go and check those three sends them to fix what already
+        // works, which is the failure this whole change exists to end.
+        let refused = dial_failed(&peer, &ConnectError::Refused("not a paired peer".to_string()));
+        assert!(refused.contains("answered and refused this server"), "{refused}");
+        assert!(refused.contains("not a paired peer"), "the cause survives: {refused}");
+        assert!(
+            !refused.contains("Check that the device is awake"),
+            "the advice that blames the network must not appear: {refused}"
+        );
+        assert!(
+            refused.contains("retrying changes nothing"),
+            "and it says the retry is pointless, which the variant already knows: {refused}"
+        );
     }
 
     #[test]
