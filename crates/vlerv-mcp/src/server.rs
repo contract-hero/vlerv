@@ -266,14 +266,19 @@ impl VlervMcp {
     #[tool(
         name = "forget_device",
         description = "Unpair one device from this server and delete everything the server was \
-                       keeping for it. Use it when the user says a device is no longer theirs, \
-                       when list_devices reports a device as \"refused\" (that device already \
-                       removed this server, and this is how the two sides agree again), or when \
-                       a queued send should simply stop being kept. It removes the pairing, so \
-                       that device can no longer reach this server, and it DELETES the private \
-                       copies of any files queued for it — those sends never arrive. Say both \
-                       things to the user, and prefer asking before calling it: nothing here can \
-                       be undone except by pairing again."
+                       keeping for it. Use it when the user says a device is no longer theirs, or \
+                       when list_devices reports a device as \"unpaired\" — that device already \
+                       removed this server, and this is how the two sides agree again. Do NOT \
+                       call it for a device reported \"refused\": that says only that the device \
+                       would not open a session, which a version mismatch between the two builds \
+                       or a device at its session cap also causes, and unpairing would destroy a \
+                       working pairing. It removes the pairing, so that device can no longer \
+                       reach this server, and it DELETES the private copies of any files queued \
+                       for it — those sends never arrive. Say both things to the user, and ask \
+                       before calling it: pairing again restores the pairing, but the deleted \
+                       copies do not come back and each send has to be made again. There is no \
+                       way to cancel a single queued send, so never reach for this tool to do \
+                       that."
     )]
     async fn forget_device(
         &self,

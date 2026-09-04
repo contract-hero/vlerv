@@ -535,14 +535,16 @@ impl Outbox {
     /// `server_status` report "attempt 1440" after a day: 1440 delivery
     /// attempts a reader would look for in a log and never find.
     ///
-    /// A VISIT is what that rule is about. An attempt that actually reached
-    /// the device takes `record_denial` instead, which always counts.
+    /// A VISIT is what that rule is about. A push that was carried through
+    /// takes `record_denial` instead, which always counts — including
+    /// `PushFailure::Local`, which never reached the wire.
     pub fn record_attempt(&self, id: &str, error: Option<String>) -> Result<(), String> {
         self.write_attempt(id, error, false)
     }
 
-    /// Note a VERDICT on one record — the push was made and this is what came
-    /// back — and step that record's own retry schedule by counting it.
+    /// Note a VERDICT on one record — the push was carried through and this is
+    /// the answer it produced — and step that record's own retry schedule by
+    /// counting it.
     ///
     /// The difference from `record_attempt` is the repeated-reason early
     /// return, and the line between them is a VISIT against a VERDICT. A held
@@ -558,9 +560,10 @@ impl Outbox {
     /// `PushFailure::Local` — a malformed content address, which never
     /// reaches the wire. That lumping is deliberate: routing those back to
     /// `record_attempt` would restore for them exactly the head-of-queue
-    /// starvation this schedule removes. So an `attempts` count means "pushes
-    /// this record was carried through", which is not always a frame the
-    /// device saw.
+    /// starvation this schedule removes. So an `attempts` count is "turns this
+    /// record has taken" — pushes carried through, plus visits that produced a
+    /// NEW reason, since `record_attempt` counts those too — and not always a
+    /// frame the device saw.
     ///
     /// The write it costs is bounded by the ladder it just lengthened rather
     /// than by the pass rate: a record at the top rung is written once per
