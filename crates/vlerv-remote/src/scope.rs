@@ -76,6 +76,21 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// only needs to see that it was refused, not why.
 const CLOSE_REFUSED: u32 = 1;
 
+/// QUIC close code for the ONE refusal a dialer may act on destructively:
+/// this node is not on the allowlist, so that device has unpaired it.
+///
+/// Its own code because the reason TEXT cannot carry this. `CLOSE_REFUSED`
+/// covers a protocol skew, an unexpected frame and the session cap as well,
+/// and a sender that read those as "they removed you" would offer to delete a
+/// working pairing over a version number. The text is another machine's; the
+/// code is the protocol's.
+///
+/// A peer on an older build closes an unpairing with `CLOSE_REFUSED` instead.
+/// That reads as an ordinary refusal here — the cause is still stated, only
+/// the destructive advice is withheld, which is the safe direction to be
+/// wrong in.
+const CLOSE_NOT_PAIRED: u32 = 2;
+
 /// Display cap on a close reason a peer wrote. Every reason this crate sends
 /// is three or four words; the bound is here because the bytes belong to
 /// another machine, and they end up in a sentence a human reads.
@@ -266,6 +281,21 @@ impl Grants {
             Some(grant) => grant.admits(&peer, now_unix()),
             None => false,
         }
+    }
+
+    /// `admit`, asked with the string forms a spool record actually holds.
+    ///
+    /// The outbox stores its hash and its peer as plain strings on purpose —
+    /// "what keeps this module readable by a consumer that never links iroh"
+    /// — and `vlerv-mcp` is exactly that consumer. Without this it cannot ask
+    /// the one question that decides whether a device it just unpaired can
+    /// still fetch the bytes a push granted it. A string this side cannot
+    /// parse is not a grant, so it answers `false` like any other miss.
+    pub fn admits_hex(&self, hash_hex: &str, peer_hex: &str) -> bool {
+        let (Some(hash), Ok(peer)) = (parse_hash(hash_hex), peer_hex.parse::<EndpointId>()) else {
+            return false;
+        };
+        self.admit(&hash, Some(peer), true)
     }
 
     /// Drop expired grants, returning the staging tags they OWNED for cleanup.
@@ -966,7 +996,9 @@ impl ProtocolHandler for ScopeServer {
         // 1 — the allowlist, before a single request byte is parsed. QUIC
         // already authenticated this NodeId, so there is nothing to spoof.
         let Some(peer) = self.state.peers.get(&node_id) else {
-            connection.close(VarInt::from_u32(CLOSE_REFUSED), b"not a paired peer");
+            // CLOSE_NOT_PAIRED, not CLOSE_REFUSED: this is the one refusal a
+            // dialer may act on by re-pairing or by forgetting this device.
+            connection.close(VarInt::from_u32(CLOSE_NOT_PAIRED), b"not a paired peer");
             return Err(refused("not a paired peer"));
         };
         self.state.peers.touch(&node_id);
@@ -1008,7 +1040,7 @@ impl ProtocolHandler for ScopeServer {
         match self.state.peers.refresh_device(&node_id, &device) {
             Ok(true) => {}
             Ok(false) => {
-                connection.close(VarInt::from_u32(CLOSE_REFUSED), b"not a paired peer");
+                connection.close(VarInt::from_u32(CLOSE_NOT_PAIRED), b"not a paired peer");
                 return Err(refused("peer was revoked during the handshake"));
             }
             Err(e) => eprintln!("vlerv: remote: cannot persist peers.json: {e}"),
@@ -1022,7 +1054,7 @@ impl ProtocolHandler for ScopeServer {
         let cut = {
             let connection = connection.clone();
             Arc::new(move || {
-                connection.close(VarInt::from_u32(CLOSE_REFUSED), b"not a paired peer");
+                connection.close(VarInt::from_u32(CLOSE_NOT_PAIRED), b"not a paired peer");
             })
         };
         self.state
@@ -1220,55 +1252,115 @@ pub enum ConnectError {
     /// connection and never answered the handshake. Only this means "asleep".
     Unreachable(String),
     /// The peer, or its stream, answered — a refusal, a version mismatch, a
-    /// frame that is not an ack. A retry later cannot change any of these.
+    /// frame that is not an ack, a stream that broke after the handshake. A
+    /// retry later MAY change some of these: a session cap frees up, a
+    /// mismatched build is upgraded.
     Refused(String),
+    /// The peer answered and said this node is not on its allowlist — the one
+    /// cause that means "this device unpaired this server".
+    ///
+    /// Split from `Refused` because it is the only refusal that may justify
+    /// re-pairing, or `forget_device`, which deletes the pairing and every
+    /// staged copy and cannot be undone. Everything else in `Refused` — a
+    /// protocol skew after a phone app update, a transient session cap, a
+    /// malformed id in this server's OWN peer file — used to arrive wearing
+    /// the same word, and a surface that read it as "they removed you" would
+    /// send a caller to destroy a working pairing over a version number.
+    ///
+    /// Decided by `CLOSE_NOT_PAIRED` on the wire, never by matching the
+    /// reason text, which the other machine writes.
+    Unpaired(String),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Unreachable(reason) | ConnectError::Refused(reason) => {
-                f.write_str(reason)
-            }
+            ConnectError::Unreachable(reason)
+            | ConnectError::Refused(reason)
+            | ConnectError::Unpaired(reason) => f.write_str(reason),
         }
     }
 }
 
-/// What the peer SAID when it closed, when it closed on purpose.
+impl ConnectError {
+    /// Did the peer ANSWER? Both refusal variants did; only `Unreachable`
+    /// means nobody was there. The queue's door is the inverse of this, and
+    /// it is asked here so no caller has to remember which variants pair up.
+    pub fn answered(&self) -> bool {
+        !matches!(self, ConnectError::Unreachable(_))
+    }
+}
+
+/// What the peer SAID when it closed, and whether it said "you are not on my
+/// allowlist" — the one refusal a caller may act on destructively.
 ///
 /// `ScopeServer::accept` turns a dial from a device that has unpaired this
-/// node away by closing with `CLOSE_REFUSED` and the reason
-/// `not a paired peer` — before `accept_bi`, so no application frame is ever
-/// written and `classify_ack` never sees the `Res::Denied` that would carry
-/// it. The close bytes DO arrive here. Without this, every stream call on the
-/// dead connection reports only `connection lost`, and the sentence built
+/// node away by closing with `CLOSE_NOT_PAIRED` and the reason
+/// `not a paired peer`. On the allowlist path there is no stream to carry a
+/// `Res::Denied` — the close comes before `accept_bi` — so these close bytes
+/// are the whole account of it. Without reading them, every stream call on
+/// the dead connection reports only `connection lost`, and the sentence built
 /// from that sends the user to check a network that is working, about a
 /// device that is awake and refusing this node on purpose.
 ///
-/// The text is written by another machine, so it passes the crate's one strip
-/// set before it reaches a human, exactly like a device name. Nothing
-/// branches on it: it is DISPLAYED, never matched. A refusal is already known
-/// to be a refusal from the variant, which is decided here rather than read
-/// back out of the string.
-fn stated_refusal(connection: &Connection) -> Option<String> {
+/// Other refusals in `accept` DO write a frame first — the protocol-version
+/// arm sends a `Res::Denied` and `classify_ack` has a live arm for it — and
+/// `not a paired peer` is itself closed from three sites, one of them
+/// mid-session through `Session::cut`. So this is the fallback for the
+/// refusals that cannot carry a frame, not a claim that none of them do.
+///
+/// The CODE decides the variant and the TEXT is only displayed. That split is
+/// the point: `CLOSE_REFUSED` covers a protocol skew, an unexpected frame and
+/// the session cap, so a caller that inferred "they removed you" from the
+/// text would offer to delete a working pairing over a version number. The
+/// text is another machine's; the code is the protocol's.
+///
+/// The text still passes the crate's one strip set before it reaches a human,
+/// exactly like a device name.
+fn stated_refusal(connection: &Connection) -> Option<(u32, String)> {
     // Every other variant is the transport's own account of a connection that
     // died, which `read_frame` already renders as well as this could. Only an
     // application close carries a sentence some peer chose to write.
     let ConnectionError::ApplicationClosed(close) = connection.close_reason()? else {
         return None;
     };
-    let said = proto::strip_spoofing_chars(
-        &String::from_utf8_lossy(&close.reason),
-        MAX_CLOSE_REASON_CHARS,
-    );
+    stated_reason(close.error_code.into_inner() as u32, &close.reason)
+}
+
+/// The treatment a close reason gets, split from the connection that carried
+/// it so a proof can reach it. `stated_refusal` needs a live `Connection`,
+/// and a test that composed `strip_spoofing_chars` itself would be asserting
+/// on its own arithmetic — that version stayed green with the strip and the
+/// cap both removed from here.
+fn stated_reason(code: u32, reason: &[u8]) -> Option<(u32, String)> {
+    let said =
+        proto::strip_spoofing_chars(&String::from_utf8_lossy(reason), MAX_CLOSE_REASON_CHARS);
     let said = said.trim();
-    (!said.is_empty()).then(|| said.to_string())
+    (!said.is_empty()).then(|| (code, said.to_string()))
 }
 
 /// One post-dial failure, told in the peer's own words when it left any and
-/// in the transport's when it did not.
+/// in the transport's when it did not — and sorted into the variant its close
+/// CODE earns, never the one its text suggests.
 fn refusal(connection: &Connection, transport: String) -> ConnectError {
-    ConnectError::Refused(stated_refusal(connection).unwrap_or(transport))
+    match stated_refusal(connection) {
+        Some((code, said)) => classify_close(code, said),
+        None => ConnectError::Refused(transport),
+    }
+}
+
+/// The close CODE decides which refusal this is. A free function so the
+/// decision can be proved without two live endpoints, and so there is exactly
+/// one place that knows `CLOSE_NOT_PAIRED` is the only code a caller may act
+/// on by deleting a pairing.
+fn classify_close(code: u32, reason: String) -> ConnectError {
+    match code {
+        CLOSE_NOT_PAIRED => ConnectError::Unpaired(reason),
+        // Includes `CLOSE_REFUSED`, which `accept` also sends for a protocol
+        // skew, an unexpected frame and the session cap — and any code a
+        // future or foreign build invents. Unknown means "not entitled".
+        _ => ConnectError::Refused(reason),
+    }
 }
 
 /// Why a push did not land, split the same way and for the same reason.
@@ -2190,8 +2282,13 @@ mod tests {
     /// the caller keeps it alive — a dropped one closes the sender.
     /// A registered session with no transport behind it, which is the whole
     /// reason `cut` is a closure: the registry proofs need a session, not a
-    /// socket. The flag comes back so a revocation proof can watch the cut;
-    /// the proofs that only need a session bind it as `_`.
+    /// socket. The flag comes back so a registry proof can watch the cut; the
+    /// proofs that only need a session bind it as `_`.
+    ///
+    /// What the REAL closure does is a different question, and a mock cannot
+    /// answer it — see
+    /// `a_revoked_peer_finds_its_live_connection_closed_and_not_merely_ignored`,
+    /// which dials two endpoints for exactly that reason.
     fn session(id: u64, peer: &str) -> (Session, mpsc::Receiver<Frame>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::channel(1);
         let was_cut = Arc::new(AtomicBool::new(false));
@@ -2596,31 +2693,132 @@ mod tests {
         .await
         .expect_err("a host that does not list this node refuses it");
 
+        // The VARIANT decides what a caller may do about this, so it carries
+        // as much as the text. `Unreachable` is the queue door, and staging a
+        // private copy of the user's file for a device that is refusing this
+        // server is what that door must never open for. `Unpaired` rather
+        // than `Refused` because only this cause entitles a surface to say
+        // the pairing is gone and offer `forget_device`, which deletes it.
         assert_eq!(
             failed,
-            ConnectError::Refused("not a paired peer".to_string()),
+            ConnectError::Unpaired("not a paired peer".to_string()),
             "the receiver's own word for it, recovered from the close it already sent"
         );
-        // The variant matters as much as the text: `Unreachable` is the queue
-        // door, and staging a private copy of the user's file for a device
-        // that is refusing this server is what that door must never open for.
-        assert!(matches!(failed, ConnectError::Refused(_)), "and it is not read as a nap");
+
+        host.router.shutdown().await.ok();
+        dialer.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_peer_finds_its_live_connection_closed_and_not_merely_ignored() {
+        // The registry proof beside this one watches a closure the TEST
+        // installs, so it shows `drop_sessions_for` calls `cut` and nothing
+        // about what production's `cut` does. Replacing that closure's body
+        // with `let _ = &connection;` left the whole suite green, which meant
+        // the measured 1.5-second window where a revoked client still read
+        // `is_closed() == false` had no guard at all. This dials for real.
+        let host_dir = tempfile::TempDir::new().unwrap();
+        let dialer_dir = tempfile::TempDir::new().unwrap();
+        let state = state(&host_dir, RootSet::empty());
+        let host = endpoint::boot(&Dirs::new(host_dir.path()), Some(state.clone()), |_| {})
+            .await
+            .expect("the host is up");
+        let dialer = endpoint::boot(&Dirs::new(dialer_dir.path()), None, |_| {})
+            .await
+            .expect("the dialer is up");
+
+        let dialer_id = dialer.endpoint.id().to_string();
+        state.peers.seed(&dialer_id, "Claude Code", Scope::Control).expect("paired");
+        let addr = endpoint::addr_at(
+            &host.endpoint.id().to_string(),
+            endpoint::loopback_socket(&host).await.expect("the host bound a port"),
+        )
+        .unwrap();
+        let session =
+            ClientSession::connect(&dialer, addr, "Claude Code".to_string(), |_| {}, || {})
+                .await
+                .expect("a paired peer gets a session");
+        assert!(!session.is_closed(), "the session is live before the unpair");
+
+        // The unpair, exactly as the app's own `remote_unpair` does it.
+        state.peers.remove(&dialer_id).expect("the human unpairs this server");
+        host.scope.as_ref().expect("the host serves scope").revoke(&dialer_id).await;
+
+        // The client learns WITHOUT asking for anything. That is the whole
+        // claim: unregistering alone left the transport up until this peer
+        // next made a request, so a client sitting idle went on believing it
+        // held a session.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !session.is_closed() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the revoked peer's transport is cut, not merely deregistered");
 
         host.router.shutdown().await.ok();
         dialer.router.shutdown().await.ok();
     }
 
     #[test]
+    fn a_refusal_that_is_not_an_unpairing_never_reads_as_one() {
+        // The close CODE separates them, never the text, and this is what
+        // stops a caller destroying a working pairing. `accept` sends
+        // CLOSE_REFUSED for a protocol skew, an unexpected frame and the
+        // session cap as well; every one of those used to arrive wearing the
+        // same word as an unpairing, and the tool surface routes that word to
+        // `forget_device`, which deletes the pairing and every staged copy.
+        assert_eq!(
+            classify_close(CLOSE_NOT_PAIRED, "not a paired peer".to_string()),
+            ConnectError::Unpaired("not a paired peer".to_string()),
+            "only the allowlist code earns the variant that may say the pairing is gone"
+        );
+        for (code, reason) in [
+            (CLOSE_REFUSED, "session cap"),
+            (CLOSE_REFUSED, "protocol version"),
+            (CLOSE_REFUSED, "expected hello"),
+            // A code this build has never heard of, from a newer or foreign
+            // peer. Unknown must mean "not entitled", never the reverse.
+            (99, "something this build cannot name"),
+        ] {
+            assert_eq!(
+                classify_close(code, reason.to_string()),
+                ConnectError::Refused(reason.to_string()),
+                "the cause is still recovered verbatim — only the entitlement differs"
+            );
+        }
+
+        // A peer cannot talk its way into the destructive variant by writing
+        // the magic words: the code is the protocol's, the text is theirs.
+        assert_eq!(
+            classify_close(CLOSE_REFUSED, "not a paired peer".to_string()),
+            ConnectError::Refused("not a paired peer".to_string()),
+            "the reason text never decides this"
+        );
+    }
+
+    #[test]
     fn a_close_reason_from_another_machine_is_bounded_before_a_human_reads_it() {
-        // `stated_refusal` needs a live connection, so the treatment its text
-        // gets is pinned on the function that applies it. The reason is
-        // written by the peer, and it lands in a sentence a human reads: the
-        // same strip set a device name goes through, and a cap, because
-        // neither the length nor the characters are this machine's to trust.
+        // The reason is written by the PEER and lands in a sentence a human
+        // reads, so it goes through the same strip set a device name does,
+        // and a cap: neither the length nor the characters are this machine's
+        // to trust.
+        //
+        // Asserted on `stated_reason`, the function that actually applies the
+        // treatment. Composing `strip_spoofing_chars` here instead would test
+        // this test — that version stayed green with the strip and the cap
+        // both removed from the production path.
         let spoof = format!("not a paired peer\u{202E}{}", "x".repeat(500));
-        let shown = proto::strip_spoofing_chars(&spoof, MAX_CLOSE_REASON_CHARS);
+        let (code, shown) =
+            stated_reason(CLOSE_NOT_PAIRED, spoof.as_bytes()).expect("a non-empty reason");
+        assert_eq!(code, CLOSE_NOT_PAIRED);
         assert!(!shown.contains('\u{202E}'), "no bidi override survives into the message");
         assert_eq!(shown.chars().count(), MAX_CLOSE_REASON_CHARS, "and the length is bounded");
+
+        // A peer that closes with nothing to say leaves the transport's own
+        // wording in place rather than an empty sentence.
+        assert_eq!(stated_reason(CLOSE_REFUSED, b""), None);
+        assert_eq!(stated_reason(CLOSE_REFUSED, b"   "), None, "and whitespace is nothing");
     }
 
     #[test]

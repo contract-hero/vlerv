@@ -105,13 +105,18 @@ pub struct DeviceInfo {
     pub scope: String,
     pub paired_at: u64,
     pub last_seen: u64,
-    /// "online", "refused", "offline", or "unknown" when nothing dialed it.
+    /// "online", "unpaired", "refused", "offline", or "unknown" when nothing
+    /// dialed it.
     ///
-    /// "refused" and "offline" are different facts and are kept apart here
-    /// because the user acts on them differently: a refusing device is awake
-    /// and on the network, and the thing to fix is its peer list, not its
-    /// Wi-Fi. One word for both is the same failure the dial message used to
-    /// have.
+    /// FOUR words because the user acts on each differently, and collapsing
+    /// any two of them is the failure this surface exists to remove.
+    /// "offline" means nobody answered. "refused" means the device answered
+    /// and would not open a session — it is awake and on the network, and the
+    /// cause may be a version mismatch between the builds or a device already
+    /// at its session cap, so nothing about the pairing follows from it.
+    /// "unpaired" is the ONE answer that says the pairing is gone, and the
+    /// only one that may justify re-pairing or `forget_device`; it is decided
+    /// by the close code on the wire, never by the peer's reason text.
     pub presence: &'static str,
 }
 
@@ -377,7 +382,8 @@ pub struct ServerStatus {
     /// capped at `MAX_ABANDONED`. Every one of them was reported to somebody
     /// as queued, so its end has to be readable somewhere; it used to be
     /// stderr and nothing else, and a record past its week simply stopped
-    /// being on the list above.
+    /// being on the list above. A `forget_device` withdrawal is deliberately
+    /// absent — that tool reported what it deleted to the caller that asked.
     ///
     /// This process only — see `McpCore::abandoned`.
     pub abandoned: Vec<AbandonedDelivery>,
@@ -458,13 +464,16 @@ enum Ending {
     Withdrawn,
 }
 
-/// A delivery this server accepted and will not make.
+/// A delivery this server accepted, and then broke its promise about.
 ///
 /// Every one of these was reported to somebody as queued, so the end of it is
 /// news. Until now it was written to stderr and nowhere else: a record past
 /// its seven-day expiry simply stopped being on the queue list, and the user
 /// who was told "it goes out when that device is reachable" had no surface
 /// that ever said otherwise.
+///
+/// ABANDONMENTS ONLY. A withdrawal the user asked for is not here — see
+/// `Ending` — because the call that withdrew it already said what it deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AbandonedDelivery {
     pub id: String,
@@ -625,11 +634,15 @@ pub struct McpCore {
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
     received: Arc<Mutex<Log<ReceivedArtifact>>>,
-    /// Deliveries this server promised and then ended. IN MEMORY, unlike the
-    /// queue itself: the record is gone by the time it lands here, so there
-    /// is nothing left on disk to hang it off, and a process that exits takes
-    /// its list with it. That is the honest limit of the surface — it says
-    /// what THIS server gave up on, not what every server ever did.
+    /// Deliveries this server promised and then broke — expiries, and records
+    /// dropped because their bytes went or the drain found the device
+    /// unpaired. NOT the ones `forget_device` withdrew; see `Ending`.
+    ///
+    /// IN MEMORY, unlike the queue itself: the record is gone by the time it
+    /// lands here, so there is nothing left on disk to hang it off, and a
+    /// process that exits takes its list with it. That is the honest limit of
+    /// the surface — it says what THIS server gave up on, not what every
+    /// server ever did.
     abandoned: Arc<Mutex<Log<AbandonedDelivery>>>,
     /// Sends accepted for a device that was asleep. Read off disk in `new`,
     /// beside the peer store and for the same reason: both are files this
@@ -1049,10 +1062,19 @@ impl McpCore {
         let Some(node) = node else {
             return "unknown";
         };
+        // Every arm is spelled out. A wildcard on an enum this workspace owns
+        // is how a later variant silently becomes "offline", which is the one
+        // word this whole surface exists to stop overusing.
         match tokio::time::timeout(PROBE_TIMEOUT, self.drainer(node).dial_session(peer)).await {
             Ok(Ok(_)) => "online",
+            // It answered. "unpaired" is the only one that entitles a caller
+            // to act on the pairing; "refused" says reachable and no more.
+            Ok(Err(ConnectError::Unpaired(_))) => "unpaired",
             Ok(Err(ConnectError::Refused(_))) => "refused",
-            _ => "offline",
+            Ok(Err(ConnectError::Unreachable(_))) => "offline",
+            // The probe's own budget ran out, which is a peer that took the
+            // connection and said nothing — asleep, as far as this can tell.
+            Err(_) => "offline",
         }
     }
 
@@ -1595,10 +1617,49 @@ impl McpCore {
     /// being implied.
     pub async fn forget_device(&self, device: &str) -> Result<Forgotten, String> {
         let query = args::validate_device_query(device)?;
+        // A peer file that did not load holds NO peers, so `list` is empty and
+        // every device on this machine reads as unknown. Answering "nothing is
+        // paired" to a request to unpair something would tell the user their
+        // device is already gone while it is still fully trusted on disk — and
+        // `save_list` is refusing writes for the same reason, so the trust
+        // returns at the next successful load. The same rule `peer_pass` and
+        // `blocked_by` state, through the same producer.
+        if let Some(reason) = self.peers.load_error() {
+            return Err(peer_list_blocked(reason));
+        }
         let peer = devices::resolve_device(&self.peers.list(), query).map_err(|e| e.to_string())?;
         let owed = self.outbox.for_peer(&peer.node_id);
 
-        self.peers.remove(&peer.node_id)?;
+        // The drain's own per-peer token, taken BEFORE the peer goes and held
+        // to the end. Two things need it.
+        //
+        // `self.node()` below boots on a cold server, and `boot` spawns the
+        // supervisor, whose first act is a pass over every peer. The peer is
+        // gone by then, so that pass takes `peer_pass`'s unknown-peer branch
+        // and gives up the very records this call is withdrawing — logging
+        // them as ABANDONED, the re-report `Ending::Withdrawn` exists to
+        // prevent. Holding the token makes that pass set the redrive flag and
+        // return instead.
+        //
+        // And a pass already past its own `peers.get` check holds an owned
+        // snapshot with a live outbound session; `revoke` cuts only the
+        // INBOUND one, and `push_staged_via` mints a fresh grant. Without the
+        // token it can deliver a file, and re-arm fetch access for the device
+        // just forgotten, after this call reported those sends would never
+        // arrive.
+        let _token = DrainToken::take(&self.inflight, &peer.node_id).await;
+
+        // `Ok(false)` means the entry was already gone — a concurrent forget,
+        // or a `list()` snapshot that went stale between the resolve above and
+        // here. Reporting deletions this call did not make is the failure this
+        // whole surface exists to remove, so it says so instead.
+        if !self.peers.remove(&peer.node_id)? {
+            return Err(format!(
+                "{} is no longer paired with this server — something else removed it first, so \
+                 this call changed nothing.",
+                label(&peer)
+            ));
+        }
         forget_session(&self.sessions, &peer.node_id).await;
         // The rest of revocation, through the mechanism the app's own unpair
         // already uses (`remote_unpair`) rather than a second spelling of it:
@@ -1645,7 +1706,20 @@ impl McpCore {
                     // it would meter the first pass after a re-pairing.
                     self.retry.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer.node_id);
                     dropped = owed.len();
-                    dropped_bytes = distinct_bytes(owed.iter().map(|r| (r.hash.as_str(), r.size)));
+                    // What this FREED, which is not what it deleted. Each
+                    // record owns its own `outbox/<id>` tag and `unpin_outbox`
+                    // drops one tag, so a blob another peer's record still
+                    // pins stays on the disk. Counting it here would report
+                    // bytes back that `server_status.retained_bytes` goes on
+                    // counting a line later.
+                    let still_pinned: BTreeSet<String> =
+                        self.outbox.list().into_iter().map(|r| r.hash).collect();
+                    dropped_bytes = distinct_bytes(
+                        owed
+                            .iter()
+                            .filter(|r| !still_pinned.contains(&r.hash))
+                            .map(|r| (r.hash.as_str(), r.size)),
+                    );
                 }
                 Err(e) => {
                     note = Some(format!(
@@ -1942,7 +2016,28 @@ impl Drainer {
         // outlive the pass it was granted for and make some later tick behave
         // as though the device had just dialed in.
         let forced = self.forced.lock().unwrap_or_else(|p| p.into_inner()).remove(peer_id);
-        let records = self.outbox.for_peer(peer_id);
+        // LEAST RECENTLY TRIED FIRST, and this ordering is what actually ends
+        // the head-of-queue starvation. `for_peer` hands them back in id
+        // order, which is enqueue time and never moves, so the same records
+        // met the per-pass budget on every pass.
+        //
+        // The per-record rest below cannot fix that on its own, and the
+        // arithmetic says why: a pass that denies its whole budget steps each
+        // record one rung (`deny`, inside the loop) AND the peer one rung
+        // (`back_off`, after it), off the same `RETRY_LADDER`. The peer's next
+        // pass therefore begins at or after the moment those records come due,
+        // every time, so the rest never skips them and the record behind waits
+        // out its seven-day expiry. Measured, with a device really refusing:
+        // twelve passes, nothing delivered, the record behind still at
+        // `attempts == 0`. With this line it lands on the second pass.
+        //
+        // A record nothing has tried carries `last_attempt_at == 0`, so it
+        // sorts ahead of everything that has had a turn — which is the whole
+        // property. The id breaks ties, so a queue nothing has attempted is
+        // still served oldest-first. Both fields already persist, so this
+        // survives a restart, which is what a rotation cursor could not do.
+        let mut records = self.outbox.for_peer(peer_id);
+        records.sort_by(|a, b| (a.last_attempt_at, &a.id).cmp(&(b.last_attempt_at, &b.id)));
         if records.is_empty() {
             return;
         }
@@ -2035,22 +2130,25 @@ impl Drainer {
                 self.note(record, held_outside_roots(record, &listed));
                 continue;
             }
-            // Three outcomes take a record off the head of this queue: it
-            // lands, it is held, or it is dropped. A denial does not: the
-            // record stays, in the same id order, every pass. Eight of those
-            // spent the whole per-pass bound forever and every record behind
-            // them waited out its seven-day expiry. The bound is right — a
-            // denied push IS a session round trip, which is exactly what it
-            // meters — so the ordering is what changes here: a record that
-            // was refused steps aside on its own schedule, and the record
-            // behind it is due immediately.
+            // Two outcomes take a record out of this queue — it lands or it
+            // is dropped — and a third, a hold, leaves it there but costs the
+            // pass nothing. A denial is the one that both STAYS and spends a
+            // slot of `MAX_PER_PASS`: eight of those owned the whole budget
+            // every pass, and every record behind them waited out its
+            // seven-day expiry. The bound is right — a denied push IS a
+            // session round trip, which is exactly what it meters — so the
+            // schedule here and the ordering above are what changed.
             //
             // Read ABOVE the bytes check, which awaits the blob store: a
-            // resting record must cost this pass nothing, and a store round
-            // trip per resting record per pass is most of what the schedule
-            // was added to stop. The price is that a record whose staged copy
-            // has gone is dropped up to one rung late — ten minutes against a
-            // seven-day TTL.
+            // resting record must cost this pass no store round trip, and one
+            // per resting record per pass is most of what this was added to
+            // stop. It is read BELOW the roots test, which is a lock and a
+            // prefix compare — a record outside the roots is held on every
+            // pass and never rests, deliberately, because its reason has to
+            // stay current. The price is that a record whose staged copy has
+            // gone is dropped up to one rung late, ten minutes against a
+            // seven-day TTL — and one that is BOTH outside the roots and
+            // missing its bytes is not dropped until that TTL.
             //
             // A device that just dialed in has answered the question the
             // schedule was guessing at, so a forced pass tries everything.
@@ -2293,6 +2391,52 @@ fn record_due(record: &Record, now: u64) -> bool {
         || now >= record.last_attempt_at.saturating_add(retry_delay(record.attempts).as_secs())
 }
 
+/// One peer's drain slot, held for as long as this value lives.
+///
+/// The same `inflight` entry `drain_peer` takes, so anything holding it makes
+/// a concurrent pass for that peer set the redrive flag and return rather than
+/// run. `forget_device` needs that: it removes a peer and then deletes that
+/// peer's records, and a pass running in between would either give the same
+/// records up as ABANDONED — the re-report `Ending::Withdrawn` exists to
+/// prevent — or push one to a device this call has already reported as gone.
+///
+/// A GUARD rather than two bare calls, because every early return between the
+/// take and the release would otherwise strand the peer's slot and stop the
+/// drain for that device for the life of the process.
+struct DrainToken {
+    inflight: Arc<Mutex<HashMap<String, bool>>>,
+    peer: String,
+}
+
+impl DrainToken {
+    /// Wait until this peer has no pass in flight, then claim its slot.
+    ///
+    /// A short poll rather than a condvar: an in-flight pass is bounded by
+    /// `MAX_PER_PASS` pushes and ends on its own, contention here needs a
+    /// human unpairing a device at the moment its queue is draining, and the
+    /// alternative is a second synchronisation primitive over a map whose
+    /// only other reader is a `try`-style check.
+    async fn take(inflight: &Arc<Mutex<HashMap<String, bool>>>, peer: &str) -> Self {
+        loop {
+            {
+                let mut flight = inflight.lock().unwrap_or_else(|p| p.into_inner());
+                if !flight.contains_key(peer) {
+                    flight.insert(peer.to_string(), false);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Self { inflight: inflight.clone(), peer: peer.to_string() }
+    }
+}
+
+impl Drop for DrainToken {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.peer);
+    }
+}
+
 /// Drop a cached session so the next call re-handshakes. A free function over
 /// the shared map: the send path and the drain both do this for the same
 /// reason, and `is_closed()` is a cached flag rather than a probe, so neither
@@ -2400,12 +2544,18 @@ fn distinct_bytes<'a>(records: impl IntoIterator<Item = (&'a str, u64)>) -> u64 
 /// this wraps it without touching a word of it.
 ///
 /// The ADVICE is what the variant decides, and it has to: a device that
-/// answered and refused this server is awake, on a network, and running
-/// Vlervtifacts, so telling its owner to go and check those three things
-/// sends them to fix what is already working while the real cause — this
-/// server is not on that device's peer list any more — goes unsaid. The
-/// variant is the authority here, never a match on the cause text, which a
-/// refusing peer writes.
+/// answered is awake, on a network, and running Vlervtifacts, so telling its
+/// owner to go and check those three things sends them to fix what is already
+/// working. The variant is the authority here, never a match on the cause
+/// text, which a refusing peer writes.
+///
+/// Three answers, because the two refusals want opposite advice. Only
+/// `Unpaired` — the peer closed with `CLOSE_NOT_PAIRED` — may say the pairing
+/// is the problem. A plain `Refused` covers a protocol skew after a phone app
+/// update, a transient session cap, and a stream that broke after the
+/// handshake; telling that owner to re-pair sends them to break a pairing
+/// that works, and telling them a retry is pointless is wrong for at least
+/// the session cap. So it states the cause and stops.
 fn dial_failed(peer: &Peer, cause: &ConnectError) -> String {
     match cause {
         ConnectError::Unreachable(_) => format!(
@@ -2414,9 +2564,17 @@ fn dial_failed(peer: &Peer, cause: &ConnectError) -> String {
             label(peer)
         ),
         ConnectError::Refused(_) => format!(
+            "{} answered this server and would not open a session: {cause}. It is awake and \
+             on the network, so this is not a connectivity problem. It has NOT said the \
+             pairing is gone — a version mismatch between the two builds, a device already \
+             holding its maximum sessions, or a stream that broke mid-handshake all read this \
+             way. Report the cause as given and change nothing until it is understood.",
+            label(peer)
+        ),
+        ConnectError::Unpaired(_) => format!(
             "{} answered and refused this server: {cause}. It is awake and on the network, \
-             so retrying changes nothing. If it no longer lists \"{}\" among its paired \
-             peers, pair the two again from that device.",
+             so retrying changes nothing — that device no longer lists \"{}\" among its \
+             paired peers. Pair the two again from that device.",
             label(peer),
             device_name()
         ),
@@ -3050,6 +3208,157 @@ mod tests {
         phone.router.shutdown().await.ok();
     }
 
+    /// Age one record's last attempt by `secs`, on disk, and reload the spool.
+    ///
+    /// What waiting for the peer's ladder does, without waiting: the peer's
+    /// `Backoff` is an `Instant` a test cannot move, so the elapsed time is
+    /// written where the RECORD keeps it instead. The record file is patched
+    /// one field at a time rather than rewritten, so this does not have to
+    /// know the record's shape.
+    /// A record that already landed has no file left, and ageing it is not an
+    /// error — a pass that delivered something is exactly what the caller is
+    /// looping to find out.
+    fn age_record(state: &tempfile::TempDir, id: &str, secs: u64) {
+        let path = Dirs::new(state.path()).outbox().join(format!("{id}.json"));
+        let Ok(raw) = std::fs::read(&path) else {
+            return;
+        };
+        let mut doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let was = doc["record"]["last_attempt_at"].as_u64().unwrap();
+        doc["record"]["last_attempt_at"] = serde_json::json!(was.saturating_sub(secs));
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permanently_refused_head_of_queue_still_lets_the_record_behind_it_through() {
+        // The proof the per-record rest could not give on its own, and the
+        // reason this queue is ordered rather than merely paced.
+        //
+        // A pass that denies its whole budget steps every head record one rung
+        // (`deny`, inside the loop) and the peer one rung (`back_off`, after
+        // it) off the SAME ladder. So the peer's next pass begins at or after
+        // the moment those records come due — the rest never skips them, the
+        // eight of them meet `MAX_PER_PASS` again, and the ninth record waits
+        // out its seven-day expiry. Measured before the ordering was added:
+        // twelve passes, nothing delivered, the ninth still at `attempts == 0`.
+        //
+        // The refusal is REAL and comes off the wire. `accept_push` refuses an
+        // announced size over `beam::HARD_CAP_BYTES` before it opens the
+        // stream, so the head records stage tiny bytes and then have their
+        // announced size patched past that cap. They cannot be enqueued that
+        // way — `room_in` refuses 8 x 256 MiB against the 1 GiB spool cap — so
+        // they go in at their real size and the record files are patched after.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        let mut refused = Vec::new();
+        for n in 0..outbox::MAX_PER_PASS {
+            let file = workspace.path().join(format!("refused-{n}.html"));
+            std::fs::write(&file, format!("<h1>the device will never take this: {n}</h1>")).unwrap();
+            let id = queue_staged(&core, &node, &phone_id, &file).await;
+            let path = Dirs::new(state.path()).outbox().join(format!("{id}.json"));
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            doc["record"]["size"] = serde_json::json!(beam::HARD_CAP_BYTES + 1);
+            std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            refused.push(id);
+        }
+        // And the one record this device WOULD take, behind every refusal.
+        let mine = workspace.path().join("report.html");
+        std::fs::write(&mine, "<h1>queued behind eight permanent refusals</h1>").unwrap();
+        let deliverable = queue_staged(&core, &node, &phone_id, &mine).await;
+        core.outbox.reload();
+
+        // Passes at the cadence the PEER's ladder imposes: each one denies its
+        // whole budget, so both ladders step together, which is exactly the
+        // lockstep that made the rest useless.
+        let mut landed_on = None;
+        for (pass, rung) in [60u64, 120, 300, 600, 600, 600].into_iter().enumerate() {
+            core.drainer(&node).drain_peer(&phone_id).await;
+            if landed_on.is_none() && !received(&signals).is_empty() {
+                landed_on = Some(pass + 1);
+            }
+            for id in refused.iter().chain(std::iter::once(&deliverable)) {
+                age_record(&state, id, rung);
+            }
+            core.outbox.reload();
+        }
+
+        assert_eq!(
+            received(&signals),
+            vec!["report.html".to_string()],
+            "the record behind the refusals has to go out, and nothing else can"
+        );
+        assert_eq!(landed_on, Some(2), "and on the second pass, not eventually");
+        let status = core.server_status().await.unwrap();
+        assert!(
+            !status.queued.iter().any(|q| q.id == deliverable),
+            "it left the spool, or the next pass sends it twice"
+        );
+        assert_eq!(
+            status.queued_total,
+            outbox::MAX_PER_PASS,
+            "every refused record stays queued: not sent, and not dropped either"
+        );
+        assert!(
+            status.queued.iter().all(|q| q
+                .last_error
+                .as_deref()
+                .is_some_and(|why| why.contains("exceeds the transfer size cap"))),
+            "and each one carries the DEVICE's own refusal, so this proved a real denial: {:?}",
+            status.queued
+        );
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wake_from_a_device_with_nothing_queued_leaves_no_credit_behind() {
+        // `HostSignal::PeerConnected` fires a `Wake::Peer` on every single
+        // connection, whatever that device's queue holds — so a device with
+        // nothing pending is the common case, not an edge one. Granting the
+        // forced credit before the pending-peers filter left it unspent,
+        // because `peer_pass` never runs for a peer with no records. Some
+        // later ordinary tick then took it and ran as a forced pass, ignoring
+        // every record's rest — which is the starvation this schedule exists
+        // to remove, reintroduced one pass at a time.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        // The wake arrives while this device is owed nothing at all.
+        core.drainer(&node).pass(Some(&phone_id)).await;
+
+        // Only now is something queued, and refused a moment ago, so every
+        // record owes the ladder its first minute.
+        for n in 0..3 {
+            let file = workspace.path().join(format!("resting-{n}.html"));
+            std::fs::write(&file, format!("<h1>refused a moment ago: {n}</h1>")).unwrap();
+            let id = queue_staged(&core, &node, &phone_id, &file).await;
+            core.outbox.record_denial(&id, "not permitted for this peer".to_string()).unwrap();
+        }
+
+        // An ORDINARY pass. If the stale credit were still there it would
+        // spend it here and push all three against their schedule.
+        core.drainer(&node).pass(None).await;
+
+        assert!(
+            received(&signals).is_empty(),
+            "a spent wake must not force a later pass: {:?}",
+            received(&signals)
+        );
+        assert_eq!(core.server_status().await.unwrap().queued_total, 3, "all three still resting");
+
+        phone.router.shutdown().await.ok();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_device_that_dials_in_gets_every_record_tried_whatever_its_rest_says() {
         // The guard the schedule ships with. A `Wake::Peer` pass is the phone
@@ -3652,12 +3961,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_probe_that_is_refused_says_refused_and_not_offline() {
+    async fn a_probe_a_device_unpaired_says_unpaired_and_not_offline_or_refused() {
         // A device that is up, speaking the scope protocol, and does not list
-        // this server. The old probe collapsed this to "offline" — the same
-        // word a phone in a drawer gets — so the surface a user reads to
-        // answer "why did my send fail" pointed at the network while the
-        // device was awake and turning this node away on purpose.
+        // this server. Two collapses to avoid, not one. "offline" is the word
+        // a phone in a drawer gets, and it sent the user to check a network
+        // that works. "refused" is the word a version mismatch and a session
+        // cap get, and it must NOT be the word here — the tool descriptions
+        // route an unpaired device to `forget_device`, which deletes the
+        // pairing and every staged copy and cannot be undone.
         let state = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
         let phone_dir = tempfile::TempDir::new().unwrap();
@@ -3670,8 +3981,8 @@ mod tests {
         let devices = core.list_devices(true).await.expect("the probe runs");
         assert_eq!(devices.len(), 1);
         assert_eq!(
-            devices[0].presence, "refused",
-            "it answered, so the thing to fix is its peer list and not its network"
+            devices[0].presence, "unpaired",
+            "it answered AND named the allowlist, which is the only cause that earns this word"
         );
 
         phone.router.shutdown().await.ok();
@@ -3694,20 +4005,49 @@ mod tests {
         assert!(asleep.contains("is not reachable"), "{asleep}");
         assert!(asleep.contains("Check that the device is awake"), "{asleep}");
 
-        // A device that ANSWERED and refused gets the opposite sentence. It
-        // is awake, on a network, and running Vlervtifacts — telling its
-        // owner to go and check those three sends them to fix what already
-        // works, which is the failure this whole change exists to end.
-        let refused = dial_failed(&peer, &ConnectError::Refused("not a paired peer".to_string()));
-        assert!(refused.contains("answered and refused this server"), "{refused}");
-        assert!(refused.contains("not a paired peer"), "the cause survives: {refused}");
+        // A device that ANSWERED and named the allowlist gets the opposite
+        // sentence. It is awake, on a network, and running Vlervtifacts —
+        // telling its owner to go and check those three sends them to fix
+        // what already works, which is the failure this change exists to end.
+        let unpaired =
+            dial_failed(&peer, &ConnectError::Unpaired("not a paired peer".to_string()));
+        assert!(unpaired.contains("answered and refused this server"), "{unpaired}");
+        assert!(unpaired.contains("not a paired peer"), "the cause survives: {unpaired}");
         assert!(
-            !refused.contains("Check that the device is awake"),
-            "the advice that blames the network must not appear: {refused}"
+            !unpaired.contains("Check that the device is awake"),
+            "the advice that blames the network must not appear: {unpaired}"
         );
         assert!(
-            refused.contains("retrying changes nothing"),
-            "and it says the retry is pointless, which the variant already knows: {refused}"
+            unpaired.contains("retrying changes nothing"),
+            "and it says the retry is pointless, which the variant already knows: {unpaired}"
+        );
+        assert!(
+            unpaired.contains("Pair the two again"),
+            "and names the one action that helps: {unpaired}"
+        );
+
+        // A refusal that did NOT name the allowlist must claim none of that.
+        // A protocol skew after a phone app update, and a device already at
+        // its session cap, both arrive here — telling that owner to re-pair
+        // sends them to break a pairing that works, and "retrying changes
+        // nothing" is simply false for a session cap that frees up.
+        let refused = dial_failed(&peer, &ConnectError::Refused("session cap".to_string()));
+        assert!(refused.contains("session cap"), "the cause still survives: {refused}");
+        assert!(
+            !refused.contains("Check that the device is awake"),
+            "it answered, so the network advice is wrong here too: {refused}"
+        );
+        assert!(
+            !refused.contains("Pair the two again"),
+            "it never said the pairing is gone, so nothing may suggest re-pairing: {refused}"
+        );
+        assert!(
+            !refused.contains("retrying changes nothing"),
+            "and a session cap frees up, so a pointless-retry claim is false: {refused}"
+        );
+        assert!(
+            refused.contains("has NOT said the pairing is gone"),
+            "it says plainly what it does not know: {refused}"
         );
     }
 
@@ -3925,6 +4265,17 @@ mod tests {
         let status = core.server_status().await.unwrap();
         assert_eq!(status.queued_total, 0, "nothing is owed to a device that is not paired");
         assert_eq!(status.retained_bytes, 0, "and nothing is kept on this disk for it");
+        // ABANDONED, not withdrawn. Nobody asked this server to drop these:
+        // the unpair happened on the device, or in the app, so the two files
+        // somebody was promised end here and the only surface that can say so
+        // is this one. Flipping this call site to `Withdrawn` left the whole
+        // suite green before this assertion existed.
+        assert_eq!(status.abandoned_total, 2, "{:?}", status.abandoned);
+        assert!(
+            status.abandoned.iter().all(|a| a.reason.contains("no longer paired")),
+            "each one says why it ended: {:?}",
+            status.abandoned
+        );
         for id in &ids {
             assert!(
                 !Dirs::new(state.path()).outbox().join(format!("{id}.json")).exists(),
@@ -3998,6 +4349,51 @@ mod tests {
         // some other call had already removed.
         let again = core.forget_device("Val's iPhone").await.unwrap_err();
         assert!(again.contains("no devices are paired"), "{again}");
+
+        phone.router.shutdown().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forgotten_device_cannot_still_fetch_the_bytes_a_push_granted_it() {
+        // The blob gate consults `grants`, not `peers.json`. Removing the
+        // pairing therefore does NOT stop a fetch: `push_staged_via` mints a
+        // peer-locked grant that lives `GRANT_TTL_SECS`, so a device forgotten
+        // a minute after a push could go on pulling those bytes for the rest
+        // of the hour. `ScopeServer::revoke` is what drops it, and wrapping
+        // that call in `if false` left the whole suite green — the other
+        // forget proof uses a device that never dials, so it holds no grant.
+        let state = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let (core, node, phone, signals, phone_id) =
+            core_draining_to(&state, &workspace, &phone_dir).await;
+
+        let file = workspace.path().join("report.html");
+        std::fs::write(&file, "<h1>pushed, then the device was forgotten</h1>").unwrap();
+        let id = queue_staged(&core, &node, &phone_id, &file).await;
+        let staged = core
+            .outbox
+            .list()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("the record is queued")
+            .hash;
+        core.drainer(&node).drain_peer(&phone_id).await;
+        assert_eq!(received(&signals), vec!["report.html".to_string()], "the push landed");
+
+        // The grant the push minted, on this server's own store.
+        assert!(
+            node.grants.admits_hex(&staged, &phone_id),
+            "the device it was pushed to may fetch those bytes"
+        );
+
+        core.forget_device("Val's iPhone").await.expect("the device is forgotten");
+
+        assert!(
+            !node.grants.admits_hex(&staged, &phone_id),
+            "and a forgotten device may not — the pairing is not what the blob gate reads"
+        );
 
         phone.router.shutdown().await.ok();
     }
@@ -4096,6 +4492,15 @@ mod tests {
         let status = core.server_status().await.unwrap();
         assert_eq!(status.queued_total, 0, "a delivery that cannot happen is not kept");
         assert_eq!(status.queued_bytes, 0);
+        // And it is REPORTED. A delivery that ends because its bytes went is
+        // a promise this server broke, so it belongs beside the expiries —
+        // dropping it silently is what the abandoned list exists to stop.
+        assert_eq!(status.abandoned_total, 1, "{:?}", status.abandoned);
+        assert!(
+            status.abandoned[0].reason.contains("no longer in the blob store"),
+            "and it says why: {:?}",
+            status.abandoned[0].reason
+        );
         assert!(
             !Dirs::new(state.path()).outbox().join(format!("{id}.json")).exists(),
             "the record file goes with it, or the next boot brings it back"

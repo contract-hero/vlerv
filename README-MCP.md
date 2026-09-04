@@ -130,10 +130,22 @@ here, when it was last seen, and presence.
 - `probe` — when true, dials each device once for live presence. Without it
   presence is `"unknown"` unless a session is already open.
 
-A probed device reads `"online"`, `"offline"` — it did not answer — or
-`"refused"`, which means it answered and turned this server away. A refused
-device is awake and on the network; what is wrong is its peer list, not its
-Wi-Fi. `forget_device` is how the two sides agree again.
+A probed device reads one of four words, and they are kept apart because you
+act on each differently:
+
+- `"online"` — a session is open, or a probe just opened one.
+- `"offline"` — it did not answer at all.
+- `"refused"` — it answered but would not open a session. It is awake and on
+  the network, so this is not a connectivity problem, and **nothing about the
+  pairing follows from it**: a version mismatch between the two builds, a
+  device already at its session cap, and a stream that broke mid-handshake all
+  read this way.
+- `"unpaired"` — it answered and said this server is not on its peer list.
+  This is the one that means the pairing is gone, and the only one that
+  justifies `forget_device`.
+
+The difference is decided by the QUIC close code on the wire, never by the
+peer's own reason text.
 
 ### `send_to_device { path, device }`
 
@@ -206,17 +218,24 @@ Unpairs one device and deletes everything this server was keeping for it.
 
 It removes the pairing, so that device can no longer reach this server, and it
 **deletes the private copies** of any files still queued for it — those sends
-never arrive. Both are irreversible except by pairing again, and the result
-says which of them happened.
+never arrive. Pairing again restores the pairing; the deleted copies do not
+come back, and each send has to be made again. The result says which of them
+happened.
 
 The order matters and is fixed: the pairing goes first, so a cleanup that
 cannot finish leaves a device unpaired with its records still queued, never the
 other way round. Whatever is left is finished by the next drain pass.
 
 Use it when a device is no longer the user's, or when `list_devices` reports it
-as `"refused"` — that device already removed this server, and until now the
+as `"unpaired"` — that device already removed this server, and until now the
 only ways to agree again were editing `peers.json` by hand or waiting out the
 seven-day record expiry.
+
+Do **not** reach for it on a device reported `"refused"`. That word says only
+that the device would not open a session, which a version mismatch or a session
+cap also causes, and unpairing would destroy a pairing that works. It is also
+not a way to cancel one queued send: there is no such tool, and this one takes
+the pairing with it.
 
 ### `server_status {}`
 
@@ -226,11 +245,13 @@ devices pushed to it during this session, and which sends are still queued for
 a device that has not answered. The pushed-file list holds the last 100
 arrivals; `received_total` reports how many arrived in all. The structured
 result carries every queued record, with the device it is for and the last
-error it hit. It also carries `abandoned`: the sends this process accepted and
-then gave up on — expired, or dropped because the device was unpaired — each
-with the file, the device and the reason. That list is in memory only, because
-the record itself is gone by then, so it reports what **this** process ended.
-The summary prints it only when there is something on it. The summary text prints that list too — except when
+error it hit. It also carries `abandoned`: the sends this process accepted and then broke
+its promise about — expired, dropped because the staged bytes went, or dropped
+because the drain found the device unpaired — each with the file, the device
+and the reason. A `forget_device` withdrawal is **not** on this list: that tool
+already reported what it deleted to whoever asked for it. The list is in memory
+only, because the record itself is gone by then, so it reports what **this**
+process ended. The summary prints it only when there is something on it. The summary text prints that list too — except when
 `queue_blocked_reason` is set, where it names the count and the reason and
 stops there, because a record-by-record list under a queue that can move
 nothing reads as progress.
