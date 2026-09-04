@@ -557,13 +557,15 @@ impl ScopeState {
     pub fn drop_sessions_for(&self, node_id: &str) {
         // Collected under the lock and cut outside it: `close` is not
         // expected to block, and holding the registry across another module's
-        // code is how a lock order gets invented by accident.
+        // code is how a lock order gets invented by accident. The `retain`
+        // this used to be is kept — an `Arc` clone per revoked session is what
+        // the cuts cost, against rebuilding the whole registry to take them.
         let revoked: Vec<Arc<dyn Fn() + Send + Sync>> = {
             let mut sessions = self.sessions();
-            let (going, staying): (Vec<Session>, Vec<Session>) =
-                sessions.drain(..).partition(|s| s.peer == node_id);
-            *sessions = staying;
-            going.into_iter().map(|s| s.cut).collect()
+            let cuts =
+                sessions.iter().filter(|s| s.peer == node_id).map(|s| s.cut.clone()).collect();
+            sessions.retain(|s| s.peer != node_id);
+            cuts
         };
         for cut in revoked {
             cut();
@@ -2186,34 +2188,20 @@ mod tests {
 
     /// A registrable session with a live channel. The receiver is returned so
     /// the caller keeps it alive — a dropped one closes the sender.
-    fn session(id: u64, peer: &str) -> (Session, mpsc::Receiver<Frame>) {
+    /// A registered session with no transport behind it, which is the whole
+    /// reason `cut` is a closure: the registry proofs need a session, not a
+    /// socket. The flag comes back so a revocation proof can watch the cut;
+    /// the proofs that only need a session bind it as `_`.
+    fn session(id: u64, peer: &str) -> (Session, mpsc::Receiver<Frame>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::channel(1);
+        let was_cut = Arc::new(AtomicBool::new(false));
+        let flag = was_cut.clone();
         let session = Session {
             id,
             peer: peer.to_string(),
             tx,
             handles: Arc::new(SessionHandles::new()),
-            // No transport behind this one, which is the whole reason `cut`
-            // is a closure: the registry proofs need a session, not a socket.
-            cut: Arc::new(|| {}),
-        };
-        (session, rx)
-    }
-
-    /// A session whose cut is observable, for the proofs about revocation
-    /// rather than about the registry. The receiver goes back to the caller
-    /// so the channel stays open: a dropped one ends the session a different
-    /// way than the one under test.
-    fn cuttable_session(
-        id: u64,
-        peer: &str,
-    ) -> (Session, mpsc::Receiver<Frame>, Arc<AtomicBool>) {
-        let (session, rx) = session(id, peer);
-        let was_cut = Arc::new(AtomicBool::new(false));
-        let flag = was_cut.clone();
-        let session = Session {
             cut: Arc::new(move || flag.store(true, Ordering::SeqCst)),
-            ..session
         };
         (session, rx, was_cut)
     }
@@ -2225,19 +2213,19 @@ mod tests {
         let mut ids = Vec::new();
         let mut keep_alive = Vec::new();
         for n in 0..MAX_SESSIONS_PER_PEER {
-            let (session, rx) = session(n as u64, "nodeA");
+            let (session, rx, _) = session(n as u64, "nodeA");
             keep_alive.push(rx);
             ids.push(st.register(session).expect("under the cap"));
         }
-        let (over_cap, _rx) = session(99, "nodeA");
+        let (over_cap, _rx, _) = session(99, "nodeA");
         assert!(st.register(over_cap).is_err(), "the cap refuses the next session");
 
         // Another peer is unaffected — the cap is per peer.
-        let (other_peer, _rx) = session(100, "nodeB");
+        let (other_peer, _rx, _) = session(100, "nodeB");
         assert!(st.register(other_peer).is_ok());
 
         st.unregister(ids[0]);
-        let (replacement, _rx) = session(101, "nodeA");
+        let (replacement, _rx, _) = session(101, "nodeA");
         assert!(st.register(replacement).is_ok());
     }
 
@@ -2247,7 +2235,7 @@ mod tests {
         let st = state(&dir, RootSet::empty());
         let watched = PathBuf::from("/w/a.html");
 
-        let (session, _rx) = session(1, "nodeA");
+        let (session, _rx, _) = session(1, "nodeA");
         let handles = session.handles.clone();
         st.register(session).unwrap();
 
@@ -2319,8 +2307,8 @@ mod tests {
         // machine it was about did not hear it.
         let dir = tempfile::TempDir::new().unwrap();
         let st = state(&dir, RootSet::empty());
-        let (revoked, _revoked_rx, was_cut) = cuttable_session(1, "nodeA");
-        let (bystander, _bystander_rx, untouched) = cuttable_session(2, "nodeB");
+        let (revoked, _revoked_rx, was_cut) = session(1, "nodeA");
+        let (bystander, _bystander_rx, untouched) = session(2, "nodeB");
         st.register(revoked).unwrap();
         st.register(bystander).unwrap();
 

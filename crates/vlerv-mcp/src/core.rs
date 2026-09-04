@@ -55,10 +55,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RECEIVED: usize = 100;
 
 /// How many dead deliveries `server_status` lists, on the same rule and for
-/// the same reason. Smaller than `MAX_RECEIVED` because the spool it draws
-/// from is capped at `outbox::MAX_RECORDS` — a queue that is full cannot
-/// abandon more than sixty-four things at once.
-const MAX_ABANDONED: usize = 50;
+/// the same reason.
+///
+/// The spool this draws from is itself capped at `outbox::MAX_RECORDS`, so
+/// matching that cap is what makes the list survive the worst single event it
+/// can see: one expiry sweep of a completely full queue. A smaller number
+/// would drop entries from the very sweep the list exists to report.
+const MAX_ABANDONED: usize = outbox::MAX_RECORDS;
 
 /// Shortest content-hash prefix `stop_beam` accepts for ONE link. Revoking
 /// the wrong link is recoverable (mint another); revoking by a one-character
@@ -129,10 +132,11 @@ pub struct Forgotten {
     /// file — the store is content-addressed, so two records naming one file
     /// were always one copy.
     pub dropped_bytes: u64,
-    /// Anything that did not happen. Empty is the normal answer, and a
-    /// non-empty list is the caller's to pass on: the pairing is gone in
-    /// either case, and only the cleanup can be left owing.
-    pub notes: Vec<String>,
+    /// What did not happen. `None` is the normal answer, and a reason is the
+    /// caller's to pass on: the pairing is gone in either case, and only the
+    /// cleanup can be left owing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -397,20 +401,61 @@ pub struct ServerStatus {
     pub roots: Vec<PathBuf>,
 }
 
-/// The pushed-artifact log: the last `MAX_RECEIVED` arrivals, and how many
-/// arrived in all. One structure under one lock — a separate counter beside
-/// the vector could be read a push out of step with it.
-#[derive(Default)]
-struct Received {
-    items: Vec<ReceivedArtifact>,
+/// A bounded event log: the last `cap` entries, and how many there have been
+/// in all. One structure under one lock — a separate counter beside the vector
+/// could be read an event out of step with it.
+///
+/// ONE implementation for the two logs this server keeps, arrivals and dead
+/// deliveries, because the retention rule is the same rule and two copies of
+/// it drift: they already disagreed on whether the total saturates. The rule
+/// is to keep the NEWEST entries — those are the ones a caller is still
+/// deciding anything about — and let `total` carry the count the list no
+/// longer can, because a silently shortened list reads as "that is all of
+/// them".
+struct Log<T> {
+    items: Vec<T>,
     total: u64,
 }
 
-/// The same shape for deliveries that ENDED instead of arriving.
-#[derive(Default)]
-struct Abandoned {
-    items: Vec<AbandonedDelivery>,
-    total: u64,
+// Derived `Default` would demand `T: Default`, which neither entry type has
+// or needs.
+impl<T> Default for Log<T> {
+    fn default() -> Self {
+        Self { items: Vec::new(), total: 0 }
+    }
+}
+
+impl<T: Clone> Log<T> {
+    fn push_capped(&mut self, item: T, cap: usize) {
+        self.total = self.total.saturating_add(1);
+        self.items.push(item);
+        if self.items.len() > cap {
+            self.items.remove(0);
+        }
+    }
+
+    /// A copy taken under one lock, so the list and the count beside it
+    /// cannot straddle a push.
+    fn snapshot(&self) -> (Vec<T>, u64) {
+        (self.items.clone(), self.total)
+    }
+}
+
+/// Why a record is leaving the spool without arriving, which decides whether
+/// the user hears about it a second time.
+///
+/// The list exists to report a promise this server BROKE. A deletion the user
+/// asked for is not one: `forget_device` already told them what it deleted, so
+/// logging it here would make every later `server_status` in the process
+/// re-report a completed, requested action as a failure — and crowd out the
+/// abandonments that are news.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// This server broke a promise: the record ran out its week, or the bytes
+    /// behind it are gone. News.
+    Abandoned,
+    /// The user asked for it and has already been told. Not news.
+    Withdrawn,
 }
 
 /// A delivery this server accepted and will not make.
@@ -492,7 +537,7 @@ struct Backoff {
 /// JSON-RPC channel and is never written to here.
 struct McpSink {
     pairing: Arc<Pairing>,
-    received: Arc<Mutex<Received>>,
+    received: Arc<Mutex<Log<ReceivedArtifact>>>,
     /// The wake channel, held WEAKLY, and that is not a nicety. This sink is
     /// owned by the `ScopeState` inside the `RemoteNode` that the supervisor
     /// task holds, so a strong sender here would make the channel
@@ -530,15 +575,10 @@ impl EventSink for McpSink {
             }
             HostSignal::ArtifactReceived { peer, path, name, size, hash } => {
                 eprintln!("vlerv-mcp: {} pushed {name} to {}", short_id(&peer), path.display());
-                let mut received = self.received.lock().unwrap_or_else(|p| p.into_inner());
-                received.total += 1;
-                received.items.push(ReceivedArtifact { from: peer, name, path, size, hash });
-                // Drop from the FRONT, so the list stays the last
-                // MAX_RECEIVED arrivals rather than the first — an operator
-                // asking what just landed wants the newest.
-                if received.items.len() > MAX_RECEIVED {
-                    received.items.remove(0);
-                }
+                self.received.lock().unwrap_or_else(|p| p.into_inner()).push_capped(
+                    ReceivedArtifact { from: peer, name, path, size, hash },
+                    MAX_RECEIVED,
+                );
             }
             HostSignal::PeerConnected { peer, device, scope } => {
                 // The precise wake trigger. This device holds a session right
@@ -584,13 +624,13 @@ pub struct McpCore {
     home: Option<PathBuf>,
     peers: Arc<PeerStore>,
     pairing: Arc<Pairing>,
-    received: Arc<Mutex<Received>>,
+    received: Arc<Mutex<Log<ReceivedArtifact>>>,
     /// Deliveries this server promised and then ended. IN MEMORY, unlike the
     /// queue itself: the record is gone by the time it lands here, so there
     /// is nothing left on disk to hang it off, and a process that exits takes
     /// its list with it. That is the honest limit of the surface — it says
     /// what THIS server gave up on, not what every server ever did.
-    abandoned: Arc<Mutex<Abandoned>>,
+    abandoned: Arc<Mutex<Log<AbandonedDelivery>>>,
     /// Sends accepted for a device that was asleep. Read off disk in `new`,
     /// beside the peer store and for the same reason: both are files this
     /// server must be able to REPORT before it is allowed to open a socket,
@@ -670,7 +710,7 @@ impl McpCore {
             device: device_name(),
             peers: Arc::new(PeerStore::load(&dirs.remote())),
             pairing: Arc::new(Pairing::new()),
-            received: Arc::new(Mutex::new(Received::default())),
+            received: Arc::new(Mutex::new(Log::default())),
             outbox: Arc::new(Outbox::load(&dirs.outbox())),
             roots: RootSet::new(roots),
             cwd,
@@ -683,7 +723,7 @@ impl McpCore {
             loopback: Arc::new(Mutex::new(None)),
             wake,
             wake_rx: Mutex::new(Some(wake_rx)),
-            abandoned: Arc::new(Mutex::new(Abandoned::default())),
+            abandoned: Arc::new(Mutex::new(Log::default())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             retry: Arc::new(Mutex::new(HashMap::new())),
             forced: Arc::new(Mutex::new(HashSet::new())),
@@ -953,15 +993,21 @@ impl McpCore {
         // probe below would then dial through the same failure and report
         // "offline", sending the user to debug phones and networks over a
         // fault that is neither. Say the real reason once.
-        if probe {
-            self.node().await?;
-        }
+        //
+        // The booted node is then HANDED DOWN rather than re-fetched per
+        // device: `presence` holding its own failure arm would have to answer
+        // a boot fault in the vocabulary of device reachability, which is the
+        // exact conflation this whole surface is being fixed to remove.
+        let node = match probe {
+            true => Some(self.node().await?),
+            false => None,
+        };
         // The probes run TOGETHER. Dialed one after another, a fleet where
         // three devices are asleep costs three PROBE_TIMEOUTs before the list
         // comes back; concurrently the whole call bounds at about one, however
         // many devices are paired.
         let presence =
-            join_all(peers.iter().map(|peer| self.presence(peer, probe))).await;
+            join_all(peers.iter().map(|peer| self.presence(peer, node.as_ref()))).await;
         Ok(peers
             .into_iter()
             .zip(presence)
@@ -985,21 +1031,25 @@ impl McpCore {
     /// turns this node away is REACHABLE, and calling it offline sends its
     /// owner to check a network that is working. The variant is what tells
     /// the two apart, so the probe takes the dial that still carries it.
-    async fn presence(&self, peer: &Peer, probe: bool) -> &'static str {
+    ///
+    /// `node` is BOTH the "probe this" flag and the node to probe with, so
+    /// there is no arm here that has to answer a boot failure — `list_devices`
+    /// booted once for the whole fan-out and returned any failure as the
+    /// call's own.
+    async fn presence(
+        &self,
+        peer: &Peer,
+        node: Option<&Arc<endpoint::RemoteNode>>,
+    ) -> &'static str {
         if let Some(session) = self.sessions.lock().await.get(&peer.node_id) {
             if !session.is_closed() {
                 return "online";
             }
         }
-        if !probe {
+        let Some(node) = node else {
             return "unknown";
-        }
-        // `list_devices` booted once for the whole probe fan-out and returned
-        // any failure as the call's own, so this cannot be the first boot.
-        let Ok(node) = self.node().await else {
-            return "offline";
         };
-        match tokio::time::timeout(PROBE_TIMEOUT, self.drainer(&node).dial_session(peer)).await {
+        match tokio::time::timeout(PROBE_TIMEOUT, self.drainer(node).dial_session(peer)).await {
             Ok(Ok(_)) => "online",
             Ok(Err(ConnectError::Refused(_))) => "refused",
             _ => "offline",
@@ -1534,10 +1584,9 @@ impl McpCore {
     ///
     /// The ORDER is the part to keep. The pairing goes first, because that is
     /// the act the user asked for and the one that must land even if
-    /// everything after it fails; then the cached session, so nothing reuses
-    /// a handle to a device this server no longer trusts; then the queued
-    /// copies. A cleanup that ran first and then failed to remove the peer
-    /// would destroy sends for a device that is still paired.
+    /// everything after it fails; then everything the pairing was holding up.
+    /// A cleanup that ran first and then failed to remove the peer would
+    /// destroy sends for a device that is still paired.
     ///
     /// Nothing after the removal can fail this call. `peer_pass` already
     /// drops every record of an unknown peer and unpins its bytes, so a
@@ -1551,9 +1600,26 @@ impl McpCore {
 
         self.peers.remove(&peer.node_id)?;
         forget_session(&self.sessions, &peer.node_id).await;
+        // The rest of revocation, through the mechanism the app's own unpair
+        // already uses (`remote_unpair`) rather than a second spelling of it:
+        // `ScopeServer::revoke` cuts the session that device holds INBOUND to
+        // this server, and drops the fetch grants it was minted. The peer
+        // list is not what the blob gate consults, so without this a device
+        // forgotten a minute after a push could still fetch those bytes for
+        // the rest of `GRANT_TTL_SECS`.
+        //
+        // `booted` and not `node`, so forgetting a device on a server that
+        // never opened its network still binds no socket: there is no session
+        // to cut and no grant to drop on a node that does not exist.
+        if let Some(node) = self.booted() {
+            if let Some(scope) = &node.scope {
+                scope.revoke(&peer.node_id).await;
+            }
+        }
 
-        let mut notes = Vec::new();
-        let mut dropped = Vec::new();
+        let mut note = None;
+        let mut dropped = 0;
+        let mut dropped_bytes = 0;
         if !owed.is_empty() {
             // The store is opened only when there is something in it to
             // unpin, so forgetting a device this server owes nothing costs no
@@ -1562,31 +1628,42 @@ impl McpCore {
                 Ok(node) => {
                     let drainer = self.drainer(&node);
                     for record in &owed {
-                        drainer.give_up(record, "the device was forgotten on this server").await;
-                        dropped.push(record.clone());
+                        // WITHDRAWN, not abandoned: the user asked for this
+                        // and is told below, so logging it as a dead delivery
+                        // would make every later `server_status` re-report a
+                        // completed request as a broken promise.
+                        drainer
+                            .give_up(
+                                record,
+                                "the device was forgotten on this server",
+                                Ending::Withdrawn,
+                            )
+                            .await;
                     }
+                    // The peer is gone, so its rung in the in-memory ladder
+                    // describes a device that no longer exists; left behind,
+                    // it would meter the first pass after a re-pairing.
+                    self.retry.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer.node_id);
+                    dropped = owed.len();
+                    dropped_bytes = distinct_bytes(owed.iter().map(|r| (r.hash.as_str(), r.size)));
                 }
-                Err(e) => notes.push(format!(
-                    "{} queued send(s) for this device could not be deleted now ({e}). The \
-                     pairing IS gone; the next drain pass deletes the records and the copies \
-                     with them.",
-                    owed.len()
-                )),
+                Err(e) => {
+                    note = Some(format!(
+                        "{} queued send(s) for this device could not be deleted now ({e}). The \
+                         pairing IS gone; the next drain pass deletes the records and the copies \
+                         with them.",
+                        owed.len()
+                    ))
+                }
             }
         }
-        // Counted off the CONTENT, like `server_status`: one blob backs every
-        // record naming it, so a file queued for two devices is one copy on
-        // this disk and reporting it twice overstates what was reclaimed.
-        let mut counted: BTreeSet<&str> = BTreeSet::new();
-        let dropped_bytes =
-            dropped.iter().filter(|r| counted.insert(&r.hash)).map(|r| r.size).sum();
         Ok(Forgotten {
             node_id_short: short_id(&peer.node_id),
             device: peer.device,
             node_id: peer.node_id,
-            dropped: dropped.len(),
+            dropped,
             dropped_bytes,
-            notes,
+            note,
         })
     }
 
@@ -1602,14 +1679,10 @@ impl McpCore {
             Some(n) => n.endpoint.id().to_string(),
             None => self.node_id()?,
         };
-        let received = {
-            let log = self.received.lock().unwrap_or_else(|p| p.into_inner());
-            Received { items: log.items.clone(), total: log.total }
-        };
-        let abandoned = {
-            let log = self.abandoned.lock().unwrap_or_else(|p| p.into_inner());
-            Abandoned { items: log.items.clone(), total: log.total }
-        };
+        let (received_artifacts, received_total) =
+            self.received.lock().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let (abandoned, abandoned_total) =
+            self.abandoned.lock().unwrap_or_else(|p| p.into_inner()).snapshot();
         // ONE read of the spool for the three answers shown side by side. The
         // same argument the sum below makes: a pending list, an unaccounted
         // list and the spool's fault taken in three separate locks can
@@ -1622,13 +1695,7 @@ impl McpCore {
         // total that disagreed with the list beside it would send a reader
         // hunting for a record that is not there.
         let queued_bytes: u64 = queued.iter().map(|q| q.size).sum();
-        // One copy backs every record that names the same content. The store
-        // is content-addressed, so a file queued for the phone and the iPad
-        // is two records, two pins and one blob — counting it twice would
-        // report a disk cost that is not there.
-        let mut counted: BTreeSet<&str> = BTreeSet::new();
-        let retained_bytes: u64 =
-            queued.iter().filter(|q| counted.insert(&q.hash)).map(|q| q.size).sum();
+        let retained_bytes = distinct_bytes(queued.iter().map(|q| (q.hash.as_str(), q.size)));
         Ok(ServerStatus {
             node_id_short: short_id(&node_id),
             node_id,
@@ -1640,8 +1707,8 @@ impl McpCore {
             uptime_secs: self.started.elapsed().as_secs(),
             paired_devices: self.peers.list().len(),
             active_offers,
-            received_artifacts: received.items,
-            received_total: received.total,
+            received_artifacts,
+            received_total,
             queued_total: queued.len(),
             queued,
             queued_bytes,
@@ -1651,8 +1718,8 @@ impl McpCore {
             // off the pending list, so a status that stayed silent would
             // report the delivery as simply gone.
             queue_unreadable: spool.unaccounted,
-            abandoned: abandoned.items,
-            abandoned_total: abandoned.total,
+            abandoned,
+            abandoned_total,
             draining: self.draining(),
             queue_blocked_reason: self.blocked_by(spool.fault),
             roots: self.roots.roots(),
@@ -1680,7 +1747,7 @@ struct Drainer {
     roots: RootSet,
     device: String,
     loopback: Arc<Mutex<Option<SocketAddr>>>,
-    abandoned: Arc<Mutex<Abandoned>>,
+    abandoned: Arc<Mutex<Log<AbandonedDelivery>>>,
     inflight: Arc<Mutex<HashMap<String, bool>>>,
     retry: Arc<Mutex<HashMap<String, Backoff>>>,
     forced: Arc<Mutex<HashSet<String>>>,
@@ -1767,7 +1834,12 @@ impl Drainer {
             if !beam::outbox_bytes_present(&self.node, &record.hash).await {
                 // Retrying this to the TTL would announce a fetch the
                 // receiver can never complete, once per pass for a week.
-                self.give_up(&record, "its staged copy is no longer in the blob store").await;
+                self.give_up(
+                    &record,
+                    "its staged copy is no longer in the blob store",
+                    Ending::Abandoned,
+                )
+                .await;
             }
         }
         let Some(keep) = self.outbox.live_tags() else {
@@ -1802,17 +1874,25 @@ impl Drainer {
         // device must cost one dial, not five. The peers then run together,
         // the way `list_devices { probe: true }` probes, so one sleeping
         // device does not hold up a delivery to an awake one.
-        // The credit is granted here and spent in `peer_pass`, so it survives
-        // the redrive path that would drop an argument threaded down.
-        if let Some(peer) = forced {
-            self.forced.lock().unwrap_or_else(|p| p.into_inner()).insert(peer.to_string());
-        }
         let due: Vec<String> = self
             .outbox
             .pending_peers()
             .into_iter()
             .filter(|peer| forced == Some(peer.as_str()) || self.due(peer))
             .collect();
+        // The credit is granted here and spent in `peer_pass`, so it survives
+        // the redrive path that would drop an argument threaded down.
+        //
+        // Granted only to a peer this pass will actually VISIT. A
+        // `Wake::Peer` fires on every connection whatever that device's queue
+        // holds (`HostSignal::PeerConnected`), so a device with nothing
+        // pending is missing from `due`, `peer_pass` never runs for it, and a
+        // credit inserted before this filter would sit there until some later
+        // tick took it — running one ordinary pass as a forced one, ignoring
+        // every record's rest, which is the starvation this schedule removes.
+        if let Some(peer) = forced.filter(|peer| due.iter().any(|due| due == peer)) {
+            self.forced.lock().unwrap_or_else(|p| p.into_inner()).insert(peer.to_string());
+        }
         join_all(due.iter().map(|peer| self.drain_peer(peer))).await;
     }
 
@@ -1883,7 +1963,12 @@ impl Drainer {
         // stays immediate: the bytes go now, not at the TTL.
         let Some(peer) = self.peers.get(peer_id) else {
             for record in &records {
-                self.give_up(record, "the device is no longer paired with this server").await;
+                self.give_up(
+                    record,
+                    "the device is no longer paired with this server",
+                    Ending::Abandoned,
+                )
+                .await;
             }
             self.retry.lock().unwrap_or_else(|p| p.into_inner()).remove(peer_id);
             return;
@@ -1950,18 +2035,6 @@ impl Drainer {
                 self.note(record, held_outside_roots(record, &listed));
                 continue;
             }
-            // `push_staged` mints a ticket for whatever hash it is handed, so
-            // a record whose bytes went would announce a fetch the receiver
-            // can never finish.
-            if !beam::outbox_bytes_present(&self.node, &record.hash).await {
-                self.give_up(record, "its staged copy is no longer in the blob store").await;
-                continue;
-            }
-            // Past both skips, so this record is about to spend a session
-            // round trip — and this is where its OWN ladder is read, after
-            // the two arms that spend nothing and before the bound that
-            // meters what it is about to spend.
-            //
             // Three outcomes take a record off the head of this queue: it
             // lands, it is held, or it is dropped. A denial does not: the
             // record stays, in the same id order, every pass. Eight of those
@@ -1972,6 +2045,13 @@ impl Drainer {
             // was refused steps aside on its own schedule, and the record
             // behind it is due immediately.
             //
+            // Read ABOVE the bytes check, which awaits the blob store: a
+            // resting record must cost this pass nothing, and a store round
+            // trip per resting record per pass is most of what the schedule
+            // was added to stop. The price is that a record whose staged copy
+            // has gone is dropped up to one rung late — ten minutes against a
+            // seven-day TTL.
+            //
             // A device that just dialed in has answered the question the
             // schedule was guessing at, so a forced pass tries everything.
             // Without that, a phone that woke up would wait ten minutes for a
@@ -1979,6 +2059,21 @@ impl Drainer {
             if !forced && !record_due(record, now) {
                 continue;
             }
+            // `push_staged` mints a ticket for whatever hash it is handed, so
+            // a record whose bytes went would announce a fetch the receiver
+            // can never finish. The one arm here that is not free — it awaits
+            // the store — which is why the schedule above runs first.
+            if !beam::outbox_bytes_present(&self.node, &record.hash).await {
+                self.give_up(
+                    record,
+                    "its staged copy is no longer in the blob store",
+                    Ending::Abandoned,
+                )
+                .await;
+                continue;
+            }
+            // Past every skip, so this record is about to spend a session
+            // round trip, and the bound below meters exactly that.
             pushes += 1;
             // The STAGED bytes, named by content address: nothing re-reads
             // the source, which by now may have been rewritten or deleted.
@@ -2086,11 +2181,13 @@ impl Drainer {
     /// Give up on one record: the file goes, then its pin. The reason is
     /// printed by the spool, because a delivery somebody was promised is
     /// ending here.
-    async fn give_up(&self, record: &Record, reason: &str) {
+    async fn give_up(&self, record: &Record, reason: &str, ending: Ending) {
         match self.outbox.drop_record(&record.id, reason) {
             Ok(Some(dropped)) => {
                 beam::unpin_outbox(&self.node, &dropped.tag).await;
-                self.abandon(&dropped, reason);
+                if ending == Ending::Abandoned {
+                    self.abandon(&dropped, reason);
+                }
             }
             // Already gone, so somebody else has already accounted for it and
             // a second entry would report one dead delivery as two.
@@ -2107,22 +2204,17 @@ impl Drainer {
     /// Written only where a record actually LEFT the spool, so the list and
     /// the queue cannot both claim the same send.
     fn abandon(&self, record: &Record, reason: &str) {
-        let mut log = self.abandoned.lock().unwrap_or_else(|p| p.into_inner());
-        log.total = log.total.saturating_add(1);
-        log.items.push(AbandonedDelivery {
-            id: record.id.clone(),
-            device: record.device.clone(),
-            name: record.name.clone(),
-            size: record.size,
-            reason: reason.to_string(),
-            at: peers::now_unix(),
-        });
-        // The same rule the arrivals log follows: keep the NEWEST, because
-        // those are the ones a caller is still deciding anything about, and
-        // let `abandoned_total` carry the count the list no longer can.
-        if log.items.len() > MAX_ABANDONED {
-            log.items.remove(0);
-        }
+        self.abandoned.lock().unwrap_or_else(|p| p.into_inner()).push_capped(
+            AbandonedDelivery {
+                id: record.id.clone(),
+                device: record.device.clone(),
+                name: record.name.clone(),
+                size: record.size,
+                reason: reason.to_string(),
+                at: peers::now_unix(),
+            },
+            MAX_ABANDONED,
+        );
     }
 
     /// Step this peer one rung down the retry ladder.
@@ -2289,6 +2381,18 @@ fn peer_list_blocked(reason: &str) -> String {
          tell a device that was unpaired from one it simply cannot see. Repair that file or \
          move it aside; queued sends wait until it reads."
     )
+}
+
+/// What a set of records COSTS this disk, as opposed to what it owes devices.
+///
+/// The store is content-addressed, so one copy backs every record that names
+/// the same content: a file queued for the phone and the iPad is two records,
+/// two pins and one blob. Counting it twice reports a disk cost that is not
+/// there, and both callers — the status surface and `forget_device`'s account
+/// of what it reclaimed — have to answer that the same way.
+fn distinct_bytes<'a>(records: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
+    let mut counted: BTreeSet<&str> = BTreeSet::new();
+    records.into_iter().filter(|(hash, _)| counted.insert(hash)).map(|(_, size)| size).sum()
 }
 
 /// The sentence a peer that would not talk produces, wherever the send path
@@ -2524,7 +2628,7 @@ mod tests {
 
     #[test]
     fn the_received_list_is_bounded_and_still_reports_the_true_count() {
-        let received = Arc::new(Mutex::new(Received::default()));
+        let received: Arc<Mutex<Log<ReceivedArtifact>>> = Arc::new(Mutex::new(Log::default()));
         let (wake, _drain) = mpsc::channel(WAKE_DEPTH);
         let sink = McpSink {
             pairing: Arc::new(Pairing::new()),
@@ -2560,7 +2664,7 @@ mod tests {
         let (wake, mut passes) = mpsc::channel(WAKE_DEPTH);
         let sink = McpSink {
             pairing: Arc::new(Pairing::new()),
-            received: Arc::new(Mutex::new(Received::default())),
+            received: Arc::new(Mutex::new(Log::default())),
             wake: wake.downgrade(),
         };
         let phone = "ab".repeat(32);
@@ -2602,7 +2706,7 @@ mod tests {
         let (wake, mut passes) = mpsc::channel::<Wake>(WAKE_DEPTH);
         let sink = McpSink {
             pairing: Arc::new(Pairing::new()),
-            received: Arc::new(Mutex::new(Received::default())),
+            received: Arc::new(Mutex::new(Log::default())),
             wake: wake.downgrade(),
         };
         drop(wake);
@@ -3865,7 +3969,13 @@ mod tests {
         assert_eq!(forgotten.node_id, phone_id);
         assert_eq!(forgotten.dropped, 2, "both queued sends go with the pairing");
         assert_eq!(forgotten.dropped_bytes, 8192, "and the caller is told what that freed");
-        assert!(forgotten.notes.is_empty(), "nothing was left owing: {:?}", forgotten.notes);
+        assert_eq!(forgotten.note, None, "nothing was left owing");
+
+        // A deletion the user ASKED for is not a broken promise. Logging it
+        // beside the expiries would make every later status call re-report a
+        // completed request as a failure, for the life of the process.
+        let after = core.server_status().await.unwrap();
+        assert_eq!(after.abandoned_total, 0, "{:?}", after.abandoned);
 
         // All three at once, with no drain pass in between: the pairing, the
         // records, and the bytes the records pinned. Leaving any of them for

@@ -541,42 +541,44 @@ impl Outbox {
         self.write_attempt(id, error, false)
     }
 
-    /// Note a push that reached the device and came back refused, and step
-    /// this record's own retry schedule by counting it.
+    /// Note a VERDICT on one record — the push was made and this is what came
+    /// back — and step that record's own retry schedule by counting it.
     ///
     /// The difference from `record_attempt` is the repeated-reason early
-    /// return, and it is the difference between a visit and a ROUND TRIP. A
-    /// held record is looked at and a string is compared; a denied record was
-    /// pushed — a ticket minted, `Req::PushArtifact` written, `Res::Denied`
-    /// awaited — down a session every other record for that peer is waiting
-    /// on. So a repeated denial always counts, which is what gives the drain
-    /// a per-record ladder to read back: `attempts` and `last_attempt_at`
-    /// already persist, and together they say when this record earned its
-    /// next turn.
+    /// return, and the line between them is a VISIT against a VERDICT. A held
+    /// record is looked at and a string is compared; a record with a verdict
+    /// was carried all the way to `push_staged`, down a session every other
+    /// record for that peer is waiting on. So a repeated verdict always
+    /// counts, which is what gives the drain a per-record ladder to read
+    /// back: `attempts` and `last_attempt_at` already persist, and together
+    /// they say when this record earned its next turn.
     ///
-    /// The write that costs is bounded by the ladder it just lengthened
-    /// rather than by the pass rate — a record at the top rung is written
-    /// once per ten minutes, not once per minute — and every count it leaves
-    /// behind names a delivery attempt that really happened, which is the
-    /// property the rule above exists to protect.
+    /// VERDICT, not "round trip", and the distinction is load-bearing. The
+    /// drain sends every non-transport push failure here, including
+    /// `PushFailure::Local` — a malformed content address, which never
+    /// reaches the wire. That lumping is deliberate: routing those back to
+    /// `record_attempt` would restore for them exactly the head-of-queue
+    /// starvation this schedule removes. So an `attempts` count means "pushes
+    /// this record was carried through", which is not always a frame the
+    /// device saw.
+    ///
+    /// The write it costs is bounded by the ladder it just lengthened rather
+    /// than by the pass rate: a record at the top rung is written once per
+    /// ten minutes, not once per minute.
     pub fn record_denial(&self, id: &str, error: String) -> Result<(), String> {
         self.write_attempt(id, Some(error), true)
     }
 
-    /// The one writer both arms share. `round_trip` is the caller's answer to
-    /// "did this cost the device anything", and it is the only thing that
-    /// decides whether a repeated reason is written again.
-    fn write_attempt(
-        &self,
-        id: &str,
-        error: Option<String>,
-        round_trip: bool,
-    ) -> Result<(), String> {
+    /// The one writer both arms share. `verdict` is the caller's answer to
+    /// "was this push carried through, or was this record merely looked at",
+    /// and it is the only thing that decides whether a repeated reason is
+    /// written again.
+    fn write_attempt(&self, id: &str, error: Option<String>, verdict: bool) -> Result<(), String> {
         let mut spool = self.guard();
         let Some(record) = spool.records.get(id) else {
             return Ok(());
         };
-        if !round_trip && record.last_error == error {
+        if !verdict && record.last_error == error {
             return Ok(());
         }
         let mut next = record.clone();
@@ -1060,13 +1062,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_that_repeats_is_still_counted_because_it_cost_a_round_trip() {
-        // The other side of the rule above, and the line between them is what
-        // the device paid. A held record was LOOKED AT; a refused one was
-        // pushed down the session every other record for that peer is
-        // waiting on. Not counting the second one left it at the head of the
-        // queue with the same schedule forever, and the drain has no other
-        // number to tell it that record has had its turn.
+    fn a_verdict_that_repeats_is_still_counted_where_a_repeated_visit_is_not() {
+        // The other side of the rule above, and the line between them is
+        // whether the push was carried through. A held record was LOOKED AT;
+        // a record with a verdict went all the way down the session every
+        // other record for that peer is waiting on. Not counting the second
+        // one left it at the head of the queue with the same schedule
+        // forever, and the drain has no other number to tell it that record
+        // has had its turn.
         let dir = tempfile::TempDir::new().unwrap();
         let out = spool(&dir);
         let id = out.next_id();
@@ -1076,7 +1079,7 @@ mod tests {
         for expected in 1..=3 {
             out.record_denial(&id, why.clone()).unwrap();
             let record = spool(&dir).list()[0].clone();
-            assert_eq!(record.attempts, expected, "every refusal is an attempt that happened");
+            assert_eq!(record.attempts, expected, "every verdict is a push carried through");
             assert_eq!(record.last_error.as_deref(), Some(why.as_str()));
         }
 

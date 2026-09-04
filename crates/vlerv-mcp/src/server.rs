@@ -316,7 +316,7 @@ fn forget_summary(forgotten: &Forgotten) -> String {
             human_bytes(forgotten.dropped_bytes)
         ));
     }
-    for note in &forgotten.notes {
+    if let Some(note) = &forgotten.note {
         summary.push('\n');
         summary.push_str(note);
     }
@@ -353,11 +353,7 @@ fn delivery_summary(path: &str, delivery: &Delivery) -> String {
 fn status_summary(status: &ServerStatus) -> String {
     // Say so when the list is shorter than the count, rather than letting the
     // reader take the listed entries for all of them.
-    let listed = if status.received_total as usize > status.received_artifacts.len() {
-        format!(" (listing the last {})", status.received_artifacts.len())
-    } else {
-        String::new()
-    };
+    let listed = shortened_clause(status.received_total, status.received_artifacts.len());
     // "booted: false" reads as "idle" unless the refusal is named beside it.
     let booted = match &status.boot_error {
         Some(e) => format!("false — the last boot failed: {e}"),
@@ -396,13 +392,7 @@ fn abandoned_line(status: &ServerStatus) -> String {
         .iter()
         .map(|a| format!("- {} to {} ({}) — {}", a.name, a.device, human_bytes(a.size), a.reason))
         .collect();
-    // The same claim `received_total` makes: a shortened list must say it is
-    // shortened, or it reads as the whole account.
-    let shortened = if status.abandoned_total as usize > status.abandoned.len() {
-        format!(" (listing the last {})", status.abandoned.len())
-    } else {
-        String::new()
-    };
+    let shortened = shortened_clause(status.abandoned_total, status.abandoned.len());
     format!(
         "\nGIVEN UP ON in this session: {}{} — these files did NOT arrive and are no longer \
          queued. Tell the user:\n{}",
@@ -570,6 +560,21 @@ fn ok<T: Serialize>(summary: impl Into<String>, value: &T) -> Result<CallToolRes
 /// a protocol error would be rendered opaquely instead of reaching the model.
 fn tool_failure(message: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
+}
+
+/// The clause a bounded list adds when the cap has dropped its oldest
+/// entries, and nothing when it has not.
+///
+/// ONE producer, because both bounded lists print into the SAME status
+/// message: two spellings of "there is more than this" in one response is a
+/// reader asking which of the two lists is the shortened kind. A list that is
+/// silently shortened reads as the whole account, which is the failure this
+/// clause exists to prevent.
+fn shortened_clause(total: u64, listed: usize) -> String {
+    match total as usize > listed {
+        true => format!(" (listing the last {listed})"),
+        false => String::new(),
+    }
 }
 
 /// "in 24 hours" style copy from an absolute expiry, so the model does not
